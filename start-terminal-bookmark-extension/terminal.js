@@ -145,19 +145,49 @@ document.addEventListener('DOMContentLoaded', () => {
          * 在当前光标位置写入单个字符串（无换行）
          * @param {string} text 要写入的文本
          */
-        _writeSingleLine(text) {
-            for (const char of text) {
-                if (this.cursorX >= this.cols) { // 自动换行
-                    this._handleNewline();
+        _writeSingleLine(htmlFragment) { // 重命名参数以清晰表明它可能包含 HTML
+            // 首先计算可见内容的长度，用于换行判断
+            const textContent = this._stripHtml(htmlFragment);
+            const visibleLength = textContent.length;
+
+            if (visibleLength === 0) return; // 如果片段为空，则无需处理
+
+            if (this.cursorX + visibleLength > this.cols) {
+                // --- 需要自动换行 ---
+                const spaceLeft = this.cols - this.cursorX;
+
+                if (spaceLeft <= 0) {
+                     // 当前行已满或光标已超出，先换行
+                     this._handleNewline();
+                     // 然后尝试在下一行写入整个片段（可能再次触发换行）
+                     this._writeSingleLine(htmlFragment); // 递归调用
+                } else {
+                     // 当前行还有空间，先写入能容纳的部分
+                     const part1 = this._truncateHtml(htmlFragment, spaceLeft);
+                     // --- 关键调用点 1 ---
+                     this.buffer[this.cursorY] = this._overwriteHtml(this.buffer[this.cursorY], this.cursorX, part1);
+
+                     // 换到下一行
+                     this._handleNewline();
+
+                     // 获取剩余部分
+                     const remainingVisibleLength = visibleLength - spaceLeft;
+                     // --- 修复：确保正确获取 part2 ---
+                     // 我们需要从原始 htmlFragment 中截取，而不是从 textContent
+                     // start 参数应为 spaceLeft (跳过已写入的部分)
+                     const part2 = this._truncateHtml(htmlFragment, remainingVisibleLength, spaceLeft);
+                     // --- 结束修复 ---
+
+                     // 如果剩余部分有实际内容，则递归写入
+                     if (this._stripHtml(part2).length > 0) {
+                          this._writeSingleLine(part2); // 递归调用
+                     }
                 }
-                
-                // "覆盖" 缓冲区中的字符
-                const y = this.cursorY;
-                const currentLine = this.buffer[y];
-                this.buffer[y] = currentLine.substring(0, this.cursorX) + 
-                                 char + 
-                                 currentLine.substring(this.cursorX + 1);
-                this.cursorX++;
+            } else {
+                // --- 不需要换行，片段完全适合当前行 ---
+                // --- 关键调用点 2 ---
+                this.buffer[this.cursorY] = this._overwriteHtml(this.buffer[this.cursorY], this.cursorX, htmlFragment);
+                this.cursorX += visibleLength; // 更新光标位置
             }
         }
 
@@ -251,6 +281,70 @@ document.addEventListener('DOMContentLoaded', () => {
             return { command: commandName, args: args, options: options };
         }
 
+        _stripHtml(html) {
+            // const doc = new DOMParser().parseFromString(html, 'text/html');
+            // return doc.body.textContent || "";
+            return html.replace(/<[^>]*>/g, '');
+        }
+
+        _overwriteHtml(originalLine, atIndex, newHtmlFragment) {
+            // Calculate the visible length of the fragment to insert
+            const fragmentVisibleLength = this._stripHtml(newHtmlFragment).length;
+
+            // Take the part of the original line before the insertion point
+            let before = originalLine.substring(0, atIndex);
+            // Ensure 'before' has enough padding if inserting beyond current content
+            if (before.length < atIndex) {
+                before += ' '.repeat(atIndex - before.length);
+            }
+
+            // Combine the 'before' part and the new fragment
+            let combined = before + newHtmlFragment;
+
+            // Calculate the visible length of the combined string so far
+            let visibleLength = this._stripHtml(combined).length;
+
+            // Calculate padding needed to fill the rest of the line up to this.cols
+            let paddingNeeded = Math.max(0, this.cols - visibleLength);
+            let padding = ' '.repeat(paddingNeeded);
+
+            // Return the combined string plus padding
+            let result = combined + padding;
+
+            // Final safety check: ensure the visible length doesn't exceed cols.
+            let finalVisibleLength = this._stripHtml(result).length;
+            if (finalVisibleLength > this.cols) {
+                // Use the _truncateHtml helper to cut based on visible length
+                // Ensure truncation happens correctly even if combined itself was already too long
+                if (visibleLength > this.cols) {
+                    result = this._truncateHtml(combined, this.cols); // Truncate combined first
+                } else {
+                    // If combined was okay, but padding made it too long (unlikely with spaces), just truncate result
+                    result = this._truncateHtml(result, this.cols);
+                }
+            }
+
+            return result;
+        }
+
+        _truncateHtml(html, length, start = 0) {
+            const text = this._stripHtml(html);
+            // Simplified truncation, might break mid-tag in complex HTML
+            let count = 0;
+            let endIndex = start;
+            for (let i = start; i < html.length && count < length; i++) {
+                if (html[i] === '<') {
+                    while (i < html.length && html[i] !== '>') {
+                        endIndex++; i++;
+                    }
+                    if(i < html.length) endIndex++;
+                } else {
+                    count++; endIndex++;
+                }
+            }
+            return html.substring(start, endIndex);
+        }
+
         writeHtml(html) {
             // 功能 1：管道支持
             if (isPiping) {
@@ -317,6 +411,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 // 普通字符输入
                 this.currentLine += e.key;
                 this._writeSingleLine(e.key); // 将字符写入缓冲区
+
             }
             
             this._render(); // 每次按键后都重绘
@@ -471,6 +566,25 @@ document.addEventListener('DOMContentLoaded', () => {
                     } else {
                         await new Promise(resolve => chrome.bookmarks.remove(target.id, resolve));
                     }
+                },
+                'pwd': (args, options) => {
+                    let displayPath;
+                    if (!this.root || !this.homeDirNode) {
+                         displayPath = "/";
+                    } else if (this.path.length === 1 && this.path[0] === this.root) {
+                        displayPath = "/";
+                    } else if (this.path.length >= 2 && this.path[0] === this.root && this.path[1] === this.homeDirNode) {
+                        if (this.path.length === 2) {
+                            displayPath = "~"; 
+                        } else {
+                            displayPath = "~/" + this.path.slice(2).map(p => p.title).join("/"); 
+                        }
+                    } else if (this.path.length > 1) {
+                         displayPath = "/" + this.path.slice(1).map(p => p.title).join("/");
+                    } else {
+                         displayPath = "/"; 
+                    }
+                    this.term.writeLine(displayPath); // 使用 writeLine 输出纯文本
                 }
             };
         }
