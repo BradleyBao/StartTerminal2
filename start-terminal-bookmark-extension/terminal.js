@@ -569,20 +569,16 @@ document.addEventListener('DOMContentLoaded', () => {
                 },
                 'pwd': (args, options) => {
                     let displayPath;
-                    if (!this.root || !this.homeDirNode) {
-                         displayPath = "/";
-                    } else if (this.path.length === 1 && this.path[0] === this.root) {
-                        displayPath = "/";
-                    } else if (this.path.length >= 2 && this.path[0] === this.root && this.path[1] === this.homeDirNode) {
-                        if (this.path.length === 2) {
-                            displayPath = "~"; 
-                        } else {
-                            displayPath = "~/" + this.path.slice(2).map(p => p.title).join("/"); 
-                        }
-                    } else if (this.path.length > 1) {
-                         displayPath = "/" + this.path.slice(1).map(p => p.title).join("/");
+                    // 核心修复：移除所有对 '~' 的特殊处理
+                    // 始终从根目录开始构建路径
+                    if (!this.root) {
+                         displayPath = "/"; // 容错处理
+                    } else if (this.path.length <= 1) {
+                         displayPath = "/"; // 根目录本身
                     } else {
-                         displayPath = "/"; 
+                         // 从 path 数组的第二个元素（根目录之后）开始
+                         // 获取所有节点的 title 并用 '/' 连接
+                         displayPath = "/" + this.path.slice(1).map(node => node.title).join("/");
                     }
                     this.term.writeLine(displayPath); // 使用 writeLine 输出纯文本
                 }
