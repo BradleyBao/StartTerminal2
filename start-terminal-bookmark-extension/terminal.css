@@ -1,6 +1,20 @@
 :root {
     --cursor-bg-color: #d4d4d4; /* 光标背景色 */
     --cursor-fg-color: #1e1e1e; /* 光标前景色 */
+
+    --terminal-font-family: 'Fira Code', 'Consolas', 'Courier New', monospace;
+    --terminal-font-size: 14px;
+} 
+
+html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background-color: #1e1e1e; /* 终端背景色 */
+    color: #d4d4d4; /* 终端文字颜色 */
+    
+    overflow: hidden; /* 防止滚动条出现 */
 }
 
 #terminal-container {
@@ -9,6 +23,7 @@
     left: 10px;
     right: 10px;
     bottom: 10px;
+    
     cursor: text; /* 提示用户这里可以输入 */
     overflow: hidden; /* 确保缓冲区内容不会溢出 */
 }
@@ -19,6 +34,8 @@
      * 它告诉浏览器完全按照 <pre> 标签中的文本（包括空格和换行）来渲染。
      */
     white-space: pre;
+    font-family: var(--terminal-font-family);
+    font-size: var(--terminal-font-size);
     line-height: 1.2; /* 行高，可以调整 */
 }
 
@@ -26,6 +43,7 @@
     background-color: var(--cursor-bg-color);
     color: var(--cursor-fg-color);
     animation: blink 1s steps(2, start) infinite;
+    font-family: monospace;
 }
 
 #input-handler {
@@ -47,4 +65,10 @@
     to {
         visibility: hidden;
     }
+}
+
+/* Register Fonts */
+@font-face {
+    font-family: "SF Mono";
+    src: local("SF Mono"), url("./fonts/SF-Mono-Regular.otf") format("otf");
 }
