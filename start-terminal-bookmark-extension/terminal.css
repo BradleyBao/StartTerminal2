@@ -1,0 +1,50 @@
+:root {
+    --cursor-bg-color: #d4d4d4; /* 光标背景色 */
+    --cursor-fg-color: #1e1e1e; /* 光标前景色 */
+}
+
+#terminal-container {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    right: 10px;
+    bottom: 10px;
+    cursor: text; /* 提示用户这里可以输入 */
+    overflow: hidden; /* 确保缓冲区内容不会溢出 */
+}
+
+#terminal-buffer {
+    margin: 0;
+    /* * white-space: pre; 是核心！
+     * 它告诉浏览器完全按照 <pre> 标签中的文本（包括空格和换行）来渲染。
+     */
+    white-space: pre;
+    line-height: 1.2; /* 行高，可以调整 */
+}
+
+.term-cursor {
+    background-color: var(--cursor-bg-color);
+    color: var(--cursor-fg-color);
+    animation: blink 1s steps(2, start) infinite;
+}
+
+#input-handler {
+    position: fixed;
+    top: -100px;
+    left: -100px;
+    width: 10px;
+    height: 10px;
+    opacity: 0;
+    border: none;
+    outline: none;
+    resize: none;
+    padding: 0;
+}
+
+/* * 光标闪烁动画
+ */
+@keyframes blink {
+    to {
+        visibility: hidden;
+    }
+}

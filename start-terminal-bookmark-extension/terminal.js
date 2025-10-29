@@ -1,0 +1,798 @@
+document.addEventListener('DOMContentLoaded', () => {
+
+    /**
+     * 核心终端模拟器类
+     */
+    class Terminal {
+
+        constructor(containerId, inputHandlerId) {
+            this.container = document.getElementById(containerId);
+            this.inputHandler = document.getElementById(inputHandlerId);
+
+            // 0. Global Var 
+            this.startTimes = 0;    // 记录启动次数
+
+            // 1. 缓冲区和尺寸
+            this.rows = 0;
+            this.cols = 0;
+            this.cellWidth = 0;
+            this.cellHeight = 0;
+            this.buffer = []; // 核心：屏幕缓冲区 (string[])
+            this.domBuffer = document.createElement('pre');
+            this.domBuffer.id = 'terminal-buffer';
+            this.container.appendChild(this.domBuffer);
+
+            // 2. 光标和输入状态
+            this.cursorX = 0;
+            this.cursorY = 0;
+            this.prompt = '';
+            this.currentLine = ''; // 用户当前输入的命令
+            this.onCommand = null; // 用户按回车键的回调
+
+            // 3. 初始化
+            this._calculateDimensions();
+            this._initBuffer();
+            this._attachListeners();
+            this.focus();
+        }
+
+        /**
+         * 测量单个字符的尺寸，并计算行列数
+         */
+        _calculateDimensions() {
+            const tempChar = document.createElement('span');
+            tempChar.textContent = 'W'; // 使用一个标准字符进行测量
+            this.domBuffer.appendChild(tempChar);
+            this.cellWidth = tempChar.getBoundingClientRect().width;
+            this.cellHeight = tempChar.getBoundingClientRect().height;
+            this.domBuffer.removeChild(tempChar);
+
+            const containerHeight = this.container.clientHeight;
+            const containerWidth = this.container.clientWidth;
+
+            this.rows = Math.floor(containerHeight / this.cellHeight);
+            this.cols = Math.floor(containerWidth / this.cellWidth);
+        }
+
+        /**
+         * 用空格初始化缓冲区（这就是你说的“填满屏幕的空格”）
+         */
+        _initBuffer() {
+            this.buffer = [];
+            for (let i = 0; i < this.rows; i++) {
+                this.buffer.push(' '.repeat(this.cols));
+            }
+            this.cursorX = 0;
+            this.cursorY = 0;
+        }
+
+        /**
+         * 绑定所有事件监听器
+         */
+        _attachListeners() {
+            // 捕获所有键盘输入
+            this.inputHandler.addEventListener('keydown', (e) => this._handleKeydown(e));
+            // 捕获中文输入法 (IME) 或粘贴
+            this.inputHandler.addEventListener('input', (e) => this._handleInput(e));
+            // 点击终端时，始终聚焦到隐藏的输入框
+            this.container.addEventListener('click', () => this.focus());
+            // 窗口大小调整时，重新计算
+            window.addEventListener('resize', () => this._handleResize());
+        }
+
+        /**
+         * 聚焦到隐藏的 textarea
+         */
+        focus() {
+            this.inputHandler.focus();
+        }
+
+        /**
+         * 核心渲染函数：将 JS 缓冲区 "绘制" 到 DOM
+         */
+        _render() {
+            let html = '';
+            for (let y = 0; y < this.rows; y++) {
+                let line = this.buffer[y]; // Line from buffer (might contain HTML)
+                
+                if (y === this.cursorY && !this.inputDisabled) {
+                    // --- Input/Output Separation Logic (No Change Here) ---
+                    const promptHtml = this.escapeHtml(this.prompt);
+                    const inputHtml = this.escapeHtml(this.currentLine);
+                    const fullLineText = this.prompt + this.currentLine;
+                    const padding = ' '.repeat(Math.max(0, this.cols - fullLineText.length));
+                    
+                    const charAtCursor = fullLineText[this.cursorX] || ' ';
+                    line = this.escapeHtml(fullLineText.substring(0, this.cursorX)) +
+                           `<span class="term-cursor">${this.escapeHtml(charAtCursor)}</span>` +
+                           this.escapeHtml(fullLineText.substring(this.cursorX + 1)) +
+                           padding; 
+                           
+                    html += line + '\n';
+                    // --- End Input/Output Separation ---
+                
+                } else {
+                    // --- FIX: Do NOT escape the buffer content here! ---
+                    // It should already contain the intended HTML or escaped text.
+                    html += line + '\n'; 
+                    // --- END FIX ---
+                }
+            }
+            this.domBuffer.innerHTML = html;
+        }
+
+        /**
+         * 缓冲区向上滚动一行
+         */
+        _scrollUp() {
+            this.buffer.shift(); // 移除第一行
+            this.buffer.push(' '.repeat(this.cols)); // 在末尾添加一个新空行
+        }
+
+        /**
+         * 处理换行符（光标移到下一行开头）
+         */
+        _handleNewline() {
+            this.cursorY++;
+            this.cursorX = 0;
+            if (this.cursorY >= this.rows) {
+                this._scrollUp();
+                this.cursorY = this.rows - 1; // 光标保持在最后一行
+            }
+        }
+
+        /**
+         * 在当前光标位置写入单个字符串（无换行）
+         * @param {string} text 要写入的文本
+         */
+        _writeSingleLine(text) {
+            for (const char of text) {
+                if (this.cursorX >= this.cols) { // 自动换行
+                    this._handleNewline();
+                }
+                
+                // "覆盖" 缓冲区中的字符
+                const y = this.cursorY;
+                const currentLine = this.buffer[y];
+                this.buffer[y] = currentLine.substring(0, this.cursorX) + 
+                                 char + 
+                                 currentLine.substring(this.cursorX + 1);
+                this.cursorX++;
+            }
+        }
+
+        /**
+         * [公共] 打印一行文本（这是你的新 "print" 函数）
+         * @param {string} text
+         */
+        writeLine(text) {
+            const textString = String(text);
+            
+            // 功能 1：管道支持
+            if (isPiping) {
+                pipeBuffer.push(textString);
+                return;
+            }
+
+            this.writeHtml(this.escapeHtml(textString));
+        }
+
+        /**
+         * [公共] 设置并显示提示符
+         * @param {string} promptText
+         */
+        setPrompt(promptText) {
+            this.prompt = promptText;
+            this.cursorX = 0;
+            this.currentLine = '';
+            this._writeSingleLine(this.prompt);
+            this._render();
+        }
+
+        parseLine(line) {
+            const commandStrings = line.split(';').map(cmd => cmd.trim()).filter(cmd => cmd.length > 0);
+            const parsedCommands = [];
+
+            for (const commandStr of commandStrings) {
+                const parsed = this.parseSingleCommand(commandStr);
+                if (parsed) {
+                    parsedCommands.push(parsed);
+                } else {
+                    // If any part fails to parse, you might want to stop or log an error
+                    // For now, we'll just skip the invalid part
+                    console.error(`Failed to parse command segment: "${commandStr}"`);
+                }
+            }
+            
+            return parsedCommands;
+        } 
+
+        parseSingleCommand(commandStr) {
+            const tokens = commandStr.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g);
+
+            if (!tokens || tokens.length === 0) {
+                return null; // Empty or invalid command string
+            }
+
+            const commandName = tokens[0];
+            const args = [];
+            const options = {};
+
+            for (let i = 1; i < tokens.length; i++) {
+                let token = tokens[i];
+
+                // Handle quoted arguments - remove the quotes
+                if ((token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'"))) {
+                    token = token.slice(1, -1);
+                    args.push(token); // Quoted strings are always arguments
+                    continue;
+                }
+
+                // Handle options
+                if (token.startsWith('--')) { // Long option (e.g., --all)
+                    const optName = token.substring(2);
+                    if (optName) {
+                        options[optName] = true; 
+                    }
+                } else if (token.startsWith('-')) { // Short option(s) (e.g., -a, -l, -al)
+                    const optString = token.substring(1);
+                    if (optString.length > 0) {
+                        for (const char of optString) {
+                            options[char] = true; // Set each char as an option
+                        }
+                    }
+                } else {
+                    // It's an argument
+                    args.push(token);
+                }
+            }
+            
+
+            return { command: commandName, args: args, options: options };
+        }
+
+        writeHtml(html) {
+            // 功能 1：管道支持
+            if (isPiping) {
+                pipeBuffer.push(this._stripHtml(html)); // 管道中只应传递纯文本
+                return;
+            }
+            
+            const lines = html.split('\n');
+            for (let i = 0; i < lines.length; i++) {
+                this._writeSingleLine(lines[i]);
+                if (i < lines.length - 1) { // 显式处理换行符
+                    this._handleNewline();
+                }
+            }
+            this._handleNewline(); // 默认在每次打印后换行
+            this._render();
+        }
+
+        disableInput() {
+            this.inputDisabled = true;
+            this._render(); // 重绘以隐藏光标
+        }
+
+        enableInput() {
+            this.inputDisabled = false;
+            this.focus();
+            this._render(); // 重绘以显示光标
+        }
+
+        /**
+         * 处理按键（非 IME）
+         */
+        _handleKeydown(e) {
+            // 阻止 F5, Tab 等默认行为，但允许 Ctrl+C/V/R 等
+            if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+                e.preventDefault();
+            } else if (e.key === "Backspace" || e.key === "Enter" || e.key === "Tab") {
+                e.preventDefault();
+            }
+
+            if (e.key === 'Enter') {
+                const command = this.currentLine;
+                this._handleNewline(); // 换行
+                
+                // 触发命令执行
+                if (this.onCommand) {
+                    this.onCommand(command);
+                }
+                
+                this.currentLine = ''; // 清空当前行
+                // (注意：这里我们不立即显示提示符，我们等待命令执行完毕后)
+                // (在我们的例子中，命令会立即在回调中显示提示符)
+
+            } else if (e.key === 'Backspace') {
+                if (this.currentLine.length > 0) {
+                    this.currentLine = this.currentLine.slice(0, -1);
+                    // "擦除" 屏幕上的最后一个字符
+                    this.cursorX--;
+                    this.buffer[this.cursorY] = this.buffer[this.cursorY].substring(0, this.cursorX) + 
+                                                ' ' + 
+                                                this.buffer[this.cursorY].substring(this.cursorX + 1);
+                }
+            } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+                // 普通字符输入
+                this.currentLine += e.key;
+                this._writeSingleLine(e.key); // 将字符写入缓冲区
+            }
+            
+            this._render(); // 每次按键后都重绘
+        }
+
+        /**
+         * 处理 IME 输入或粘贴
+         */
+        _handleInput(e) {
+            const text = e.target.value;
+            if (text) {
+                this.currentLine += text;
+                this._writeSingleLine(text);
+                this._render();
+            }
+            // 立即清空 textarea，为下一次输入做准备
+            e.target.value = '';
+        }
+
+        /**
+         * 处理窗口大小调整
+         */
+        _handleResize() {
+            // 这是一个简化的重绘，它会清空屏幕
+            this._calculateDimensions();
+            this._initBuffer();
+            this.writeLine("--- Terminal resized. Buffer cleared. ---");
+            this.setPrompt(this.prompt);
+            this._render();
+        }
+
+        escapeHtml(unsafe) {
+            return unsafe
+                 .replace(/&/g, "&amp;")
+                 .replace(/</g, "&lt;")
+                 .replace(/>/g, "&gt;")
+                 .replace(/"/g, "&quot;")
+                 .replace(/'/g, "&#039;");
+        }
+    }
+
+    class BookmarkSystem {
+        constructor(termInstance) {
+            this.term = termInstance; // 接收 Terminal 实例用于输出
+            this.current = null;
+            this.root = null;
+            this.path = [];
+            this.homeDirNode = null;
+            this.full_path = "~ $"; // 默认提示符
+
+            // --- 将命令实现移入此类 ---
+            this.commands = {
+                'cd': (args, options) => {
+                    const targetPath = args[0] || '~';
+                    if (targetPath === '..') {
+                        if (this.path.length > 1) {
+                            this.path.pop();
+                            this.current = this.path[this.path.length - 1];
+                        }
+                    } else {
+                        const result = this._findNodeByPath(targetPath);
+                        if (result && result.node && result.node.children) {
+                            this.current = result.node;
+                            this.path = result.newPathArray;
+                        } else if (result && result.node) {
+                            this.term.writeHtml(`<span class="term-error">cd: ${targetPath}: Not a directory</span>`);
+                        } else {
+                            this.term.writeHtml(`<span class="term-error">cd: ${targetPath}: No such file or directory</span>`);
+                        }
+                    }
+                    this.update_user_path(); // cd 后更新路径
+                },
+
+                'ls': (args, options) => {
+                    let targetNode = this.current;
+                    if (args[0]) {
+                        const result = this._findNodeByPath(args[0]);
+                        if (result && result.node && result.node.children) {
+                            targetNode = result.node;
+                        } else if (result && result.node) {
+                             this.term.writeHtml(`<span class="term-error">ls: ${args[0]}: Not a directory</span>`);
+                             return;
+                        } else {
+                            this.term.writeHtml(`<span class="term-error">ls: ${args[0]}: No such directory</span>`);
+                            return;
+                        }
+                    }
+
+                    let children = targetNode.children || [];
+                    if (!options.a) { 
+                        children = children.filter(child => !child.title.startsWith('.'));
+                    }
+                    
+                    for (const child of children) {
+                        if (child.children) {
+                            this.term.writeHtml(`<span class="term-folder">${child.title}/</span>`);
+                        } else {
+                            this.term.writeLine(child.title); 
+                        }
+                    }
+                },
+                
+                'mkdir': async (args, options) => {
+                    if (!args[0]) {
+                        this.term.writeHtml(`<span class="term-error">mkdir: missing operand</span>`);
+                        return;
+                    }
+                    const dirName = args[0];
+                    if (this._findChildByTitle(this.current.children, dirName)) {
+                        this.term.writeHtml(`<span class="term-error">mkdir: ${dirName}: File exists</span>`);
+                        return;
+                    }
+                    await new Promise(resolve => {
+                        chrome.bookmarks.create({ parentId: this.current.id, title: dirName }, resolve);
+                    });
+                },
+                
+                'rmdir': async (args, options) => {
+                    if (!args[0]) {
+                        this.term.writeHtml(`<span class="term-error">rmdir: missing operand</span>`);
+                        return;
+                    }
+                    const target = this._findChildByTitle(this.current.children, args[0]);
+                    if (!target) {
+                        this.term.writeHtml(`<span class="term-error">rmdir: ${args[0]}: No such file or directory</span>`);
+                    } else if (!target.children) {
+                        this.term.writeHtml(`<span class="term-error">rmdir: ${args[0]}: Not a directory</span>`);
+                    } else if (target.children.length > 0) {
+                        this.term.writeHtml(`<span class="term-error">rmdir: ${args[0]}: Directory not empty</span>`);
+                    } else {
+                        await new Promise(resolve => chrome.bookmarks.remove(target.id, resolve));
+                    }
+                },
+                
+                'rm': async (args, options) => {
+                    if (!args[0]) {
+                        this.term.writeHtml(`<span class="term-error">rm: missing operand</span>`);
+                        return;
+                    }
+                    const target = this._findChildByTitle(this.current.children, args[0]);
+                    if (!target) {
+                        this.term.writeHtml(`<span class="term-error">rm: ${args[0]}: No such file or directory</span>`);
+                        return;
+                    }
+                    
+                    const recursive = options.r || options.recurse;
+                    
+                    if (target.children && !recursive) {
+                        this.term.writeHtml(`<span class="term-error">rm: ${args[0]}: Is a directory (use -r)</span>`);
+                    } else if (target.children && recursive) {
+                        await this._removeRecursive(target.id);
+                    } else {
+                        await new Promise(resolve => chrome.bookmarks.remove(target.id, resolve));
+                    }
+                }
+            };
+        }
+
+        // --- 将书签相关的辅助函数移入此类 ---
+
+        async initialize() {
+             await this._refreshBookmarks();
+        }
+
+        async _refreshBookmarks() {
+            if (typeof chrome === 'undefined' || !chrome.bookmarks) {
+                console.warn("chrome.bookmarks API not available. Using mock data.");
+                if (!this.root) {
+                    this.root = { id: '0', title: 'Root', children: [
+                        { id: '1', title: 'Bookmarks Bar', children: [
+                            { id: '3', title: 'Work', children: [] },
+                            { id: '4', title: 'Personal', url: 'https://google.com' }
+                        ] },
+                        { id: '2', title: 'Other Bookmarks', children: [] }
+                    ]};
+                    this.homeDirNode = this.root.children[0];
+                    this.current = this.homeDirNode;
+                    this.path = [this.root, this.homeDirNode];
+                }
+                return; 
+            }
+
+            const tree = await new Promise(resolve => chrome.bookmarks.getTree(resolve));
+            this.root = tree[0];
+            this.homeDirNode = (this.root.children && this.root.children.length > 0) ? this.root.children[0] : this.root;
+            
+            if (this.path.length === 0) { 
+                 this.current = this.homeDirNode;
+                 this.path = [this.root, this.homeDirNode];
+                 return;
+            }
+
+            let tempCurrent = this.root;
+            let tempPath = [this.root];
+            let pathIsValid = true;
+            
+            for (let i = 1; i < this.path.length; i++) {
+                const nodeId = this.path[i].id;
+                const foundNode = (tempCurrent.children || []).find(c => c.id === nodeId);
+                if (foundNode) {
+                    tempCurrent = foundNode;
+                    tempPath.push(foundNode);
+                } else {
+                    pathIsValid = false;
+                    break;
+                }
+            }
+            
+            if (pathIsValid) {
+                this.current = tempCurrent;
+                this.path = tempPath;
+            } else {
+                this.current = this.homeDirNode;
+                this.path = [this.root, this.homeDirNode];
+            }
+        }
+
+        update_user_path() {
+            let displayPath;
+            if (!this.root || !this.homeDirNode) { 
+                 displayPath = "~";
+            } else if (this.path.length >= 2 && this.path[0] === this.root && this.path[1] === this.homeDirNode) {
+                displayPath = this.path.length === 2 ? "~" : "~/" + this.path.slice(2).map(p => p.title).join("/");
+            } else if (this.path.length > 0) {
+                const pathString = this.path.slice(1).map(p => p.title).join("/");
+                displayPath = "/" + pathString;
+            } else {
+                 displayPath = "/"; 
+            }
+            
+            this.full_path = `user@ST2.0:${displayPath}$`;
+            
+            if (!this.term.inputDisabled) {
+                this.term.setPrompt(this.full_path + " ");
+            }
+        }
+
+        _findNodeByPath(pathStr) {
+            if (!pathStr || !this.root || !this.homeDirNode) return null;
+
+            let startNode;
+            let newPathArray;
+            let pathSegments;
+
+            if (pathStr.startsWith('~/')) {
+                startNode = this.homeDirNode;
+                newPathArray = [this.root, this.homeDirNode];
+                pathSegments = pathStr.substring(2).split('/').filter(s => s.length > 0);
+            } else if (pathStr.startsWith('/')) {
+                startNode = this.root;
+                newPathArray = [this.root];
+                pathSegments = pathStr.substring(1).split('/').filter(s => s.length > 0);
+            } else {
+                startNode = this.current;
+                newPathArray = [...this.path];
+                pathSegments = pathStr.split('/').filter(s => s.length > 0);
+            }
+
+            if (pathSegments.length === 0) {
+                return { node: startNode, newPathArray: newPathArray };
+            }
+
+            let currentNode = startNode;
+            for (let i = 0; i < pathSegments.length; i++) {
+                const segment = pathSegments[i];
+                if (!currentNode || !currentNode.children) return null; // 检查 currentNode 是否有效
+
+                if (segment === '..') {
+                    if (newPathArray.length > 1) newPathArray.pop();
+                    currentNode = newPathArray[newPathArray.length - 1] || this.root;
+                    continue;
+                }
+                
+                const foundNode = (currentNode.children || []).find(child => child.title === segment); // 添加保护
+                if (foundNode) {
+                    currentNode = foundNode;
+                    // --- 修复：确保只有当找到的是目录时才更新路径 ---
+                    if (foundNode.children) {
+                         // 检查 newPathArray 是否已经包含此节点，避免重复添加
+                         if (!newPathArray.find(p => p.id === foundNode.id)) {
+                             newPathArray.push(currentNode);
+                         }
+                    } else if (i < pathSegments.length - 1) {
+                         // 如果路径中间部分不是目录，则路径无效
+                         return null;
+                    }
+                    // --- 结束修复 ---
+                } else {
+                    return null;
+                }
+            }
+            return { node: currentNode, newPathArray: newPathArray };
+        }
+
+        _findChildByTitle(children, title) {
+            return (children || []).find(child => child.title === title);
+        }
+        
+        _removeRecursive(nodeId) {
+             if (typeof chrome === 'undefined' || !chrome.bookmarks) {
+                console.warn("chrome.bookmarks API not available. Skipping recursive remove.");
+                return Promise.resolve(); // 返回一个 resolved Promise
+            }
+            return new Promise((resolve, reject) => {
+                chrome.bookmarks.removeTree(nodeId, resolve);
+            });
+        }
+    }
+
+    // ===============================================
+    // =           初始化和使用 Terminal         =
+    // ===============================================
+
+    let isPiping = false;
+    let pipeBuffer = [];
+
+    const term = new Terminal('terminal-container', 'input-handler');
+    const bookmarkSystem = new BookmarkSystem(term); // 将 term 传给 BookmarkSystem
+
+    // --- 将非书签命令移到这里 ---
+    const globalCommands = {
+         'grep': (args, options, pipedInput) => {
+            if (!args[0]) {
+                term.writeHtml(`<span class="term-error">grep: missing pattern</span>`);
+                return;
+            }
+            if (!pipedInput) {
+                term.writeHtml(`<span class="term-error">grep: requires piped input</span>`);
+                return;
+            }
+            const pattern = new RegExp(args[0], 'i');
+            const matches = pipedInput.filter(line => pattern.test(line));
+            matches.forEach(line => term.writeLine(line));
+            return matches;
+        },
+        
+        'wc': (args, options, pipedInput) => {
+            if (!pipedInput) {
+                term.writeHtml(`<span class="term-error">wc: requires piped input</span>`);
+                return;
+            }
+            const lines = pipedInput.length;
+            const words = pipedInput.join(' ').split(/\s+/).filter(Boolean).length;
+            const chars = pipedInput.join('\n').length;
+            term.writeLine(` ${lines}  ${words}  ${chars}`);
+        },
+        'clear': (args, options) => {
+            term._initBuffer();
+        },
+        'help': (args, options) => {
+             term.writeLine("Welcome to Start Terminal 2");
+             term.writeLine("Bookmark commands moved to BookmarkSystem.");
+        },
+         'echo': (args, options) => {
+            term.writeLine(args.join(' ')); 
+        },
+        'greet': (args, options) => {
+             const name = args[0]; 
+            if (name) {
+                term.writeLine(`你好, ${name}! 欢迎来到终端。`); 
+                if (options.v || options.verbose) { 
+                    term.writeLine(" (Verbose mode enabled!)");
+                }
+            } else {
+                term.writeLine("用法: greet [你的名字] [-v or --verbose]");
+            }
+        }
+        // ... 你未来可以添加更多非书签命令 ...
+    };
+
+
+    function parseLine(line) {
+        const commandStrings = line.split(';').map(cmd => cmd.trim()).filter(cmd => cmd.length > 0);
+        const parsedCommands = [];
+        for (const commandStr of commandStrings) {
+            const parsed = parseSingleCommand(commandStr);
+            if (parsed) { parsedCommands.push(parsed); } 
+            else { console.error(`Failed to parse: "${commandStr}"`); }
+        }
+        return parsedCommands;
+    }
+
+    function parseSingleCommand(commandStr) {
+        const tokens = commandStr.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g);
+        if (!tokens || tokens.length === 0) { return null; }
+        const commandName = tokens[0];
+        const args = [];
+        const options = {};
+        for (let i = 1; i < tokens.length; i++) {
+            let token = tokens[i];
+            if ((token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'"))) {
+                token = token.slice(1, -1); args.push(token); continue;
+            }
+            if (token.startsWith('--')) { 
+                const optName = token.substring(2); if (optName) { options[optName] = true; }
+            } else if (token.startsWith('-')) { 
+                const optString = token.substring(1); if (optString.length > 0) { for (const char of optString) { options[char] = true; } }
+            } else { args.push(token); }
+        }
+        return { command: commandName, args: args, options: options };
+    }
+
+    function awaiting() {
+        term.disableInput();
+    }
+
+    function done() {
+        term.enableInput();
+        bookmarkSystem.update_user_path(); // 使用 BookmarkSystem 的方法
+    }
+
+    async function executeLine(line) {
+        awaiting(); 
+        
+        const parsedCommands = parseLine(line);
+        if (!parsedCommands || parsedCommands.length === 0) {
+             done(); // 如果没有有效命令，直接结束
+             return;
+        }
+
+        let lastOutput = null; 
+
+        for (let i = 0; i < parsedCommands.length; i++) {
+             const parsed = parsedCommands[i];
+             if (!parsed) continue;
+
+            const { command, args, options } = parsed;
+            
+            let commandFunc = null;
+
+            // --- 修改：优先检查 BookmarkSystem ---
+            if (bookmarkSystem.commands[command]) {
+                commandFunc = bookmarkSystem.commands[command];
+            } 
+            // --- 修改：然后检查全局命令 ---
+            else if (globalCommands[command]) {
+                 commandFunc = globalCommands[command];
+            }
+
+            // --- 管道逻辑不变 ---
+            if (i > 0) { isPiping = false; }
+            if (i < parsedCommands.length - 1) { isPiping = true; pipeBuffer = []; }
+            
+            if (commandFunc) {
+                // 如果是 clear，它会自己处理缓冲区，不需要 await
+                 if (command === 'clear') {
+                     commandFunc(args, options);
+                     lastOutput = null; // 清除后没有输出
+                 } else {
+                    lastOutput = await commandFunc(args, options, lastOutput);
+                 }
+            } else if (command.trim() !== '') {
+                term.writeHtml(`<span class="term-error">${command}: command not found</span>`);
+            }
+            
+            if (isPiping) { lastOutput = pipeBuffer; }
+            isPiping = false; 
+        }
+        
+        // --- 修改：使用 BookmarkSystem 的方法 ---
+        await bookmarkSystem._refreshBookmarks(); 
+        done(); 
+    }
+    
+
+    async function main() {
+        term.writeLine("ST 2.0 Booting...");
+        await bookmarkSystem.initialize(); // 初始化 BookmarkSystem
+        
+        term.onCommand = executeLine; 
+
+        term.writeLine("欢迎来到 Start-Terminal 2.0！");
+        term.writeLine("Bookmark commands refactored.");
+        done(); 
+    }
+
+    main();
+
+});
