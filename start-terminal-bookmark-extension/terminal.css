@@ -26,6 +26,8 @@ html, body::selection {
     color: var(--terminal-selection-foreground);
 }
 
+
+
 #terminal-container {
     position: absolute;
     top: 10px;
@@ -35,6 +37,10 @@ html, body::selection {
     
     cursor: text; /* 提示用户这里可以输入 */
     overflow: hidden; /* 确保缓冲区内容不会溢出 */
+}
+
+#terminal-container:hover {
+    cursor:default; /* 默认光标 */
 }
 
 #terminal-buffer {
