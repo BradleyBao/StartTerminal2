@@ -4,6 +4,10 @@
 
     --terminal-font-family: 'Fira Code', 'Consolas', 'Courier New', monospace;
     --terminal-font-size: 14px;
+    --terminal-background-color: #1e1e1e;
+    --terminal-foreground-color: #d4d4d4;
+    --terminal-selection-background: #d4d4d4;
+    --terminal-selection-foreground: #1e1e1e;
 } 
 
 html, body {
@@ -11,10 +15,15 @@ html, body {
     padding: 0;
     width: 100%;
     height: 100%;
-    background-color: #1e1e1e; /* 终端背景色 */
-    color: #d4d4d4; /* 终端文字颜色 */
-    
+    background-color: var(--terminal-background-color);
+    color: var(--terminal-foreground-color);
+
     overflow: hidden; /* 防止滚动条出现 */
+}
+
+html, body::selection {
+    background-color: var(--terminal-selection-background);
+    color: var(--terminal-selection-foreground);
 }
 
 #terminal-container {

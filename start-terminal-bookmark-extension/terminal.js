@@ -1049,8 +1049,7 @@ async function main() {
     term.onCommand = executeLine;
 
     // 5. 打印欢迎信息 (现在缓冲区尺寸正确)
-    term.writeLine("欢迎来到 Start-Terminal 2.0！");
-    term.writeLine("Bookmark commands refactored.");
+    term.writeLine("Welcome to Start-Terminal 2.0!");
 
     // 6. 显示第一个提示符
     done();
