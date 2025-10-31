@@ -79,6 +79,11 @@ class Terminal {
         this.prompt = '';
         this.currentLine = ''; // 用户当前输入的命令
         this.onCommand = null; // 用户按回车键的回调
+        this.onTab = null;
+
+        this.history = [];
+        this.historyIndex = 0;
+        this.tempLine = "";
 
         // 3. 初始化
         this._calculateDimensions();
@@ -186,27 +191,26 @@ class Terminal {
             let line = this.buffer[y]; // Line from buffer (might contain HTML)
             
             if (y === this.cursorY && !this.inputDisabled) {
-                // --- Input/Output Separation Logic (No Change Here) ---
-                const promptHtml = this.escapeHtml(this.prompt);
-                const inputHtml = this.escapeHtml(this.currentLine);
-                // console.log(this.currentLine, this.prompt)
+                // --- [重写] 输入/光标渲染逻辑 ---
                 const fullLineText = this.prompt + this.currentLine;
-                const padding = ' '.repeat(Math.max(0, this.cols - fullLineText.length));
+
+                // 1. [新] 先将行用空格填充到正确的总宽度
+                const paddedLine = fullLineText + ' '.repeat(Math.max(0, this.cols - fullLineText.length));
+
+                // 2. [新] 从已填充的行中获取光标下的字符
+                //    (这确保了光标在行尾时，我们能正确获取到一个空格)
+                const charAtCursor = paddedLine[this.cursorX] || ' '; 
                 
-                const charAtCursor = fullLineText[this.cursorX] || ' ';
-                line = this.escapeHtml(fullLineText.substring(0, this.cursorX)) +
+                // 3. [新] 替换光标位置的字符，而不是在行尾添加
+                line = this.escapeHtml(paddedLine.substring(0, this.cursorX)) +
                         `<span class="term-cursor">${this.escapeHtml(charAtCursor)}</span>` +
-                        this.escapeHtml(fullLineText.substring(this.cursorX + 1)) +
-                        padding; 
+                        this.escapeHtml(paddedLine.substring(this.cursorX + 1));
+                // --- [结束重写] ---
                         
                 html += line + '\n';
-                // --- End Input/Output Separation ---
             
             } else {
-                // --- FIX: Do NOT escape the buffer content here! ---
-                // It should already contain the intended HTML or escaped text.
                 html += line + '\n'; 
-                // --- END FIX ---
             }
         }
         this.domBuffer.innerHTML = html;
@@ -338,9 +342,20 @@ class Terminal {
      */
     setPrompt(promptText) {
         this.prompt = promptText;
-        this.cursorX = 0;
+        // this.cursorX = 0;
         this.currentLine = '';
-        this._writeSingleLine(this.prompt);
+        this.cursorX = this.prompt.length;
+        // this._writeSingleLine(this.prompt);
+        this._render();
+    }
+
+    setCommand(newLine, newCursorPos) {
+        this.currentLine = newLine;
+        if (newCursorPos !== undefined) {
+            this.cursorX = this.prompt.length + newCursorPos;
+        } else {
+            this.cursorX = this.prompt.length + newLine.length;
+        }
         this._render();
     }
 
@@ -409,7 +424,8 @@ class Terminal {
     _stripHtml(html) {
         // const doc = new DOMParser().parseFromString(html, 'text/html');
         // return doc.body.textContent || "";
-        return html.replace(/<[^>]*>/g, '');
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        return doc.body.textContent || "";
     }
 
     _overwriteHtml(originalLine, atIndex, newHtmlFragment) {
@@ -453,21 +469,50 @@ class Terminal {
     }
 
     _truncateHtml(html, length, start = 0) {
-        const text = this._stripHtml(html);
-        // Simplified truncation, might break mid-tag in complex HTML
-        let count = 0;
-        let endIndex = start;
-        for (let i = start; i < html.length && count < length; i++) {
-            if (html[i] === '<') {
-                while (i < html.length && html[i] !== '>') {
-                    endIndex++; i++;
-                }
-                if(i < html.length) endIndex++;
-            } else {
-                count++; endIndex++;
+        let visibleCount = 0;
+        let captureCount = 0;
+        let startIndex = 0;
+        let endIndex = 0;
+        let inTag = false;
+        let foundStart = (start === 0);
+
+        if (length <= 0) return "";
+
+        for (let i = 0; i < html.length; i++) {
+            const char = html[i];
+            if (char === '<') {
+                inTag = true;
+            } else if (char === '>') {
+                inTag = false;
             }
+
+            if (!inTag) {
+                if (!foundStart) {
+                    // --- 1. 跳过阶段 ---
+                    visibleCount++;
+                    if (visibleCount >= start) {
+                        foundStart = true;
+                        startIndex = i; // 从这个 HTML 索引开始捕获
+                    }
+                }
+                
+                if (foundStart) {
+                    // --- 2. 捕获阶段 ---
+                    captureCount++;
+                    if (captureCount >= length) {
+                        // 我们已捕获足够的字符。
+                        endIndex = i + 1; // 结束索引是当前字符之后
+                        break;
+                    }
+                }
+            }
+
+            // 如果我们还没 break，则 endIndex 必须至少跟上 i
+            endIndex = i + 1;
         }
-        return html.substring(start, endIndex);
+
+        if (!foundStart) return ""; // 从未找到起始点
+        return html.substring(startIndex, endIndex);
     }
 
     writeHtml(html) {
@@ -485,7 +530,7 @@ class Terminal {
             }
         }
         this._handleNewline(); // 默认在每次打印后换行
-        this._render();
+        // this._render();
     }
 
     disableInput() {
@@ -564,6 +609,30 @@ class Terminal {
                         this.onCommand(""); 
                     }
                     break;
+
+                case 'arrowleft': 
+                    {
+                        const line = this.currentLine;
+                        let i = this.cursorX - this.prompt.length - 1; // start from char before cursor
+                        // Skip whitespace
+                        while (i >= 0 && /\s/.test(line[i])) { i--; }
+                        // Skip word
+                        while (i >= 0 && !/\s/.test(line[i])) { i--; }
+                        this.cursorX = this.prompt.length + i + 1;
+                    }
+                    break;
+                case 'arrowright':
+                    {
+                        const line = this.currentLine;
+                        let i = this.cursorX - this.prompt.length; // start at cursor
+                        // Skip word
+                        while (i < line.length && !/\s/.test(line[i])) { i++; }
+                        // Skip whitespace
+                        while (i < line.length && /\s/.test(line[i])) { i++; }
+                        this.cursorX = this.prompt.length + i;
+                    }
+                    break;
+
                 default:
                     handled = false; 
             }
@@ -579,8 +648,13 @@ class Terminal {
         
         if (e.key === "Tab") {
             e.preventDefault();
-            // (Tab 补全逻辑)
-            // this._render(); // 如果有补全，记得渲染
+            // --- [新增] Tab 补全 ---
+            if (this.onTab) {
+                // 计算光标在 this.currentLine 中的位置
+                const pos = this.cursorX - this.prompt.length;
+                this.onTab(this.currentLine, pos);
+            }
+            // --- [结束新增] ---
             return; // Tab 不应触发末尾的 _render
         }
         
@@ -588,14 +662,20 @@ class Terminal {
             e.preventDefault();
             const command = this.currentLine;
 
-            // --- [新增] 在换行前，将当前行“固化”到缓冲区 ---
+            if (command.trim().length > 0 && command !== this.history[this.history.length - 1]) {
+                this.history.push(command);
+            }
+            this.historyIndex = this.history.length; // 重置索引到“新行”
+            this.tempLine = ""; // 清空临时行
+
+            // --- 在换行前，将当前行“固化”到缓冲区 ---
             const fullLineText = this.prompt + this.currentLine;
             // (我们使用 escapeHtml 来匹配 _render 中的逻辑，确保安全)
             const escapedLine = this.escapeHtml(fullLineText);
             // (我们填充行尾的空格，就像 _render 那样)
             const padding = ' '.repeat(Math.max(0, this.cols - fullLineText.length));
             this.buffer[this.cursorY] = escapedLine + padding;
-            // --- [结束新增] ---
+            
 
             this._handleNewline(); // 现在换行 (cursorY++)
             
@@ -634,9 +714,33 @@ class Terminal {
 
         } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
             e.preventDefault();
-            // (历史记录逻辑)
-            // this._render(); // 如果有历史记录，记得渲染
-            return; // 结束
+            
+            if (this.history.length === 0) return; // 没有历史
+
+            if (e.key === 'ArrowUp') {
+                if (this.historyIndex === this.history.length) {
+                    // 如果在“新行”上，保存它
+                    this.tempLine = this.currentLine;
+                }
+                if (this.historyIndex > 0) {
+                    this.historyIndex--;
+                    this.currentLine = this.history[this.historyIndex];
+                }
+            } else { // ArrowDown
+                if (this.historyIndex < this.history.length) {
+                    this.historyIndex++;
+                    if (this.historyIndex === this.history.length) {
+                        // 恢复到“新行”
+                        this.currentLine = this.tempLine;
+                    } else {
+                        this.currentLine = this.history[this.historyIndex];
+                    }
+                }
+            }
+            // 移动光标到行尾
+            this.cursorX = this.prompt.length + this.currentLine.length;
+            this._render();
+            return; // [修改] 确保返回
         }
 
         // --- 3. 处理普通字符输入 ---
@@ -1023,7 +1127,8 @@ class BookmarkSystem {
                 continue;
             }
             
-            const foundNode = (currentNode.children || []).find(child => child.title === segment); // 添加保护
+            // const foundNode = (currentNode.children || []).find(child => child.title === segment); // 添加保护
+            const foundNode = (currentNode.children || []).find(child => child.title.trim() === segment);
             if (foundNode) {
                 currentNode = foundNode;
                 // --- 修复：确保只有当找到的是目录时才更新路径 ---
@@ -1045,6 +1150,7 @@ class BookmarkSystem {
     }
 
     _findChildByTitle(children, title) {
+        const trimmedTitle = title ? title.trim() : '';
         return (children || []).find(child => child.title === title);
     }
     
@@ -1108,6 +1214,156 @@ function parseStartrc(content) {
 }
 
 /**
+ * [新增] 查找一组匹配项的最长公共前缀 (LCP)
+ */
+function findLCP(matches) {
+    let lcp = matches[0].title.trim();
+    for (let i = 1; i < matches.length; i++) {
+        const title = matches[i].title.trim();
+        while (!title.startsWith(lcp)) {
+            lcp = lcp.substring(0, lcp.length - 1);
+            if (lcp === "") break;
+        }
+    }
+    return lcp;
+}
+
+/**
+ * [新增] 比较两个匹配数组是否相同
+ */
+function arraysAreEqual(arr1, arr2) {
+    if (arr1.length !== arr2.length) return false;
+    for (let i = 0; i < arr1.length; i++) {
+        if (arr1[i].id !== arr2[i].id) return false; // 按书签 ID 比较
+    }
+    return true;
+}
+
+/**
+ * [新增] Tab 补全的核心逻辑
+ * (需要全局的 term 和 bookmarkSystem 实例)
+ */
+/**
+ * [重构] Tab 补全核心逻辑
+ * - 支持双击列出选项
+ * - 支持带空格的文件名（自动加引号）
+ */
+function handleTabCompletion(line, pos) {
+    const currentTime = Date.now();
+    
+    // 1. 找出要补全的 "token" (逻辑不变)
+    const lineUpToCursor = line.substring(0, pos);
+    const lastSpace = lineUpToCursor.lastIndexOf(' ');
+    const tokenToComplete = lineUpToCursor.substring(lastSpace + 1);
+    const tokenStartIndex = lastSpace + 1; 
+
+    // 2. 确定搜索目录和 "partial" (逻辑不变)
+    let searchDirNode;
+    let partial;
+    let pathPrefix = ''; 
+
+    const lastSlash = tokenToComplete.lastIndexOf('/');
+    if (lastSlash > -1) {
+        pathPrefix = tokenToComplete.substring(0, lastSlash + 1);
+        partial = tokenToComplete.substring(lastSlash + 1);
+        const result = bookmarkSystem._findNodeByPath(pathPrefix);
+        if (result && result.node && result.node.children) {
+            searchDirNode = result.node;
+        } else {
+            return; 
+        }
+    } else {
+        searchDirNode = bookmarkSystem.current;
+        partial = tokenToComplete;
+    }
+
+    if (!searchDirNode || !searchDirNode.children) {
+        return; 
+    }
+
+    // 3. 查找所有匹配项 (逻辑不变)
+    const matches = searchDirNode.children.filter(child => 
+        child.title.trim().startsWith(partial)
+    );
+
+    // --- 4. [新] 补全逻辑 ---
+
+    if (matches.length === 0) {
+        lastTabMatches = []; // 重置
+        return; // 没有匹配项
+    }
+
+    if (matches.length === 1) {
+        // 4a. 只有一个匹配项：直接补全
+        lastTabMatches = []; // 重置
+        const match = matches[0];
+        let matchName = match.title.trim(); // e.g., "UPDF Account Center"
+        
+        let completion = pathPrefix + matchName;
+        if (match.children) {
+            completion += '/'; // e.g., "My Documents/"
+        }
+
+        // [!! 修复空格 Bug !!]
+        // 如果补全包含空格，并且原始 token 不带引号，则添加引号
+        if (completion.includes(' ') && !tokenToComplete.startsWith('"')) {
+            completion = `"${completion}"`; // e.g., '"UPDF Account Center"'
+        }
+        
+        const textBeforeToken = line.substring(0, tokenStartIndex);
+        const textAfterCursor = line.substring(pos); // 光标后的文本
+        
+        const newLine = textBeforeToken + completion + textAfterCursor;
+        const newCursorPos = (textBeforeToken + completion).length;
+        
+        term.setCommand(newLine, newCursorPos);
+
+    } else {
+        // 4b. 多个匹配项：
+        const lcp = findLCP(matches);
+
+        if (lcp.length > partial.length) {
+            // 我们可以补全更多 (LCP)
+            lastTabMatches = []; // 重置
+            
+            const completion = pathPrefix + lcp;
+            // (注意：LCP 补全暂未处理空格转义，这更复杂)
+            
+            const textBeforeToken = line.substring(0, tokenStartIndex);
+            const textAfterCursor = line.substring(pos);
+            const newLine = textBeforeToken + completion + textAfterCursor;
+            const newCursorPos = (textBeforeToken + completion).length;
+            term.setCommand(newLine, newCursorPos);
+
+        } else {
+            // 4c. 无法进一步补全 (LCP === partial)。检查双击。
+            const isDoubleTap = (currentTime - lastTabTime < 500); // 500ms 阈值
+            
+            if (isDoubleTap && arraysAreEqual(matches, lastTabMatches)) {
+                // 这是第二次 Tab，列出所有选项
+                term._handleNewline(); 
+                const output = matches.map(m => {
+                    const title = m.title.trim();
+                    return m.children ? `${title}/` : title;
+                }).join('   ');
+                
+                term.writeHtml(output); 
+                
+                bookmarkSystem.update_user_path(); 
+                term.setCommand(line, pos); // 恢复当前行
+                
+                lastTabMatches = []; // 重置
+            } else {
+                // 这是第一次 Tab。只存储状态
+                lastTabMatches = matches;
+            }
+        }
+    }
+    
+    lastTabTime = currentTime; // 记录本次 Tab 时间
+}
+
+/**
  * 从 localStorage 加载虚拟 .startrc 文件内容
  * @returns {string}
  */
@@ -1150,6 +1406,10 @@ function saveStyleSettings() {
 
 let isPiping = false;
 let pipeBuffer = [];
+
+// Tab 
+let lastTabMatches = [];
+let lastTabTime = 0;
 
 const term = new Terminal('terminal-container', 'input-handler');
 const bookmarkSystem = new BookmarkSystem(term); // 将 term 传给 BookmarkSystem
@@ -1427,6 +1687,7 @@ async function main() {
 
     // 4. 设置命令处理器
     term.onCommand = executeLine;
+    term.onTab = handleTabCompletion;
 
     // 5. 打印欢迎信息 (现在缓冲区尺寸正确)
     // term.writeLine("Welcome to Start-Terminal 2.0!");

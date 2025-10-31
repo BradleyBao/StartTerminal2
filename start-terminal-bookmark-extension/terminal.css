@@ -45,9 +45,6 @@ html, body::selection {
 
 #terminal-buffer {
     margin: 0;
-    /* * white-space: pre; 是核心！
-     * 它告诉浏览器完全按照 <pre> 标签中的文本（包括空格和换行）来渲染。
-     */
     white-space: pre;
     font-family: var(--terminal-font-family);
     font-size: var(--terminal-font-size);
@@ -58,7 +55,7 @@ html, body::selection {
     background-color: var(--cursor-bg-color);
     color: var(--cursor-fg-color);
     animation: blink 1s steps(2, start) infinite;
-    font-family: monospace;
+    font-family: inherit;
 }
 
 #input-handler {
