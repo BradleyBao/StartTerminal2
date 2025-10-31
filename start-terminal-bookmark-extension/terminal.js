@@ -164,6 +164,10 @@ class Terminal {
         this.container.addEventListener('click', () => this.focus());
         // 窗口大小调整时，重新计算
         window.addEventListener('resize', () => this._handleResize());
+
+        // IME Listen 
+        this.inputHandler.addEventListener('compositionstart', (e) => this._handleCompositionStart(e));
+        this.inputHandler.addEventListener('compositionend', (e) => this._handleCompositionEnd(e));
     }
 
     /**
@@ -185,6 +189,7 @@ class Terminal {
                 // --- Input/Output Separation Logic (No Change Here) ---
                 const promptHtml = this.escapeHtml(this.prompt);
                 const inputHtml = this.escapeHtml(this.currentLine);
+                // console.log(this.currentLine, this.prompt)
                 const fullLineText = this.prompt + this.currentLine;
                 const padding = ' '.repeat(Math.max(0, this.cols - fullLineText.length));
                 
@@ -205,6 +210,39 @@ class Terminal {
             }
         }
         this.domBuffer.innerHTML = html;
+    }
+
+    /**
+     * [新增] 处理输入法开始
+     */
+    _handleCompositionStart(e) {
+        this.isComposing = true;
+    }
+
+    /**
+     * [新增] 处理输入法结束 (选择或确认)
+     */
+    _handleCompositionEnd(e) {
+        this.isComposing = false;
+        
+        // --- 关键：
+        // 在 `compositionend` 时，`e.data` 包含最终的字符（如 "l" 或 "你"）
+        // 此时 `input` 事件可能不会再触发，或者我们不应该依赖它。
+        // 我们需要在这里手动处理输入。
+        
+        if (this.inputDisabled) return; 
+
+        const text = e.data; // 获取输入法确认的文本
+        
+        if (text) {
+            const pos = this.cursorX - this.prompt.length;
+            this.currentLine = this.currentLine.substring(0, pos) + text + this.currentLine.substring(pos);
+            this.cursorX += text.length; // 移动光标
+            this._render(); // 重新渲染
+        }
+
+        // 清空隐藏的 input，防止它干扰下一次按键
+        this.inputHandler.value = '';
     }
 
     /**
@@ -273,6 +311,7 @@ class Terminal {
             // --- 不需要换行，片段完全适合当前行 ---
             // --- 关键调用点 2 ---
             this.buffer[this.cursorY] = this._overwriteHtml(this.buffer[this.cursorY], this.cursorX, htmlFragment);
+
             this.cursorX += visibleLength; // 更新光标位置
         }
     }
@@ -463,57 +502,179 @@ class Terminal {
     /**
      * 处理按键（非 IME）
      */
+    /**
+     * 处理按键（非 IME）
+     * [调整] 将 _render() 移动到每个分支内部，确保成功处理后才重绘
+     */
     _handleKeydown(e) {
-        // 阻止 F5, Tab 等默认行为，但允许 Ctrl+C/V/R 等
-        if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
-            e.preventDefault();
-        } else if (e.key === "Backspace" || e.key === "Enter" || e.key === "Tab") {
-            e.preventDefault();
+        // 如果正在输入法组合中，则忽略 keydown，等待 compositionend
+        if (this.isComposing) return;
+
+        // --- 1. 处理 Ctrl 组合键 (Emacs 绑定) ---
+        if (e.ctrlKey) {
+            let handled = true; 
+            switch (e.key.toLowerCase()) {
+                // ... (Ctrl+A, E, B, F, U, K, D, L 的 case... 保持不变) ...
+                case 'a': 
+                    this.cursorX = this.prompt.length;
+                    break;
+                case 'e': 
+                    this.cursorX = this.prompt.length + this.currentLine.length;
+                    break;
+                case 'b': 
+                    if (this.cursorX > this.prompt.length) this.cursorX--;
+                    break;
+                case 'f': 
+                    if (this.cursorX < this.prompt.length + this.currentLine.length) this.cursorX++;
+                    break;
+                case 'u': 
+                    {
+                        const pos = this.cursorX - this.prompt.length;
+                        if (pos > 0) {
+                            this.currentLine = this.currentLine.substring(pos);
+                            this.cursorX = this.prompt.length;
+                        }
+                    }
+                    break;
+                case 'k': 
+                    {
+                        const pos = this.cursorX - this.prompt.length;
+                        this.currentLine = this.currentLine.substring(0, pos);
+                    }
+                    break;
+                case 'd': 
+                    {
+                        const pos = this.cursorX - this.prompt.length;
+                        if (pos < this.currentLine.length) {
+                            this.currentLine = this.currentLine.substring(0, pos) + this.currentLine.substring(pos + 1);
+                        }
+                    }
+                    break;
+                case 'l': 
+                    this._initBuffer();
+                    this.cursorY = 0;
+                    this.cursorX = this.prompt.length;
+                    break;
+                // ... (case 'c' 保持不变) ...
+                case 'c': 
+                    this._handleNewline();
+                    this.currentLine = ''; 
+                    this.cursorX = 0;
+                    if (this.onCommand) {
+                        this.onCommand(""); 
+                    }
+                    break;
+                default:
+                    handled = false; 
+            }
+
+            if (handled) {
+                e.preventDefault();
+                this._render(); // [!] 在
+                return;
+            }
         }
 
-        if (e.key === 'Enter') {
-            const command = this.currentLine;
-            this._handleNewline(); // 换行
-            
-            // 触发命令执行
-            if (this.onCommand) {
-                this.onCommand(command);
-            }
-            
-            this.currentLine = ''; // 清空当前行
-            // (注意：这里我们不立即显示提示符，我们等待命令执行完毕后)
-            // (在我们的例子中，命令会立即在回调中显示提示符)
-
-        } else if (e.key === 'Backspace') {
-            if (this.currentLine.length > 0) {
-                this.currentLine = this.currentLine.slice(0, -1);
-                // "擦除" 屏幕上的最后一个字符
-                this.cursorX--;
-                this.buffer[this.cursorY] = this.buffer[this.cursorY].substring(0, this.cursorX) + 
-                                            ' ' + 
-                                            this.buffer[this.cursorY].substring(this.cursorX + 1);
-            }
-        } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
-            // 普通字符输入
-            this.currentLine += e.key;
-            this._writeSingleLine(e.key); // 将字符写入缓冲区
-
+        // --- 2. 处理功能键 (Enter, Backspace, Arrows) ---
+        
+        if (e.key === "Tab") {
+            e.preventDefault();
+            // (Tab 补全逻辑)
+            // this._render(); // 如果有补全，记得渲染
+            return; // Tab 不应触发末尾的 _render
         }
         
-        this._render(); // 每次按键后都重绘
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            const command = this.currentLine;
+
+            // --- [新增] 在换行前，将当前行“固化”到缓冲区 ---
+            const fullLineText = this.prompt + this.currentLine;
+            // (我们使用 escapeHtml 来匹配 _render 中的逻辑，确保安全)
+            const escapedLine = this.escapeHtml(fullLineText);
+            // (我们填充行尾的空格，就像 _render 那样)
+            const padding = ' '.repeat(Math.max(0, this.cols - fullLineText.length));
+            this.buffer[this.cursorY] = escapedLine + padding;
+            // --- [结束新增] ---
+
+            this._handleNewline(); // 现在换行 (cursorY++)
+            
+            if (this.onCommand) {
+                this.onCommand(command); // 命令将在新行上打印输出
+            }
+            
+            this.currentLine = ''; 
+            this.cursorX = 0; 
+            return; // `done()` 会调用 setPrompt -> _render
+        } else if (e.key === 'Backspace') {
+            e.preventDefault();
+            const pos = this.cursorX - this.prompt.length;
+            if (pos > 0) {
+                this.currentLine = this.currentLine.substring(0, pos - 1) + this.currentLine.substring(pos);
+                this.cursorX--; 
+                this._render(); // [!] 移动到内部
+            }
+            return; // 结束
+
+        } else if (e.key === 'ArrowLeft') {
+            e.preventDefault();
+            if (this.cursorX > this.prompt.length) {
+                this.cursorX--;
+                this._render(); // [!] 移动到内部
+            }
+            return; // 结束
+
+        } else if (e.key === 'ArrowRight') {
+            e.preventDefault();
+            if (this.cursorX < this.prompt.length + this.currentLine.length) {
+                this.cursorX++;
+                this._render(); // [!] 移动到内部
+            }
+            return; // 结束
+
+        } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+            e.preventDefault();
+            // (历史记录逻辑)
+            // this._render(); // 如果有历史记录，记得渲染
+            return; // 结束
+        }
+
+        // --- 3. 处理普通字符输入 ---
+        else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+            e.preventDefault();
+            const pos = this.cursorX - this.prompt.length;
+            const char = e.key;
+            
+            this.currentLine = this.currentLine.substring(0, pos) + char + this.currentLine.substring(pos);
+            this.cursorX++; 
+            this._render(); // [!] 移动到内部
+            return; // 结束
+        }
+        
+        // (原先在函数末尾的 _render() 已被移除或分配到各个分支)
     }
 
     /**
      * 处理 IME 输入或粘贴
      */
     _handleInput(e) {
+        // --- 核心 IME 修复 ---
+        // 如果正在输入法组合中，忽略所有 `input` 事件
+        // 我们将只在 `compositionend` 事件中处理最终结果
+        if (this.isComposing) return; 
+        // --- 结束 ---
+
+        if (this.inputDisabled) return; 
+        
+        // (这个逻辑现在主要用于处理粘贴)
         const text = e.target.value;
         if (text) {
-            this.currentLine += text;
-            this._writeSingleLine(text);
+            // const pos = this.cursorX - this.promptLength;
+            const pos = this.cursorX - this.prompt.length;
+            this.currentLine = this.currentLine.substring(0, pos) + text + this.currentLine.substring(pos);
+            this.cursorX += text.length;
             this._render();
         }
-        // 立即清空 textarea，为下一次输入做准备
         e.target.value = '';
     }
 

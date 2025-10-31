@@ -32,6 +32,25 @@ function saveStyleSettings() {
     console.log("Saved styles - Font:", currentFont, "Size:", currentSize); // Debug
 }
 
+// Initial Global Variables
+const Environment = {
+    'LANG': 'en', // 默认语言
+    'USER': 'user',
+    'HOST': 'ST2.0',
+    "PS1": '\\u@\\h:\\w\\$ ',
+    // More will load by .startrc
+}
+
+// International Help Function 
+function t(key) {
+    const lang = Environment.LANG || 'en';
+    if (messages[lang] && messages[lang][key]) {
+        return messages[lang][key];
+    } 
+    // roll back to English 
+    return messages['en'][key] || key;
+}
+
 /**
  * 核心终端模拟器类
  */
@@ -66,6 +85,11 @@ class Terminal {
         this._initBuffer();
         this._attachListeners();
         this.focus();
+    }
+
+    async initialize() {
+        await this._calculateDimensions();
+        this._initBuffer();
     }
 
     /**
@@ -524,11 +548,46 @@ class BookmarkSystem {
         this.homeDirNode = null;
         this.full_path = "~ $"; // 默认提示符
 
+        // VFS 
+        this.vfsEtc = {
+            id: 'vfs-etc',
+            title: 'etc',
+            children: [
+                {
+                    id: 'vfs-startrc',
+                    title: '.startrc',
+                    url: `data:text/plain;base64,${btoa(encodeURIComponent(loadVirtualStartrc()))}`, // 编码前先 URI 编码
+                    children: null
+                }
+            ],
+            parentId: 'vfs-root'
+        };
+
+        // Virtual Root Directory 
+        this.virtualRoot = {
+            id: 'vfs-root',
+            title: '', // 根目录没有标题
+            children: [ this.vfsEtc ], // 默认包含 /etc
+            parentId: null
+        };
+
         // --- 将命令实现移入此类 ---
         this.commands = {
             'cd': (args, options) => {
-                const targetPath = args[0] || '~';
-                if (targetPath === '..') {
+                const targetPath = args[0] || '~'; // 默认 'cd' 等同于 'cd ~'
+
+                // --- 新增：显式处理 'cd ~' ---
+                if (targetPath === '~') {
+                    if (this.homeDirNode) {
+                        this.current = this.homeDirNode;
+                        this.path = [this.virtualRoot, this.homeDirNode];
+                    } else {
+                        // 如果 home 目录不存在，则转到根目录
+                        this.current = this.virtualRoot;
+                        this.path = [this.virtualRoot];
+                    }
+                // --- 结束新增 ---
+                } else if (targetPath === '..') {
                     if (this.path.length > 1) {
                         this.path.pop();
                         this.current = this.path[this.path.length - 1];
@@ -539,9 +598,9 @@ class BookmarkSystem {
                         this.current = result.node;
                         this.path = result.newPathArray;
                     } else if (result && result.node) {
-                        this.term.writeHtml(`<span class="term-error">cd: ${targetPath}: Not a directory</span>`);
+                        this.term.writeHtml(`<span class="term-error">${t('notADir')}: ${targetPath}</span>`);
                     } else {
-                        this.term.writeHtml(`<span class="term-error">cd: ${targetPath}: No such file or directory</span>`);
+                        this.term.writeHtml(`<span class="term-error">${t('noSuchFileOrDir')}: ${targetPath}</span>`);
                     }
                 }
                 this.update_user_path(); // cd 后更新路径
@@ -631,98 +690,136 @@ class BookmarkSystem {
             },
             'pwd': (args, options) => {
                 let displayPath;
-                // 核心修复：移除所有对 '~' 的特殊处理
-                // 始终从根目录开始构建路径
+                // --- 核心修复：pwd 始终显示绝对路径，从不显示 ~ ---
                 if (!this.root) {
-                        displayPath = "/"; // 容错处理
+                    displayPath = "/"; // 容错
                 } else if (this.path.length <= 1) {
-                        displayPath = "/"; // 根目录本身
+                    displayPath = "/"; // 根目录
                 } else {
-                        // 从 path 数组的第二个元素（根目录之后）开始
-                        // 获取所有节点的 title 并用 '/' 连接
-                        displayPath = "/" + this.path.slice(1).map(node => node.title).join("/");
+                    // 从 path 数组的第二个元素（根目录之后）开始
+                    // 获取所有节点的 title 并用 '/' 连接
+                    displayPath = "/" + this.path.slice(1).map(node => node.title).join("/");
                 }
+                // --- 结束修复 ---
                 this.term.writeLine(displayPath); // 使用 writeLine 输出纯文本
-            }
+            },
         };
     }
 
     // --- 将书签相关的辅助函数移入此类 ---
 
     async initialize() {
-            await this._refreshBookmarks();
+            await this._refreshBookmarks(); // 加载并合并 VFS
+            
+            try {
+                const startrcNode = this._findNodeByPath('/etc/.startrc');
+                if (startrcNode && startrcNode.node && startrcNode.node.url) {
+                    const base64Content = startrcNode.node.url.split(',')[1] || '';
+                    const rcContent = decodeURIComponent(atob(base64Content));
+                    parseStartrc(rcContent);
+                } else {
+                    console.warn(".startrc not found, using default environment.");
+                    parseStartrc(defaultStartrcContent); 
+                }
+            } catch (e) {
+                console.error("Error loading .startrc:", e);
+            }
+
+            // --- 关键修复：在 _refreshBookmarks 之后设置初始路径 ---
+            this.current = this.homeDirNode || this.virtualRoot; // 默认启动目录 (Home 或 Root)
+            this.path = this.homeDirNode ? [this.virtualRoot, this.homeDirNode] : [this.virtualRoot];
+            // --- 结束 ---
+            this.update_user_path();
     }
 
     async _refreshBookmarks() {
-        if (typeof chrome === 'undefined' || !chrome.bookmarks) {
-            console.warn("chrome.bookmarks API not available. Using mock data.");
-            if (!this.root) {
-                this.root = { id: '0', title: 'Root', children: [
-                    { id: '1', title: 'Bookmarks Bar', children: [
-                        { id: '3', title: 'Work', children: [] },
-                        { id: '4', title: 'Personal', url: 'https://google.com' }
-                    ] },
-                    { id: '2', title: 'Other Bookmarks', children: [] }
-                ]};
-                this.homeDirNode = this.root.children[0];
-                this.current = this.homeDirNode;
-                this.path = [this.root, this.homeDirNode];
-            }
-            return; 
-        }
-
-        const tree = await new Promise(resolve => chrome.bookmarks.getTree(resolve));
-        this.root = tree[0];
-        this.homeDirNode = (this.root.children && this.root.children.length > 0) ? this.root.children[0] : this.root;
-        
-        if (this.path.length === 0) { 
-                this.current = this.homeDirNode;
-                this.path = [this.root, this.homeDirNode];
-                return;
-        }
-
-        let tempCurrent = this.root;
-        let tempPath = [this.root];
-        let pathIsValid = true;
-        
-        for (let i = 1; i < this.path.length; i++) {
-            const nodeId = this.path[i].id;
-            const foundNode = (tempCurrent.children || []).find(c => c.id === nodeId);
-            if (foundNode) {
-                tempCurrent = foundNode;
-                tempPath.push(foundNode);
+            if (typeof chrome === 'undefined' || !chrome.bookmarks) {
+                console.warn("chrome.bookmarks API not available. Using mock data.");
+                if (!this.root) {
+                    this.root = { id: '0', title: 'Root', children: [ { id: '1', title: 'Bookmarks Bar', children: [ { id: '3', title: 'Work', children: [] }, { id: '4', title: 'Personal', url: 'https://google.com' } ] }, { id: '2', title: 'Other Bookmarks', children: [] }]};
+                }
             } else {
-                pathIsValid = false;
-                break;
+                const tree = await new Promise(resolve => chrome.bookmarks.getTree(resolve));
+                this.root = tree[0];
             }
-        }
-        
-        if (pathIsValid) {
-            this.current = tempCurrent;
-            this.path = tempPath;
-        } else {
-            this.current = this.homeDirNode;
-            this.path = [this.root, this.homeDirNode];
-        }
+
+            // --- 核心 VFS 修复 ---
+            // 1. 设置 homeDirNode (可能为 null)
+            this.homeDirNode = (this.root.children && this.root.children.length > 0) ? this.root.children[0] : null;
+
+            // 2. 无条件合并 vfsEtc 和 真实书签
+            // 确保 this.root.children 存在
+            const bookmarkChildren = this.root.children || []; 
+            this.virtualRoot.children = [ this.vfsEtc, ...bookmarkChildren ];
+
+            // 3. 为已合并的真实书签设置正确的 parentId (用于 'cd ..' 等)
+            bookmarkChildren.forEach(child => {
+                child.parentId = 'vfs-root';
+            });
+            if (this.homeDirNode) {
+                 this.homeDirNode.parentId = 'vfs-root'; // 确保 homeDirNode 的 parentId 也被设置
+            }
+            // --- 结束 VFS 修复 ---
+            
+
+            // --- 路径验证逻辑 (使用 virtualRoot) ---
+            if (this.path.length === 0) { // 首次初始化
+                 // 移到 initialize 函数中
+            } else {
+                // 验证当前路径
+                let tempCurrent = this.virtualRoot; // 从 VFS 根开始验证
+                let tempPath = [this.virtualRoot];
+                let pathIsValid = true;
+                
+                for (let i = 1; i < this.path.length; i++) {
+                    const nodeId = this.path[i].id;
+                    const foundNode = (tempCurrent.children || []).find(c => c.id === nodeId);
+                    if (foundNode) {
+                        tempCurrent = foundNode;
+                        tempPath.push(foundNode);
+                    } else {
+                        pathIsValid = false;
+                        break;
+                    }
+                }
+                
+                if (pathIsValid) {
+                    this.current = tempCurrent;
+                    this.path = tempPath;
+                } else {
+                    // 路径无效, 重置回 Home (如果存在) 或 VFS 根
+                    this.current = this.homeDirNode || this.virtualRoot;
+                    this.path = this.homeDirNode ? [this.virtualRoot, this.homeDirNode] : [this.virtualRoot];
+                }
+            }
     }
 
     update_user_path() {
         let displayPath;
+        
         if (!this.root || !this.homeDirNode) { 
-                displayPath = "~";
-        } else if (this.path.length >= 2 && this.path[0] === this.root && this.path[1] === this.homeDirNode) {
+                displayPath = "/"; // 回退
+        } else if (this.path.length >= 2 && this.path[0] === this.virtualRoot && this.path[1] === this.homeDirNode) {
+            // 如果我们在 home 目录或其子目录中
             displayPath = this.path.length === 2 ? "~" : "~/" + this.path.slice(2).map(p => p.title).join("/");
         } else if (this.path.length > 0) {
-            const pathString = this.path.slice(1).map(p => p.title).join("/");
-            displayPath = "/" + pathString;
+            // 否则，显示从 VFS 根开始的完整路径
+            displayPath = "/" + this.path.slice(1).map(p => p.title).join("/");
         } else {
                 displayPath = "/"; 
         }
+        // --- 结束修复 ---
         
-        this.full_path = `user@ST2.0:${displayPath}$`;
+        let promptString = Environment.PS1 || '\\$ '; // 回退
+        promptString = promptString.replace(/\\u/g, Environment.USER || 'user');
+        promptString = promptString.replace(/\\h/g, Environment.HOST || 'host');
+        promptString = promptString.replace(/\\w/g, displayPath); // \w 现在会是 ~ 或 /path
+        promptString = promptString.replace(/\\\$/g, '$');
+
+        this.full_path = promptString;
         
         if (!this.term.inputDisabled) {
-            this.term.setPrompt(this.full_path + " ");
+            this.term.setPrompt(this.full_path);
         }
     }
 
@@ -734,12 +831,15 @@ class BookmarkSystem {
         let pathSegments;
 
         if (pathStr.startsWith('~/')) {
+            if (!this.homeDirNode) return null; // Home 目录不存在
             startNode = this.homeDirNode;
-            newPathArray = [this.root, this.homeDirNode];
+            newPathArray = [this.virtualRoot, this.homeDirNode];
             pathSegments = pathStr.substring(2).split('/').filter(s => s.length > 0);
         } else if (pathStr.startsWith('/')) {
-            startNode = this.root;
-            newPathArray = [this.root];
+            // startNode = this.root;
+            startNode = this.virtualRoot; // 从虚拟根开始
+            // newPathArray = [this.root];
+            newPathArray = [this.virtualRoot]; // 从虚拟根开始
             pathSegments = pathStr.substring(1).split('/').filter(s => s.length > 0);
         } else {
             startNode = this.current;
@@ -799,8 +899,93 @@ class BookmarkSystem {
 }
 
 // ===============================================
+// =       3. 虚拟文件系统 (VFS)           =
+// ===============================================
+
+const defaultStartrcContent = `
+# Start-Terminal 2.0 Config File 
+#
+# Set Environment Variables 
+# use export KEY=VALUE
+
+# --- Prompt String ---
+# \\u = user (user)
+# \\h = host (ST2.0)
+# \\w = working directory (~ or /Bookmarks Bar)
+# \\$ = prompt symbol ($)
+export PS1="\\u@\\h:\\w\\$ "
+
+# --- Language ---
+# 'en' for English
+# 'zh' for 简体中文
+export LANG="en"
+`
+
+/**
+ * 解析 .startrc 内容并更新 Environment 对象
+ * @param {string} content - .startrc 文件内容
+ */
+function parseStartrc(content) {
+    const lines = content.split('\n');
+    const exportRegex = /^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/;
+
+    for (const line of lines) {
+        const match = line.match(exportRegex);
+        if (match) {
+            const key = match[1];
+            let value = match[2];
+
+            // 去除值两端的引号（"value" or 'value')
+            if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+                value = value.substring(1, value.length - 1);
+            }
+            
+            Environment[key] = value;
+            console.log(`[Env] Set ${key} = "${value}"`);
+        }
+    }
+}
+
+/**
+ * 从 localStorage 加载虚拟 .startrc 文件内容
+ * @returns {string}
+ */
+function loadVirtualStartrc() {
+    // 我们用 localStorage 来模拟持久化
+    const content = localStorage.getItem('.startrc');
+    if (content === null) {
+        // 如果不存在，创建默认的
+        localStorage.setItem('.startrc', defaultStartrcContent);
+        return defaultStartrcContent;
+    }
+    return content;
+}
+
+
+// ===============================================
 // =           初始化和使用 Terminal         =
 // ===============================================
+
+// Helper Function 
+function loadStyleSettings() {
+    const savedFont = localStorage.getItem('terminalFontFamily');
+    const savedSize = localStorage.getItem('terminalFontSize');
+    const rootStyle = getComputedStyle(document.documentElement);
+    const defaultFont = rootStyle.getPropertyValue('--terminal-font-family').trim() || "'Consolas', 'Courier New', monospace";
+    const defaultSize = rootStyle.getPropertyValue('--terminal-font-size').trim() || '14px';
+    const fontFamily = savedFont || defaultFont;
+    const fontSize = savedSize || defaultSize;
+    document.documentElement.style.setProperty('--terminal-font-family', fontFamily);
+    document.documentElement.style.setProperty('--terminal-font-size', fontSize);
+}
+function saveStyleSettings() {
+    const currentFont = getComputedStyle(document.documentElement).getPropertyValue('--terminal-font-family').trim();
+    const currentSize = getComputedStyle(document.documentElement).getPropertyValue('--terminal-font-size').trim();
+    localStorage.setItem('terminalFontFamily', currentFont);
+    localStorage.setItem('terminalFontSize', currentSize);
+}
+
+
 
 let isPiping = false;
 let pipeBuffer = [];
@@ -809,129 +994,161 @@ const term = new Terminal('terminal-container', 'input-handler');
 const bookmarkSystem = new BookmarkSystem(term); // 将 term 传给 BookmarkSystem
 
 // --- 将非书签命令移到这里 ---
+// (替换) 你现有的 globalCommands 对象
 const globalCommands = {
-        'grep': (args, options, pipedInput) => {
-        if (!args[0]) {
-            term.writeHtml(`<span class="term-error">grep: missing pattern</span>`);
-            return;
-        }
-        if (!pipedInput) {
-            term.writeHtml(`<span class="term-error">grep: requires piped input</span>`);
-            return;
-        }
+     'grep': (args, options, pipedInput) => {
+        if (!args[0]) { term.writeHtml(`<span class="term-error">${t('grepMissingPattern')}</span>`); return; }
+        if (!pipedInput) { term.writeHtml(`<span class="term-error">${t('grepRequiresPipe')}</span>`); return; }
         const pattern = new RegExp(args[0], 'i');
         const matches = pipedInput.filter(line => pattern.test(line));
         matches.forEach(line => term.writeLine(line));
         return matches;
-    },
-    
-    'wc': (args, options, pipedInput) => {
-        if (!pipedInput) {
-            term.writeHtml(`<span class="term-error">wc: requires piped input</span>`);
-            return;
-        }
+     },
+     'wc': (args, options, pipedInput) => {
+        if (!pipedInput) { term.writeHtml(`<span class="term-error">${t('wcRequiresPipe')}</span>`); return; }
         const lines = pipedInput.length;
         const words = pipedInput.join(' ').split(/\s+/).filter(Boolean).length;
         const chars = pipedInput.join('\n').length;
         term.writeLine(` ${lines}  ${words}  ${chars}`);
-    },
-    'clear': (args, options) => {
-        term._initBuffer();
-    },
-    'help': (args, options) => {
-            term.writeLine("Welcome to Start Terminal 2");
-            term.writeLine("Bookmark commands moved to BookmarkSystem.");
-    },
-        'echo': (args, options) => {
-        term.writeLine(args.join(' ')); 
-    },
-    'greet': (args, options) => {
-            const name = args[0]; 
-        if (name) {
-            term.writeLine(`你好, ${name}! 欢迎来到终端。`); 
-            if (options.v || options.verbose) { 
-                term.writeLine(" (Verbose mode enabled!)");
-            }
-        } else {
-            term.writeLine("用法: greet [你的名字] [-v or --verbose]");
-        }
-    },
-    'style': async (args, options) => { // 注意：设为 async 以便 await _handleResize
+     },
+     'clear': (args, options) => { term._initBuffer(); },
+     'help': (args, options) => {
+         term.writeLine(t('welcome'));
+         term.writeLine(t('features'));
+     },
+     'echo': (args, options) => { term.writeLine(args.join(' ')); },
+     'greet': (args, options) => {
+         const name = args[0];
+         if (name) {
+             term.writeLine(`你好, ${name}!`); // Greet 保持中文
+             if (options.v || options.verbose) { term.writeLine(" (Verbose mode enabled!)"); }
+         } else { term.writeHtml(`<span class="term-error">${t('greetUsage')}</span>`); }
+     },
+     'style': async (args, options) => {
+        // ... (你现有的 style 命令代码保持不变) ...
         const subCommand = args[0];
-        const value = args.slice(1).join(' '); // 获取子命令之后的所有内容作为值
-
+        const value = args.slice(1).join(' ');
         const rootStyle = getComputedStyle(document.documentElement);
         const currentFont = rootStyle.getPropertyValue('--terminal-font-family').trim();
         const currentSize = rootStyle.getPropertyValue('--terminal-font-size').trim();
-
         if (!subCommand) {
-            // 显示当前设置
-            term.writeLine(`Current font: ${currentFont}`);
-            term.writeLine(`Current size: ${currentSize}`);
-            term.writeLine(`Usage:`);
-            term.writeLine(`  style font <font-family>`);
-            term.writeLine(`  style size <css-size>`);
-            term.writeLine(`  style reset`);
-            return; // 不需要返回 Promise
+            term.writeLine(`${t('styleCurrent')}:`);
+            term.writeLine(`  font: ${currentFont}`);
+            term.writeLine(`  size: ${currentSize}`);
+            return;
         }
-
         let needsResize = false;
-
         switch (subCommand.toLowerCase()) {
             case 'font':
-                if (!value) {
-                    term.writeHtml(`<span class="term-error">Usage: style font &lt;font-family&gt;</span>`);
-                    return;
-                }
-                // 基本验证 (可以更复杂，例如检查字体是否可用)
-                if (value.length < 3) {
-                     term.writeHtml(`<span class="term-error">Invalid font family: "${value}"</span>`);
-                     return;
-                }
+                if (!value) { term.writeHtml(`<span class="term-error">${t('styleUsageFont')}</span>`); return; }
+                if (value.length < 3) { term.writeHtml(`<span class="term-error">${t('styleInvalidFont')} "${value}"</span>`); return; }
                 document.documentElement.style.setProperty('--terminal-font-family', value);
-                term.writeLine(`Font set to: ${value}`);
+                term.writeLine(`${t('fontSet')} ${value}`);
                 needsResize = true;
                 break;
             case 'size':
-                if (!value) {
-                    term.writeHtml(`<span class="term-error">Usage: style size &lt;css-size&gt; (e.g., 14px, 1rem)</span>`);
-                    return;
-                }
-                // 基本验证 CSS 尺寸单位 (px, em, rem, pt)
-                if (!/^\d+(\.\d+)?(px|em|rem|pt)$/i.test(value)) {
-                    term.writeHtml(`<span class="term-error">Invalid size format: "${value}". Use units like px, em, rem, pt.</span>`);
-                    return;
-                }
+                if (!value) { term.writeHtml(`<span class="term-error">${t('styleUsageSize')}</span>`); return; }
+                if (!/^\d+(\.\d+)?(px|em|rem|pt)$/i.test(value)) { term.writeHtml(`<span class="term-error">${t('styleInvalidSize')} "${value}"</span>`); return; }
                 document.documentElement.style.setProperty('--terminal-font-size', value);
-                term.writeLine(`Size set to: ${value}`);
+                term.writeLine(`${t('sizeSet')} ${value}`);
                 needsResize = true;
                 break;
             case 'reset':
-                // 从 :root 获取默认值 (需要 CSS 中有定义)
-                 const defaultFont = "'Fira Code', 'Consolas', 'Courier New', monospace"; // 硬编码或尝试从 CSS :root 原始规则读取
+                 const defaultFont = "'Fira Code', 'Consolas', 'Courier New', monospace";
                  const defaultSize = "14px";
                  document.documentElement.style.setProperty('--terminal-font-family', defaultFont);
                  document.documentElement.style.setProperty('--terminal-font-size', defaultSize);
-                 term.writeLine(`Font and size reset to defaults.`);
+                 term.writeLine(t('styleReset'));
                  needsResize = true;
                  break;
-
             default:
-                term.writeHtml(`<span class="term-error">Unknown style command: ${subCommand}. Use 'font', 'size', or 'reset'.</span>`);
+                term.writeHtml(`<span class="term-error">${t('styleUnknownCmd')} ${subCommand}.</span>`);
                 return;
         }
-
         if (needsResize) {
-            saveStyleSettings(); // 保存新设置
-            // 触发重新计算尺寸和重绘
-            // 使用 setTimeout 确保样式先生效再计算
-            await new Promise(resolve => setTimeout(resolve, 50)); // 短暂延迟
-            await term._handleResize(); // 调用异步 resize 处理器
+            saveStyleSettings();
+            await new Promise(resolve => setTimeout(resolve, 50));
+            await term._handleResize();
         }
-        // 不需要 return true 或 false，await 已经处理了异步
-    },
-    // ... 你未来可以添加更多非书签命令 ...
+     },
+
+     // --- 新增：cat 命令 ---
+     'cat': (args, options) => {
+        if (!args[0]) {
+            term.writeHtml(`<span class="term-error">${t('missingOperand')}</span>`);
+            return;
+        }
+        const path = args[0];
+        // 使用 bookmarkSystem 的 VFS 路径查找器
+        const result = bookmarkSystem._findNodeByPath(path);
+
+        if (!result || !result.node) {
+            term.writeHtml(`<span class="term-error">${t('noSuchFileOrDir')}: ${path}</span>`);
+            return;
+        }
+        if (result.node.children) {
+            term.writeHtml(`<span class="term-error">${t('isADir')}: ${path}</span>`);
+            return;
+        }
+
+        const url = result.node.url;
+        if (!url) {
+            term.writeLine(""); // 空文件
+            return;
+        }
+
+        // 检查是否是我们的 .startrc 虚拟文件
+        if (result.node.id === 'vfs-startrc') {
+            try {
+                // 这个解码逻辑与 initialize 中的逻辑完全一致
+                const base64Content = url.split(',')[1] || '';
+                const content = decodeURIComponent(atob(base64Content));
+                term.writeLine(content); // 打印解码后的文件内容
+            } catch (e) {
+                term.writeHtml(`<span class="term-error">${path}: Error reading file: ${e.message}</span>`);
+            }
+        } else {
+            // 对于普通书签，只打印 URL
+            term.writeLine(url);
+        }
+     },
+
+     // --- 新增：export 命令 ---
+     'export': (args, options) => {
+        if (args.length === 0) {
+            // 如果没有参数，打印所有环境变量
+            for (const key in Environment) {
+                term.writeLine(`${key}="${Environment[key]}"`);
+            }
+            return;
+        }
+
+        const assignment = args.join(' '); // e.g., "LANG=zh" or "MY_VAR='hello world'"
+        const match = assignment.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+
+        if (match) {
+            const key = match[1];
+            let value = match[2];
+
+            // 去除值两端的引号
+            if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+                value = value.substring(1, value.length - 1);
+            }
+
+            // 在当前会话中设置环境变量
+            Environment[key] = value;
+            console.log(`[Env] Set (runtime) ${key} = "${value}"`);
+
+            // 特殊处理：如果更改了 LANG 或 PS1，立即更新提示符
+            if (key === 'LANG' || key === 'PS1') {
+                bookmarkSystem.update_user_path();
+            }
+        } else {
+            term.writeLine(`export: invalid format. Use KEY=VALUE`);
+        }
+     }
 };
+// --- 结束替换 ---
 
 
 function parseLine(line) {
@@ -1015,7 +1232,8 @@ async function executeLine(line) {
                 lastOutput = await commandFunc(args, options, lastOutput);
                 }
         } else if (command.trim() !== '') {
-            term.writeHtml(`<span class="term-error">startsh: command not found: ${command}</span>`);
+            // term.writeHtml(`<span class="term-error">startsh: command not found: ${command}</span>`);
+            term.writeHtml(`<span class="term-error">startsh: ${t('cmdNotFound')}: ${command}</span>`);
         }
         
         if (isPiping) { lastOutput = pipeBuffer; }
@@ -1040,16 +1258,19 @@ async function main() {
     await bookmarkSystem.initialize();
 
     // 2. 异步计算尺寸 (等待字体)
-    await term._calculateDimensions();
+    // await term._calculateDimensions();
+    await term.initialize();
 
     // 3. 使用正确尺寸初始化缓冲区
-    term._initBuffer();
+    // term._initBuffer();
 
     // 4. 设置命令处理器
     term.onCommand = executeLine;
 
     // 5. 打印欢迎信息 (现在缓冲区尺寸正确)
-    term.writeLine("Welcome to Start-Terminal 2.0!");
+    // term.writeLine("Welcome to Start-Terminal 2.0!");
+    term.writeLine(t('welcome'));
+    term.writeLine(t('features'));
 
     // 6. 显示第一个提示符
     done();
@@ -1058,5 +1279,5 @@ async function main() {
 // --- 修改：使用 load 事件 ---
 window.addEventListener('load', main);
 
-main();
+// main();
 
