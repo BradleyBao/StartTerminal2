@@ -54,7 +54,7 @@ html, body::selection {
 .term-cursor {
     background-color: var(--cursor-bg-color);
     color: var(--cursor-fg-color);
-    animation: blink 1s steps(2, start) infinite;
+    animation: cursor-blink-explicit 1.2s infinite;
     font-family: inherit;
 }
 
@@ -71,11 +71,27 @@ html, body::selection {
     padding: 0;
 }
 
-/* * 光标闪烁动画
+/* * 光标闪烁动画 (明确的 50/50)
  */
-@keyframes blink {
-    to {
-        visibility: hidden;
+@keyframes cursor-blink-explicit {
+    /* 0% 到 49.9% 保持 "亮" (光标可见) */
+    0% {
+        background-color: var(--cursor-bg-color);
+        color: var(--cursor-fg-color);
+    }
+    49.9% {
+        background-color: var(--cursor-bg-color);
+        color: var(--cursor-fg-color);
+    }
+
+    /* 50% 到 100% 保持 "灭" (字符可见) */
+    50% {
+        background-color: var(--terminal-background-color);
+        color: var(--terminal-foreground-color);
+    }
+    100% {
+        background-color: var(--terminal-background-color);
+        color: var(--terminal-foreground-color);
     }
 }
 
