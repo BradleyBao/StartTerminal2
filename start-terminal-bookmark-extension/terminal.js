@@ -79,7 +79,9 @@ class Terminal {
         this.prompt = '';
         this.currentLine = ''; // 用户当前输入的命令
         this.onCommand = null; // 用户按回车键的回调
-        this.onTab = null;
+        this.onTab = null; 
+
+        this.fullScreenApp = null;
 
         this.history = [];
         this.historyIndex = 0;
@@ -162,7 +164,8 @@ class Terminal {
      */
     _attachListeners() {
         // 捕获所有键盘输入
-        this.inputHandler.addEventListener('keydown', (e) => this._handleKeydown(e));
+        // this.inputHandler.addEventListener('keydown', (e) => this._handleKeydown(e));
+        this.inputHandler.addEventListener('keydown', (e) => this._masterKeydownHandler(e));
         // 捕获中文输入法 (IME) 或粘贴
         this.inputHandler.addEventListener('input', (e) => this._handleInput(e));
         // 点击终端时，始终聚焦到隐藏的输入框
@@ -173,6 +176,28 @@ class Terminal {
         // IME Listen 
         this.inputHandler.addEventListener('compositionstart', (e) => this._handleCompositionStart(e));
         this.inputHandler.addEventListener('compositionend', (e) => this._handleCompositionEnd(e));
+    }
+
+    _masterKeydownHandler(e) {
+        if (this.fullScreenApp) {
+            // 如果全屏应用正在运行，将按键交给它处理
+            this.fullScreenApp.handleKeydown(e);
+        } else {
+            // 否则，使用我们常规的命令行处理器
+            this._handleKeydown(e);
+        }
+    }
+
+    enterFullScreenApp(app) {
+        this.fullScreenApp = app;
+        this.disableInput(); // 隐藏常规的命令行光标
+    }
+
+    exitFullScreenApp() {
+        this.fullScreenApp = null;
+        this._initBuffer(); // 清空屏幕
+        this.enableInput();  // 恢复命令行
+        // 'done()' 将在 executeLine 中被调用，以重绘提示符
     }
 
     /**
@@ -801,6 +826,221 @@ class Terminal {
                 .replace(/>/g, "&gt;")
                 .replace(/"/g, "&quot;")
                 .replace(/'/g, "&#039;");
+    }
+}
+
+// ===============================================
+// =          NANO EDITOR
+// ===============================================
+
+class NanoEditor {
+    constructor(term, filePath, initialContent, onSave, onExit) {
+        this.term = term;
+        this.filePath = filePath;
+        this.onSave = onSave;
+        this.onExit = onExit;
+
+        this.lines = initialContent.split('\n'); // 文件内容（字符串数组）
+        this.cursorY = 0;   // 光标在文件中的行号
+        this.cursorX = 0;   // 光标在文件中的列号
+        this.topRow = 0;    // 屏幕上显示的第一行文件
+        this.status = "Press ^X to Exit, ^O to Save";
+        this.dirty = false; // 是否有未保存的修改
+        this.termRows = term.rows;
+        this.termCols = term.cols;
+    }
+
+    open() {
+        this.term.enterFullScreenApp(this);
+        this._render();
+    }
+
+    // --- 核心辅助函数 ---
+
+    _padLine(line, inverse = false) {
+        const escaped = this.term.escapeHtml(line);
+        const padding = ' '.repeat(Math.max(0, this.termCols - line.length));
+        if (inverse) {
+            // "反色" 菜单栏
+            return `<span style="background-color: var(--terminal-foreground-color); color: var(--terminal-background-color);">${escaped}${padding}</span>`;
+        }
+        return escaped + padding;
+    }
+
+    _validateCursor() {
+        // 确保光标 Y 在文件范围内
+        this.cursorY = Math.max(0, Math.min(this.lines.length - 1, this.cursorY));
+        // 确保光标 X 在当前行范围内
+        const lineLength = this.lines[this.cursorY].length;
+        this.cursorX = Math.max(0, Math.min(lineLength, this.cursorX));
+    }
+
+    _handleScrolling() {
+        // 屏幕上的文本区域
+        const editorHeight = this.termRows - 3; // 减去顶栏和两行底栏
+        
+        // 向上滚动
+        if (this.cursorY < this.topRow) {
+            this.topRow = this.cursorY;
+        }
+        // 向下滚动
+        if (this.cursorY >= this.topRow + editorHeight) {
+            this.topRow = this.cursorY - editorHeight + 1;
+        }
+    }
+
+    // --- 核心渲染和事件 ---
+
+    _render() {
+        this.term._initBuffer(); // 清空 term.buffer
+
+        // 1. 绘制顶栏
+        const topBar = `Nano 1.0 | File: ${this.filePath} ${this.dirty ? '*' : ''}`;
+        this.term.buffer[0] = this._padLine(topBar, true);
+
+        // 2. 绘制文本区域
+        const editorHeight = this.termRows - 3;
+        for (let y = 0; y < editorHeight; y++) {
+            const lineIndex = this.topRow + y;
+            if (lineIndex < this.lines.length) {
+                this.term.buffer[y + 1] = this._padLine(this.lines[lineIndex]);
+            } else {
+                this.term.buffer[y + 1] = this._padLine("~");
+            }
+        }
+
+        // 3. 绘制底栏
+        this.term.buffer[this.termRows - 2] = this._padLine("^X Exit   ^O Save", true);
+        this.term.buffer[this.termRows - 1] = this._padLine(this.status, true);
+
+        // 4. 绘制光标 (手动插入 <span>)
+        const bufferY = (this.cursorY - this.topRow) + 1; // +1 因为顶栏
+        if (bufferY > 0 && bufferY < this.termRows - 2) { // 确保在文本区域内
+            let line = this.term.buffer[bufferY];
+            // 解码 (因为 _padLine 编码了)
+            line = line.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+            
+            const char = this.term.escapeHtml(line[this.cursorX] || ' ');
+            const cursorSpan = `<span class="term-cursor">${char}</span>`;
+            
+            const lineBefore = this.term.escapeHtml(line.substring(0, this.cursorX));
+            const lineAfter = this.term.escapeHtml(line.substring(this.cursorX + 1));
+
+            this.term.buffer[bufferY] = lineBefore + cursorSpan + lineAfter;
+        }
+
+        // 5. 渲染到 DOM
+        this.term._render();
+    }
+
+    handleKeydown(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.status = ""; // 清除状态
+
+        if (e.ctrlKey) {
+            // --- Ctrl 命令 ---
+            switch (e.key.toLowerCase()) {
+                case 'x':
+                    if (this.dirty) {
+                        this.status = "File is modified. Save? (Y/N)";
+                        // (简易版：我们直接退出)
+                        this.term.exitFullScreenApp();
+                        this.onExit();
+                    } else {
+                        this.term.exitFullScreenApp();
+                        this.onExit();
+                    }
+                    return; // 退出，不重绘
+                case 'o':
+                    this._save();
+                    break;
+            }
+        } else {
+            // --- 常规编辑 ---
+            switch (e.key) {
+                case 'ArrowUp':
+                    if (this.cursorY > 0) this.cursorY--;
+                    break;
+                case 'ArrowDown':
+                    if (this.cursorY < this.lines.length - 1) this.cursorY++;
+                    break;
+                case 'ArrowLeft':
+                    if (this.cursorX > 0) {
+                        this.cursorX--;
+                    } else if (this.cursorY > 0) {
+                        // 换到上一行行尾
+                        this.cursorY--;
+                        this.cursorX = this.lines[this.cursorY].length;
+                    }
+                    break;
+                case 'ArrowRight':
+                    if (this.cursorX < this.lines[this.cursorY].length) {
+                        this.cursorX++;
+                    } else if (this.cursorY < this.lines.length - 1) {
+                        // 换到下一行行首
+                        this.cursorY++;
+                        this.cursorX = 0;
+                    }
+                    break;
+                case 'Backspace':
+                    this.dirty = true;
+                    if (this.cursorX > 0) {
+                        // 在行内删除
+                        const line = this.lines[this.cursorY];
+                        this.lines[this.cursorY] = line.substring(0, this.cursorX - 1) + line.substring(this.cursorX);
+                        this.cursorX--;
+                    } else if (this.cursorY > 0) {
+                        // 在行首删除（合并行）
+                        const line = this.lines[this.cursorY];
+                        const prevLine = this.lines[this.cursorY - 1];
+                        this.cursorX = prevLine.length;
+                        this.lines[this.cursorY - 1] = prevLine + line;
+                        this.lines.splice(this.cursorY, 1);
+                        this.cursorY--;
+                    }
+                    break;
+                case 'Enter':
+                    this.dirty = true;
+                    // 分割行
+                    const line = this.lines[this.cursorY];
+                    const lineBefore = line.substring(0, this.cursorX);
+                    const lineAfter = line.substring(this.cursorX);
+                    this.lines[this.cursorY] = lineBefore;
+                    this.lines.splice(this.cursorY + 1, 0, lineAfter);
+                    this.cursorY++;
+                    this.cursorX = 0;
+                    break;
+                case 'Tab':
+                    // (暂不支持)
+                    break;
+                default:
+                    // 插入字符
+                    if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+                        this.dirty = true;
+                        const line = this.lines[this.cursorY];
+                        this.lines[this.cursorY] = line.substring(0, this.cursorX) + e.key + line.substring(this.cursorX);
+                        this.cursorX++;
+                    }
+                    break;
+            }
+        }
+
+        this._validateCursor(); // 确保光标位置有效
+        this._handleScrolling();  // 确保光标在屏幕上
+        this._render();           // 重新渲染
+    }
+
+    _save() {
+        this.status = "Saving...";
+        try {
+            const content = this.lines.join('\n');
+            this.onSave(this.filePath, content);
+            this.dirty = false;
+            this.status = `File saved! (${content.length} bytes)`;
+        } catch (e) {
+            this.status = `Error saving: ${e.message}`;
+        }
     }
 }
 
@@ -1534,6 +1774,60 @@ const globalCommands = {
         }
      },
 
+     'nano': (args, options) => {
+        const path = args[0];
+        if (!path) {
+            term.writeLine("nano: File name not specified.");
+            return; // 必须返回一个 Promise 或 undefined
+        }
+
+        // nano 是一个异步命令
+        return new Promise(async (resolve) => {
+            let content = "";
+            let node; // 书签节点
+
+            if (path === '/etc/.startrc') {
+                content = loadVirtualStartrc(); // 使用 VFS 函数
+            } else {
+                const result = bookmarkSystem._findNodeByPath(path);
+                if (result && result.node) {
+                    if (result.node.url) {
+                        node = result.node;
+                        content = node.url; // 编辑书签 URL
+                    } else if (result.node.children) {
+                        term.writeLine(`nano: ${path} is a directory.`);
+                        resolve(); // 结束命令
+                        return;
+                    }
+                }
+                // (如果文件不存在，content 保持为 ""，即新文件)
+            }
+
+            const onSave = (savedPath, savedContent) => {
+                try {
+                    if (savedPath === '/etc/.startrc') {
+                        localStorage.setItem('.startrc', savedContent);
+                        parseStartrc(savedContent); // 重新加载配置
+                        bookmarkSystem.update_user_path(); // 更新提示符
+                    } else if (node) {
+                        // 如果我们在编辑一个书签，更新它的 URL
+                        chrome.bookmarks.update(node.id, { url: savedContent });
+                    }
+                } catch (e) {
+                    console.error("Nano save error:", e);
+                }
+            };
+
+            const onExit = () => {
+                resolve(); // 告诉 executeLine 命令已完成
+            };
+
+            // 创建并启动 nano
+            const editor = new NanoEditor(term, path, content, onSave, onExit);
+            editor.open();
+        });
+     },
+
      // --- 新增：export 命令 ---
      'export': (args, options) => {
         if (args.length === 0) {
@@ -1651,6 +1945,9 @@ async function executeLine(line) {
                     lastOutput = null; // 清除后没有输出
                 } else {
                 lastOutput = await commandFunc(args, options, lastOutput);
+                if (lastOutput instanceof Promise) {
+                    lastOutput = await lastOutput;
+                }
                 }
         } else if (command.trim() !== '') {
             // term.writeHtml(`<span class="term-error">startsh: command not found: ${command}</span>`);
