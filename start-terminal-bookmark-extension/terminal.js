@@ -1906,61 +1906,84 @@ function done() {
     bookmarkSystem.update_user_path(); // 使用 BookmarkSystem 的方法
 }
 
+/**
+ * 命令执行引擎
+ * - 正确处理分号 (;) [顺序执行]
+ * - 正确处理管道 (|) [流式执行]
+ */
 async function executeLine(line) {
-    awaiting(); 
+    awaiting();
     
-    const parsedCommands = parseLine(line);
-    if (!parsedCommands || parsedCommands.length === 0) {
-            done(); // 如果没有有效命令，直接结束
-            return;
+    // 1. 按分号 (;) 拆分，得到顺序命令
+    const sequentialCommands = line.split(';').map(cmd => cmd.trim()).filter(cmd => cmd.length > 0);
+    
+    if (sequentialCommands.length === 0) {
+        done();
+        return;
     }
 
-    let lastOutput = null; 
+    // 依次执行每个顺序命令
+    for (const commandSequence of sequentialCommands) {
+        
+        // 2. 按管道 (|) 拆分，得到管道命令
+        const pipelineStrings = commandSequence.split('|').map(cmd => cmd.trim()).filter(cmd => cmd.length > 0);
+        
+        let lastOutput = null; // 用于存储上一个命令的输出
 
-    for (let i = 0; i < parsedCommands.length; i++) {
-            const parsed = parsedCommands[i];
+        // 依次执行管道中的每个命令
+        for (let i = 0; i < pipelineStrings.length; i++) {
+            const commandStr = pipelineStrings[i];
+            
+            // 3. 解析单个命令 (例如 "ls" 或 "grep How")
+            const parsed = parseSingleCommand(commandStr);
             if (!parsed) continue;
 
-        const { command, args, options } = parsed;
-        
-        let commandFunc = null;
-
-        // --- 修改：优先检查 BookmarkSystem ---
-        if (bookmarkSystem.commands[command]) {
-            commandFunc = bookmarkSystem.commands[command];
-        } 
-        // --- 修改：然后检查全局命令 ---
-        else if (globalCommands[command]) {
+            const { command, args, options } = parsed;
+            
+            let commandFunc = null;
+            if (bookmarkSystem.commands[command]) {
+                commandFunc = bookmarkSystem.commands[command];
+            } else if (globalCommands[command]) {
                 commandFunc = globalCommands[command];
-        }
+            }
 
-        // --- 管道逻辑不变 ---
-        if (i > 0) { isPiping = false; }
-        if (i < parsedCommands.length - 1) { isPiping = true; pipeBuffer = []; }
-        
-        if (commandFunc) {
-            // 如果是 clear，它会自己处理缓冲区，不需要 await
+            // 4. [!!] 设置管道状态 [!!]
+            // 检查*这*是不是管道中的最后一个命令
+            isPiping = (i < pipelineStrings.length - 1);
+            if (isPiping) {
+                pipeBuffer = []; // 如果是，准备好缓冲区
+            }
+
+            if (commandFunc) {
                 if (command === 'clear') {
                     commandFunc(args, options);
-                    lastOutput = null; // 清除后没有输出
+                    lastOutput = null; // clear 会重置一切
                 } else {
-                lastOutput = await commandFunc(args, options, lastOutput);
-                if (lastOutput instanceof Promise) {
-                    lastOutput = await lastOutput;
+                    // 将上一个命令的输出 (lastOutput) 作为管道输入 (pipedInput) 传递
+                    const result = commandFunc(args, options, lastOutput);
+                    
+                    if (result instanceof Promise) {
+                        lastOutput = await result;
+                    } else {
+                        lastOutput = result;
+                    }
                 }
-                }
-        } else if (command.trim() !== '') {
-            // term.writeHtml(`<span class="term-error">startsh: command not found: ${command}</span>`);
-            term.writeHtml(`<span class="term-error">startsh: ${t('cmdNotFound')}: ${command}</span>`);
+            } else if (command.trim() !== '') {
+                term.writeHtml(`<span class="term-error">startsh: ${t('cmdNotFound')}: ${command}</span>`);
+                isPiping = false; // 命令失败，中断管道
+                break; // 停止执行此管道
+            }
+
+            // 5. 如果正在管道中，将缓冲区设为 "lastOutput" 供下一个命令使用
+            if (isPiping) {
+                lastOutput = pipeBuffer;
+            }
         }
-        
-        if (isPiping) { lastOutput = pipeBuffer; }
-        isPiping = false; 
     }
     
-    // --- 修改：使用 BookmarkSystem 的方法 ---
-    await bookmarkSystem._refreshBookmarks(); 
-    done(); 
+    // 所有命令执行完毕
+    await bookmarkSystem._refreshBookmarks();
+    done();
 }
 
 
