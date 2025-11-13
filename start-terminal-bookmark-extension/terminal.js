@@ -83,15 +83,73 @@ class Terminal {
 
         this.fullScreenApp = null;
 
+        // I/O 状态
+        this.isReading = false;
+        this.readResolve = null;
+
         this.history = [];
         this.historyIndex = 0;
         this.tempLine = "";
+
+        // 沙盒支持
+        this.sandboxFrame = null;
+        this.sandboxResolve = null;
+        this._createSandbox();
 
         // 3. 初始化
         this._calculateDimensions();
         this._initBuffer();
         this._attachListeners();
         this.focus();
+    }
+
+    _createSandbox() {
+        this.sandboxFrame = document.createElement('iframe');
+        this.sandboxFrame.src = 'sandbox.html';
+        this.sandboxFrame.style.display = 'none';
+        document.body.appendChild(this.sandboxFrame);
+
+        // 监听来自 sandbox.js 的消息
+        window.addEventListener('message', (event) => {
+            // 1. 安全检查：只接受来自沙盒的消息
+            if (event.source !== this.sandboxFrame.contentWindow) {
+                return;
+            }
+
+            const { type, payload } = event.data;
+
+            // 2. 处理来自 st_api 的消息
+            switch (type) {
+                case 'writeLine':
+                    this.writeLine(payload);
+                    break;
+                case 'writeHtml':
+                    this.writeHtml(payload);
+                    break;
+                case 'error':
+                    this.writeHtml(`<span class="term-error">Script Error: ${payload}</span>`);
+                    this.sandboxResolve(null); // 发生错误，结束命令
+                    break;
+                case 'result':
+                    this.sandboxResolve(payload); // 成功，返回结果
+                    break;
+            }
+        });
+    }
+
+    /**
+     * 在沙盒中执行一个脚本字符串
+     */
+    executeInSandbox(scriptString, args, pipeInput) {
+        return new Promise((resolve) => {
+            this.sandboxResolve = resolve; // 存储 resolve
+            // 向 sandbox.js 发送消息
+            this.sandboxFrame.contentWindow.postMessage({
+                scriptString,
+                args,
+                pipeInput
+            }, `chrome-extension://${chrome.runtime.id}`);
+        });
     }
 
     async initialize() {
@@ -182,6 +240,24 @@ class Terminal {
         if (this.fullScreenApp) {
             // 如果全屏应用正在运行，将按键交给它处理
             this.fullScreenApp.handleKeydown(e);
+        } else if (this.isReading) {
+            // 如果在 [Y/n] 模式下，我们只处理 Enter 和 Backspace
+            e.preventDefault();
+            if (e.key === 'Enter') {
+                const answer = this.currentLine;
+                this.isReading = false;
+                this._handleNewline(); // 换行
+                this.readResolve(answer.trim().toLowerCase()); // Resolve Promise
+                this.readResolve = null;
+                // (done() 会在 executeLine 末尾调用，重置提示符)
+            } else if (e.key === 'Backspace') {
+                if (this.currentLine.length > 0) {
+                    this.currentLine = this.currentLine.slice(0, -1);
+                }
+            } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+                this.currentLine += e.key;
+            }
+            this._render(); // 渲染 Y/n 的输入
         } else {
             // 否则，使用我们常规的命令行处理器
             this._handleKeydown(e);
@@ -198,6 +274,21 @@ class Terminal {
         this._initBuffer(); // 清空屏幕
         this.enableInput();  // 恢复命令行
         // 'done()' 将在 executeLine 中被调用，以重绘提示符
+    }
+
+    /**
+     * 交互式 I/O：暂停命令执行并等待一行输入
+     * @param {string} prompt - 要显示的提示 (例如 "[Y/n]")
+     */
+    readInput(prompt) {
+        return new Promise((resolve) => {
+            this.writeLine(prompt + " "); // 显示 [Y/n] 提示
+            this.prompt = ""; // 临时隐藏主提示符
+            this.currentLine = ""; // 清空当前输入
+            this.isReading = true; // 进入“读取模式”
+            this.readResolve = resolve; // 存储 resolve 函数
+            this._render(); // 渲染 [Y/n] 提示
+        });
     }
 
     /**
