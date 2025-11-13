@@ -240,6 +240,10 @@ class Terminal {
             // 如果用户拖拽选择了文本 (selection.isCollapsed 为 false)，
             // 我们什么也不做，以保留他们的选中内容。
         });
+
+        this.container.addEventListener('dragstart', (e) => {
+            e.preventDefault();
+        });
         
         // 窗口大小调整时，重新计算
         window.addEventListener('resize', () => this._handleResize());
@@ -259,7 +263,6 @@ class Terminal {
             // console.log(this.cursorX);
 
             if (e.key === 'Enter') {
-                // ... (Enter 逻辑保持不变) ...
                 const answer = this.currentLine;
                 this.isReading = false;
                 this._handleNewline(); // 换行
@@ -839,8 +842,8 @@ class Terminal {
                 this.onCommand(command); // 命令将在新行上打印输出
             }
             
-            this.currentLine = ''; 
-            this.cursorX = 0; 
+            // this.currentLine = ''; 
+            // this.cursorX = 0; 
             return; // `done()` 会调用 setPrompt -> _render
         } else if (e.key === 'Backspace') {
             e.preventDefault();
@@ -901,13 +904,13 @@ class Terminal {
 
         // --- 3. 处理普通字符输入 ---
         else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
-            e.preventDefault();
-            const pos = this.cursorX - this.prompt.length;
-            const char = e.key;
+            // e.preventDefault();
+            // const pos = this.cursorX - this.prompt.length;
+            // const char = e.key;
             
-            this.currentLine = this.currentLine.substring(0, pos) + char + this.currentLine.substring(pos);
-            this.cursorX++; 
-            this._render(); // [!] 移动到内部
+            // this.currentLine = this.currentLine.substring(0, pos) + char + this.currentLine.substring(pos);
+            // this.cursorX++; 
+            // this._render(); // [!] 移动到内部
             return; // 结束
         }
         
@@ -921,6 +924,10 @@ class Terminal {
         // 如果正在输入法组合中，忽略所有 `input` 事件
         // 我们将只在 `compositionend` 事件中处理最终结果
         if (this.isComposing) return; 
+        if (this.isReading) {
+            e.target.value = ''; // 清空 <textarea>
+            return;
+        }
         if (this.inputDisabled) return; 
         
         // (这个逻辑现在主要用于处理粘贴)
