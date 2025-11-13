@@ -1215,6 +1215,13 @@ class BookmarkSystem {
             parentId: 'vfs-root'
         };
 
+        this.vfsBin = {
+            id: 'vfs-bin',
+            title: 'bin',
+            children: [], // 将在 initialize() 中被填充
+            parentId: 'vfs-root'
+        };
+
         // Virtual Root Directory 
         this.virtualRoot = {
             id: 'vfs-root',
@@ -1260,17 +1267,25 @@ class BookmarkSystem {
 
             'ls': (args, options) => {
                 let targetNode = this.current;
+                let targetPath = ".";
+                
                 if (args[0]) {
-                    const result = this._findNodeByPath(args[0]);
-                    if (result && result.node && result.node.children) {
-                        targetNode = result.node;
-                    } else if (result && result.node) {
-                            this.term.writeHtml(`<span class="term-error">ls: ${args[0]}: Not a directory</span>`);
-                            return;
-                    } else {
-                        this.term.writeHtml(`<span class="term-error">ls: ${args[0]}: No such directory</span>`);
+                    targetPath = args[0];
+                }
+                // (如果 -l 在 args[0]，则 targetPath 还是 '.')
+                if (targetPath.startsWith('-')) {
+                    targetPath = "."; // 'ls -l' 意味着 ls '.'
+                }
+
+                const result = this._findNodeByPath(targetPath);
+                if (result && result.node && result.node.children) {
+                    targetNode = result.node;
+                } else if (result && result.node) {
+                        this.term.writeHtml(`<span class="term-error">ls: ${targetPath}: Not a directory</span>`);
                         return;
-                    }
+                } else {
+                    this.term.writeHtml(`<span class="term-error">ls: ${targetPath}: No such directory</span>`);
+                    return;
                 }
 
                 let children = targetNode.children || [];
@@ -1278,11 +1293,31 @@ class BookmarkSystem {
                     children = children.filter(child => !child.title.startsWith('.'));
                 }
                 
-                for (const child of children) {
-                    if (child.children) {
-                        this.term.writeHtml(`<span class="term-folder">${child.title}/</span>`);
-                    } else {
-                        this.term.writeLine(child.title); 
+                // [!! 新增 'ls -l' 逻辑 !!]
+                if (options.l) {
+                    // 长列表格式
+                    for (const child of children) {
+                        const meta = getMetadata(child);
+                        const isDir = !!child.children;
+                        const modeStr = formatMode(meta.mode, isDir);
+                        const links = 1;
+                        const owner = "user";
+                        const group = "user";
+                        const size = 0; // (大小对书签没有意义)
+                        const date = new Date(child.dateAdded || Date.now()).toLocaleDateString('en-US', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+
+                        const name = isDir ? `<span class="term-folder">${child.title}/</span>` : child.title;
+                        
+                        this.term.writeHtml(`${modeStr} ${links} ${owner} ${group} ${String(size).padStart(6)} ${date} ${name}`);
+                    }
+                } else {
+                    // 默认短列表格式
+                    for (const child of children) {
+                        if (child.children) {
+                            this.term.writeHtml(`<span class="term-folder">${child.title}/</span>`);
+                        } else {
+                            this.term.writeLine(child.title); 
+                        }
                     }
                 }
             },
@@ -1290,6 +1325,11 @@ class BookmarkSystem {
             'mkdir': async (args, options) => {
                 if (!args[0]) {
                     this.term.writeHtml(`<span class="term-error">mkdir: missing operand</span>`);
+                    return;
+                }
+                const currentMeta = getMetadata(this.current);
+                if (!(currentMeta.mode & 0o200)) { // 0o200 = U_WRITE
+                    term.writeHtml(`<span class="term-error">mkdir: cannot create directory: Permission denied</span>`);
                     return;
                 }
                 const dirName = args[0];
@@ -1321,19 +1361,48 @@ class BookmarkSystem {
             
             'rm': async (args, options) => {
                 if (!args[0]) {
-                    this.term.writeHtml(`<span class="term-error">rm: missing operand</span>`);
+                    term.writeHtml(`<span class="term-error">rm: missing operand</span>`);
                     return;
                 }
-                const target = this._findChildByTitle(this.current.children, args[0]);
+                const path = args[0];
+                let target;
+                if (!path.startsWith('/') && !path.startsWith('~/')) {
+                    // 'rm' 查找当前目录
+                    target = this._findChildByTitle(this.current.children, path);
+                } else {
+                    const result = this._findNodeByPath(path);
+                    target = result ? result.node : null;
+                }
                 if (!target) {
-                    this.term.writeHtml(`<span class="term-error">rm: ${args[0]}: No such file or directory</span>`);
+                    term.writeHtml(`<span class="term-error">rm: ${args[0]}: No such file or directory</span>`);
+                    return;
+                }
+
+                const meta = getMetadata(target);
+                if (!(meta.mode & 0o200)) { // 0o200 = U_WRITE
+                    term.writeHtml(`<span class="term-error">rm: cannot remove '${args[0]}': Permission denied</span>`);
                     return;
                 }
                 
+                // [VFS 'rm' 逻辑]
+                if (target.id.startsWith('vfs-bin-')) {
+                    if (this.current.id === 'vfs-bin') {
+                        // 1. 从 localStorage 删除
+                        deleteVfsScript(target.title);
+                        // 2. 从 VFS (内存中) 删除
+                        this.vfsBin.children = this.vfsBin.children.filter(c => c.id !== target.id);
+                        term.writeLine(`Removed VFS script: ${target.title}`);
+                        return;
+                    } else {
+                        term.writeHtml(`<span class="term-error">rm: Cannot remove VFS files from here.</span>`);
+                        return;
+                    }
+                }
+
                 const recursive = options.r || options.recurse;
                 
                 if (target.children && !recursive) {
-                    this.term.writeHtml(`<span class="term-error">rm: ${args[0]}: Is a directory (use -r)</span>`);
+                    // ... (is a directory)
                 } else if (target.children && recursive) {
                     await this._removeRecursive(target.id);
                 } else {
@@ -1361,6 +1430,7 @@ class BookmarkSystem {
     // --- 将书签相关的辅助函数移入此类 ---
 
     async initialize() {
+            this.vfsBin.children = loadVfsScripts();
             await this._refreshBookmarks(); // 加载并合并 VFS
             
             try {
@@ -1395,14 +1465,14 @@ class BookmarkSystem {
                 this.root = tree[0];
             }
 
-            // --- 核心 VFS 修复 ---
+            // --- 核心 VFS ---
             // 1. 设置 homeDirNode (可能为 null)
             this.homeDirNode = (this.root.children && this.root.children.length > 0) ? this.root.children[0] : null;
 
             // 2. 无条件合并 vfsEtc 和 真实书签
             // 确保 this.root.children 存在
             const bookmarkChildren = this.root.children || []; 
-            this.virtualRoot.children = [ this.vfsEtc, ...bookmarkChildren ];
+            this.virtualRoot.children = [ this.vfsEtc, this.vfsBin, ...bookmarkChildren ];
 
             // 3. 为已合并的真实书签设置正确的 parentId (用于 'cd ..' 等)
             bookmarkChildren.forEach(child => {
@@ -1411,7 +1481,7 @@ class BookmarkSystem {
             if (this.homeDirNode) {
                  this.homeDirNode.parentId = 'vfs-root'; // 确保 homeDirNode 的 parentId 也被设置
             }
-            // --- 结束 VFS 修复 ---
+            // --- 结束 VFS ---
             
 
             // --- 路径验证逻辑 (使用 virtualRoot) ---
@@ -1475,8 +1545,19 @@ class BookmarkSystem {
         }
     }
 
+    getPWD() {
+        if (!this.root) return "/";
+        if (this.path.length <= 1) return "/"; // 根目录
+        // 从 VFS 根之后开始
+        return "/" + this.path.slice(1).map(node => node.title).join("/");
+    }
+
     _findNodeByPath(pathStr) {
         if (!pathStr || !this.root || !this.homeDirNode) return null;
+
+        if (pathStr === '.') {
+            return { node: this.current, newPathArray: [...this.path] };
+        }
 
         let startNode;
         let newPathArray;
@@ -1510,7 +1591,11 @@ class BookmarkSystem {
 
             if (segment === '..') {
                 if (newPathArray.length > 1) newPathArray.pop();
-                currentNode = newPathArray[newPathArray.length - 1] || this.root;
+                currentNode = newPathArray[newPathArray.length - 1] || this.virtualRoot;
+                continue;
+            }
+
+            if (segment === '.') {
                 continue;
             }
             
@@ -1769,6 +1854,146 @@ function loadVirtualStartrc() {
     return content;
 }
 
+/**
+ * 从 localStorage 加载所有 VFS 脚本
+ * @returns {Array} VFS 节点对象数组
+ */
+function loadVfsScripts() {
+    const scripts = JSON.parse(localStorage.getItem('vfs_bin_scripts') || '{}');
+    const children = [];
+    for (const name in scripts) {
+        children.push({
+            id: `vfs-bin-${name}`,
+            title: name,
+            url: `data:text/plain;base64,${btoa(encodeURIComponent(scripts[name].content))}`,
+            mode: scripts[name].mode, // [!!] 附带权限 [!!]
+            children: null,
+            parentId: 'vfs-bin'
+        });
+    }
+    return children;
+}
+
+/**
+ * 获取节点的元数据 (权限)
+ * @param {Object} node - VFS 节点
+ * @returns {Object} - { mode: 0o755 }
+ */
+function getMetadata(node) {
+    if (!node) return { mode: 0 }; // 安全回退
+    
+    // 1. VFS 内部节点 (权限是硬编码的)
+    if (node.mode) {
+        return { mode: node.mode };
+    }
+    if (node.id === 'vfs-etc') return { mode: 0o755 }; // drwxr-xr-x
+    if (node.id === 'vfs-bin') return { mode: 0o755 }; // drwxr-xr-x
+    if (node.id === 'vfs-startrc') return { mode: 0o644 }; // -rw-r--r--
+    if (node.id.startsWith('vfs-bin-')) {
+        // (这个应该在 loadVfsScripts 中被设置，但作为回退)
+        return { mode: 0o755 };
+    }
+
+    // 2. 真实书签 (从 localStorage 读取)
+    const metadataStore = JSON.parse(localStorage.getItem('vfs_metadata') || '{}');
+    if (metadataStore[node.id]) {
+        return metadataStore[node.id];
+    }
+    
+    // 3. 默认书签权限
+    if (node.children) {
+        return { mode: 0o777 }; // 目录 (drwxrwxrwx)
+    } else {
+        return { mode: 0o666 }; // 文件 (-rw-rw-rw-)
+    }
+}
+
+/**
+ * 设置节点的元数据 (权限)
+ * @param {Object} node - VFS 节点
+ * @param {number} newMode - 八进制权限 (e.g., 0o755)
+ */
+function setMetadata(node, newMode) {
+    if (!node) return;
+
+    // 1. VFS /bin/ 脚本 (可写)
+    if (node.id.startsWith('vfs-bin-')) {
+        updateVfsScriptMode(node.title, newMode);
+        return;
+    }
+    
+    // 2. VFS /etc/ 目录 (只读)
+    if (node.id.startsWith('vfs-etc') || node.id === 'vfs-startrc') {
+        term.writeHtml(`<span class="term-error">chmod: ${node.title}: Read-only file system.</span>`);
+        return;
+    }
+
+    // 3. 真实书签 (可写)
+    let metadataStore = JSON.parse(localStorage.getItem('vfs_metadata') || '{}');
+    // 获取当前元数据 (以防有其他设置)
+    let currentMeta = metadataStore[node.id] || getMetadata(node); 
+    currentMeta.mode = newMode;
+    metadataStore[node.id] = currentMeta;
+    localStorage.setItem('vfs_metadata', JSON.stringify(metadataStore));
+}
+
+/**
+ * 将八进制 mode 格式化为 -rwxrwxrwx
+ * @param {number} mode - e.g., 0o755
+ * @param {boolean} isDir - 是否是目录
+ */
+function formatMode(mode, isDir) {
+    const r = (mode & 0o400) ? 'r' : '-';
+    const w = (mode & 0o200) ? 'w' : '-';
+    const x = (mode & 0o100) ? 'x' : '-';
+    
+    const g_r = (mode & 0o040) ? 'r' : '-';
+    const g_w = (mode & 0o020) ? 'w' : '-';
+    const g_x = (mode & 0o010) ? 'x' : '-';
+
+    const o_r = (mode & 0o004) ? 'r' : '-';
+    const o_w = (mode & 0o002) ? 'w' : '-';
+    const o_x = (mode & 0o001) ? 'x' : '-';
+
+    return (isDir ? 'd' : '-') + r + w + x + g_r + g_w + g_x + o_r + o_w + o_x;
+}
+
+/**
+ * 将脚本保存到 localStorage
+ */
+function saveVfsScript(name, content, mode = 0o755) { // 默认 755 (rwxr-xr-x)
+    let scripts = JSON.parse(localStorage.getItem('vfs_bin_scripts') || '{}');
+    // 如果已有脚本，只更新内容并保留旧 mode
+    const oldMode = scripts[name] ? scripts[name].mode : mode;
+    
+    scripts[name] = {
+        content: content,
+        mode: oldMode // 保留旧权限，或使用默认权限
+    };
+    localStorage.setItem('vfs_bin_scripts', JSON.stringify(scripts));
+}
+
+function updateVfsScriptMode(name, newMode) {
+    let scripts = JSON.parse(localStorage.getItem('vfs_bin_scripts') || '{}');
+    if (scripts[name]) {
+        scripts[name].mode = newMode;
+        localStorage.setItem('vfs_bin_scripts', JSON.stringify(scripts));
+        return true;
+    }
+    return false;
+}
+
+/**
+ * 从 localStorage 删除脚本
+ */
+function deleteVfsScript(name) {
+    let scripts = JSON.parse(localStorage.getItem('vfs_bin_scripts') || '{}');
+    if (scripts[name]) {
+        delete scripts[name];
+        localStorage.setItem('vfs_bin_scripts', JSON.stringify(scripts));
+    }
+}
+
 
 // ===============================================
 // =           初始化和使用 Terminal         =
@@ -1798,6 +2023,8 @@ function saveStyleSettings() {
 let isPiping = false;
 let pipeBuffer = [];
 
+let executeNestLevel = 0;
+
 // Tab 
 let lastTabMatches = [];
 let lastTabTime = 0;
@@ -1808,6 +2035,83 @@ const bookmarkSystem = new BookmarkSystem(term); // 将 term 传给 BookmarkSyst
 // --- 将非书签命令移到这里 ---
 // (替换) 你现有的 globalCommands 对象
 const globalCommands = {
+    'sh': async (args, options, pipedInput) => {
+        if (!args[0]) {
+            term.writeHtml(`<span class="term-error">sh: missing file operand</span>`);
+            return;
+        }
+        if (pipedInput) {
+            term.writeHtml(`<span class="term-error">sh: does not support piped input.</span>`);
+            return;
+        }
+
+        const path = args[0];
+        const result = bookmarkSystem._findNodeByPath(path);
+
+        if (!result || !result.node) {
+            term.writeHtml(`<span class="term-error">sh: ${path}: ${t('noSuchFileOrDir')}</span>`);
+            return;
+        }
+        if (result.node.children) {
+            term.writeHtml(`<span class="term-error">sh: ${path}: ${t('isADir')}</span>`);
+            return;
+        }
+
+        const meta = getMetadata(result.node);
+        if (!(meta.mode & 0o100)) { // 0o100 = U_EXEC
+             term.writeHtml(`<span class="term-error">startsh: permission denied: ${path}</span>`);
+             return;
+        }
+
+        let scriptContent = "";
+        const url = result.node.url;
+        if (!url) {
+             term.writeLine(""); // 空文件
+             return;
+        }
+
+        // 检查是否是我们的 VFS 文件
+        if (result.node.id.startsWith('vfs-')) {
+            try {
+                const base64Content = url.split(',')[1] || '';
+                scriptContent = decodeURIComponent(atob(base64Content));
+            } catch (e) {
+                term.writeHtml(`<span class="term-error">${path}: Error reading file: ${e.message}</span>`);
+                return;
+            }
+        } else {
+            // 不执行普通书签 URL
+            term.writeHtml(`<span class="term-error">sh: ${path}: Not an executable script.</span>`);
+            return;
+        }
+
+        // --- 核心执行 ---
+        // 我们只需递归调用 executeLine，它现在可以处理 \n
+        // await/return 链和 executeNestLevel 会处理好一切。
+        return executeLine(scriptContent);
+     },
+     'chmod': (args, options) => {
+        if (args.length < 2) {
+            term.writeHtml(`<span class="term-error">chmod: missing operand</span>`);
+            return;
+        }
+        const modeStr = args[0];
+        const path = args[1];
+
+        const newMode = parseInt(modeStr, 8); // 解析八进制
+        if (isNaN(newMode)) {
+            term.writeHtml(`<span class="term-error">chmod: invalid mode: '${modeStr}'</span>`);
+            return;
+        }
+
+        const result = bookmarkSystem._findNodeByPath(path);
+        if (!result || !result.node) {
+            term.writeHtml(`<span class="term-error">${t('noSuchFileOrDir')}: ${path}</span>`);
+            return;
+        }
+
+        setMetadata(result.node, newMode);
+     },
      'grep': (args, options, pipedInput) => {
         if (!args[0]) { term.writeHtml(`<span class="term-error">${t('grepMissingPattern')}</span>`); return; }
         if (!pipedInput) { term.writeHtml(`<span class="term-error">${t('grepRequiresPipe')}</span>`); return; }
@@ -1884,14 +2188,13 @@ const globalCommands = {
         }
      },
 
-     // --- 新增：cat 命令 ---
+     // --- cat 命令 ---
      'cat': (args, options) => {
         if (!args[0]) {
             term.writeHtml(`<span class="term-error">${t('missingOperand')}</span>`);
             return;
         }
         const path = args[0];
-        // 使用 bookmarkSystem 的 VFS 路径查找器
         const result = bookmarkSystem._findNodeByPath(path);
 
         if (!result || !result.node) {
@@ -1909,10 +2212,9 @@ const globalCommands = {
             return;
         }
 
-        // 检查是否是我们的 .startrc 虚拟文件
-        if (result.node.id === 'vfs-startrc') {
+        // 检查是否是 VFS 文件 (startrc 或 bin 脚本)
+        if (result.node.id.startsWith('vfs-')) {
             try {
-                // 这个解码逻辑与 initialize 中的逻辑完全一致
                 const base64Content = url.split(',')[1] || '';
                 const content = decodeURIComponent(atob(base64Content));
                 term.writeLine(content); // 打印解码后的文件内容
@@ -1926,71 +2228,102 @@ const globalCommands = {
      },
 
      'nano': (args, options) => {
-        const path = args[0];
+        let path = args[0];
         if (!path) {
             term.writeLine("nano: File name not specified.");
-            return; // 必须返回一个 Promise 或 undefined
+            return;
         }
 
-        // nano 是一个异步命令
+        if (!path.startsWith('/') && !path.startsWith('~/')) {
+            const pwd = bookmarkSystem.getPWD();
+            path = (pwd === '/') ? ('/' + path) : (pwd + '/' + path);
+        }
+
         return new Promise(async (resolve) => {
             let content = "";
-            let node = null; // 书签节点
-            let resolvedPath = path; // 默认为用户输入的路径
+            let node = null;
+            let resolvedPath = path;
 
-            // [!! 核心修复逻辑 !!]
-            // 1. 无论路径是什么，首先尝试解析它
             const result = bookmarkSystem._findNodeByPath(path);
 
             if (result && result.node) {
-                // 2. 如果找到了节点
                 node = result.node;
-                
-                // 3. 重建一个标准化的绝对路径 (例如 "/etc/.startrc")
-                //    这能修复 Nano 编辑器标题栏显示 ".startrc" 的问题
                 resolvedPath = "/" + result.newPathArray.slice(1).map(p => p.title).join("/");
 
-                // 4. 按 ID 检查，而不是按路径字符串检查
-                if (node.id === 'vfs-startrc') {
-                    // 4a. 这是 .startrc 文件。加载解码后的内容。
-                    content = loadVirtualStartrc();
+                // [加载 VFS]
+                if (node.id.startsWith('vfs-')) {
+                    // 适用于 /etc/.startrc AND /bin/hello.sh
+                    try {
+                        const base64Content = (node.url || '').split(',')[1] || '';
+                        content = decodeURIComponent(atob(base64Content));
+                    } catch (e) {
+                        content = ""; // 文件已损坏
+                    }
                 } else if (node.url) {
-                    // 4b. 这是普通书签。加载其 URL 作为内容。
+                    // 这是普通书签
                     content = node.url; 
                 } else if (node.children) {
-                    // 4c. 这是个目录。
                     term.writeLine(`nano: ${resolvedPath} is a directory.`);
-                    resolve(); // 结束命令
+                    resolve();
                     return;
                 }
-            } else {
-                // 5. 如果未找到节点，说明这是一个新文件。
-                // 'content' 保持为 ""
-                // 'node' 保持为 null
-                // 'resolvedPath' 保持为用户输入的路径 (例如 "/etc/myscript.sh")
             }
-            // [!! 修复结束 !!]
-
+            // (如果是新文件, 'content' 保持为 "")
 
             const onSave = (savedPath, savedContent) => {
                 try {
-                    // 使用 'resolvedPath' 进行检查，因为 'savedPath' 
-                    // 总是等于传递给 NanoEditor 的路径。
+                    // (权限检查保持不变)
+                    if (node) { 
+                        const meta = getMetadata(node);
+                        if (!(meta.mode & 0o200)) {
+                            term.writeHtml(`<span class="term-error">Error: Permission denied.</span>`); return;
+                        }
+                    } else {
+                        const parentPath = savedPath.substring(0, savedPath.lastIndexOf('/')) || '/';
+                        const parentResult = bookmarkSystem._findNodeByPath(parentPath);
+                        if (!parentResult || !parentResult.node || !(getMetadata(parentResult.node).mode & 0o200)) {
+                            term.writeHtml(`<span class="term-error">Error: Parent directory not writable.</span>`); return;
+                        }
+                    }
+
+                    // [!! 核心修复 2：保存 VFS !!]
                     if (resolvedPath === '/etc/.startrc') {
                         localStorage.setItem('.startrc', savedContent);
-                        parseStartrc(savedContent); // 重新加载配置
-                        bookmarkSystem.update_user_path(); // 更新提示符
-                    } else if (node && node.id !== 'vfs-startrc') {
-                        // 如果我们在编辑一个*已存在的*书签，更新它的 URL
+                        parseStartrc(savedContent);
+                        bookmarkSystem.update_user_path();
+                    
+                    } else if (node && node.id.startsWith('vfs-bin-')) {
+                        // A. 正在更新一个*已存在的* /bin/ 脚本
+                        saveVfsScript(node.title, savedContent);
+                        // 更新内存中的 VFS 节点 URL
+                        node.url = `data:text/plain;base64,${btoa(encodeURIComponent(savedContent))}`;
+
+                    } else if (node) {
+                        // B. 正在更新一个*已存在的*书签 (非 VFS)
                         chrome.bookmarks.update(node.id, { url: savedContent });
+
+                    } else if (!node && savedPath.startsWith('/bin/')) {
+                        // C. 正在创建*新的* /bin/ 脚本
+                        const scriptName = savedPath.substring(5);
+                        if (scriptName && !scriptName.includes('/')) {
+                            saveVfsScript(scriptName, savedContent);
+                            // 更新 VFS (内存中)
+                            const newNode = {
+                                id: `vfs-bin-${scriptName}`,
+                                title: scriptName,
+                                url: `data:text/plain;base64,${btoa(encodeURIComponent(savedContent))}`,
+                                mode: 0o755, // 默认权限
+                                children: null,
+                                parentId: 'vfs-bin'
+                            };
+                            bookmarkSystem.vfsBin.children.push(newNode);
+                            term.writeLine(`Saved to VFS: ${savedPath}`);
+                        } else {
+                            term.writeHtml(`<span class="term-error">nano: Invalid path.</span>`);
+                        }
                     } else if (!node) {
-                        // 准备为 'sh' 命令支持！
-                        // 这是一个新文件 (例如 /etc/myscript.sh)
-                        // 目前，我们还不支持在 VFS 中*创建*新文件
-                        term.writeHtml(`<span class="term-error">nano: Error: Cannot save new file '${savedPath}'. (Not implemented)</span>`);
-                    } else {
-                        // (以防万一)
-                        console.error("Nano save error: Unknown state.", resolvedPath);
+                        // D. 正在创建*新的*书签 (不支持)
+                         term.writeHtml(`<span class="term-error">nano: Error: Cannot save new file to '${savedPath}'. Only /bin/ is supported.</span>`);
                     }
                 } catch (e) {
                     console.error("Nano save error:", e);
@@ -1998,10 +2331,9 @@ const globalCommands = {
             };
 
             const onExit = () => {
-                resolve(); // 告诉 executeLine 命令已完成
+                resolve();
             };
 
-            // 创建并启动 nano (现在传递 'resolvedPath')
             const editor = new NanoEditor(term, resolvedPath, content, onSave, onExit);
             editor.open();
         });
@@ -2330,12 +2662,19 @@ function parseSingleCommand(commandStr) {
 }
 
 function awaiting() {
-    term.disableInput();
+    if (executeNestLevel === 0) {
+        term.disableInput();
+    }
+    executeNestLevel++;
 }
 
 function done() {
-    term.enableInput();
-    bookmarkSystem.update_user_path(); // 使用 BookmarkSystem 的方法
+    executeNestLevel--;
+    if (executeNestLevel === 0) {
+        term.enableInput();
+        bookmarkSystem.update_user_path();
+    }
+     // 使用 BookmarkSystem 的方法
 }
 
 /**
@@ -2347,8 +2686,13 @@ async function executeLine(line) {
     awaiting();
     
     // 1. 按分号 (;) 拆分，得到顺序命令
-    const sequentialCommands = line.split(';').map(cmd => cmd.trim()).filter(cmd => cmd.length > 0);
+    // const sequentialCommands = line.split(';').map(cmd => cmd.trim()).filter(cmd => cmd.length > 0);
     
+    const sequentialCommands = line.replace(/\n/g, ';')
+                                   .split(';')
+                                   .map(cmd => cmd.trim())
+                                   .filter(cmd => cmd.length > 0 && !cmd.startsWith('#')); // 顺便支持注释
+
     if (sequentialCommands.length === 0) {
         done();
         return;
@@ -2373,7 +2717,26 @@ async function executeLine(line) {
             const { command, args, options } = parsed;
             
             let commandFunc = null;
-            if (bookmarkSystem.commands[command]) {
+
+            if (command.startsWith('./') || command.startsWith('/') || command.startsWith('~/')) {
+                const result = bookmarkSystem._findNodeByPath(command);
+                if (!result || !result.node) {
+                    term.writeHtml(`<span class="term-error">startsh: ${t('noSuchFileOrDir')}: ${command}</span>`);
+                    isPiping = false; break;
+                }
+                
+                const meta = getMetadata(result.node);
+                // 检查用户执行权限 (0o100 = --x------)
+                if (meta.mode & 0o100) {
+                    // 是可执行文件，将其交给 'sh'
+                    commandFunc = globalCommands.sh;
+                    args.unshift(command); // 将路径作为第一个参数
+                } else {
+                    term.writeHtml(`<span class="term-error">startsh: permission denied: ${command}</span>`);
+                    isPiping = false; break;
+                }
+            }
+            else if (bookmarkSystem.commands[command]) {
                 commandFunc = bookmarkSystem.commands[command];
             } else if (globalCommands[command]) {
                 commandFunc = globalCommands[command];
@@ -2455,7 +2818,10 @@ async function main() {
     term.writeLine(t('features'));
 
     // 6. 显示第一个提示符
-    done();
+    // done();
+
+    bookmarkSystem.update_user_path(); // 1. 显示提示符
+    term.enableInput(); // 2. 启用光标和输入
 }
 
 // --- 修改：使用 load 事件 ---
