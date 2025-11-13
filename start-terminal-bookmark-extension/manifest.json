@@ -22,7 +22,7 @@
   "host_permissions": [
     "https://login.microsoftonline.com/*",
     "https://graph.microsoft.com/*",
-    "https://raw.githubusercontent.com/BradleyBao/Start-Terminal/main/start-terminal-bookmark-extension/plugins/*"
+    "https://raw.githubusercontent.com/BradleyBao/StartTerminal2/main/start-terminal-bookmark-extension/repo/*"
   ],
   "sandbox": {
     "pages": ["sandbox.html"]

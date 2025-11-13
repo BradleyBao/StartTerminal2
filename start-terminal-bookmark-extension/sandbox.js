@@ -5,9 +5,9 @@
 
 window.addEventListener('message', (event) => {
     // 1. 安全检查：只接受来自拓展本身的 event
-    if (event.origin !== `chrome-extension://${chrome.runtime.id}`) {
-        return;
-    }
+    // if (event.origin !== `chrome-extension://${chrome.runtime.id}`) {
+    //     return;
+    // }
 
     const { scriptString, args, pipeInput } = event.data;
 

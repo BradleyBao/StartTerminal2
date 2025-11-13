@@ -148,7 +148,7 @@ class Terminal {
                 scriptString,
                 args,
                 pipeInput
-            }, `chrome-extension://${chrome.runtime.id}`);
+            }, `*`);
         });
     }
 
@@ -241,23 +241,38 @@ class Terminal {
             // 如果全屏应用正在运行，将按键交给它处理
             this.fullScreenApp.handleKeydown(e);
         } else if (this.isReading) {
-            // 如果在 [Y/n] 模式下，我们只处理 Enter 和 Backspace
+            // 如果在 [Y/n] 模式下
             e.preventDefault();
+            // console.log(this.cursorX);
+
             if (e.key === 'Enter') {
+                // ... (Enter 逻辑保持不变) ...
                 const answer = this.currentLine;
                 this.isReading = false;
                 this._handleNewline(); // 换行
                 this.readResolve(answer.trim().toLowerCase()); // Resolve Promise
                 this.readResolve = null;
-                // (done() 会在 executeLine 末尾调用，重置提示符)
+                this.disableInput(); // 交还控制权
+
+            // --- [!! 核心修复 !!] ---
+            // (从 _handleKeydown 复制 Backspace 逻辑)
             } else if (e.key === 'Backspace') {
-                if (this.currentLine.length > 0) {
-                    this.currentLine = this.currentLine.slice(0, -1);
+                const pos = this.cursorX - this.prompt.length;
+                if (pos > 0) {
+                    this.currentLine = this.currentLine.substring(0, pos - 1) + this.currentLine.substring(pos);
+                    this.cursorX--;
                 }
+            // (从 _handleKeydown 复制字符输入逻辑)
             } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
-                this.currentLine += e.key;
+                const pos = this.cursorX - this.prompt.length;
+                const char = e.key;
+                this.currentLine = this.currentLine.substring(0, pos) + char + this.currentLine.substring(pos);
+                this.cursorX++;
             }
+            // --- [!! 结束修复 !!] ---
+            
             this._render(); // 渲染 Y/n 的输入
+        
         } else {
             // 否则，使用我们常规的命令行处理器
             this._handleKeydown(e);
@@ -282,12 +297,24 @@ class Terminal {
      */
     readInput(prompt) {
         return new Promise((resolve) => {
-            this.writeLine(prompt + " "); // 显示 [Y/n] 提示
-            this.prompt = ""; // 临时隐藏主提示符
-            this.currentLine = ""; // 清空当前输入
+            const fullPrompt = prompt + " ";
+            
+            // --- [!! 核心修复 !!] ---
+            // 1. 不使用 writeLine，而是将提示符 "烘焙" 到当前缓冲区行
+            this.buffer[this.cursorY] = this._overwriteHtml(this.buffer[this.cursorY], 0, this.escapeHtml(fullPrompt));
+            
+            // 2. 将 I/O 提示符设置为 "逻辑" 提示符
+            this.prompt = fullPrompt;
+            this.currentLine = ""; // 清空输入
+            
+            // 3. 将光标移动到提示符末尾
+            this.cursorX = fullPrompt.length;
+
             this.isReading = true; // 进入“读取模式”
             this.readResolve = resolve; // 存储 resolve 函数
-            this._render(); // 渲染 [Y/n] 提示
+            // (我们仍然需要 enableInput 来确保 _render 生效)
+            this.enableInput();
+            this._render(); // 渲染 [Y/n] 提示和光标
         });
     }
 
@@ -878,12 +905,9 @@ class Terminal {
      * 处理 IME 输入或粘贴
      */
     _handleInput(e) {
-        // --- 核心 IME 修复 ---
         // 如果正在输入法组合中，忽略所有 `input` 事件
         // 我们将只在 `compositionend` 事件中处理最终结果
         if (this.isComposing) return; 
-        // --- 结束 ---
-
         if (this.inputDisabled) return; 
         
         // (这个逻辑现在主要用于处理粘贴)
@@ -1919,7 +1943,7 @@ const globalCommands = {
         });
      },
 
-     // --- 新增：export 命令 ---
+     // --- export 命令 ---
      'export': (args, options) => {
         if (args.length === 0) {
             // 如果没有参数，打印所有环境变量
@@ -1952,7 +1976,141 @@ const globalCommands = {
         } else {
             term.writeLine(`export: invalid format. Use KEY=VALUE`);
         }
-     }
+     },
+     // --- sudo 命令 (实现我上一个回复中的 Step C) ---
+    'sudo': async (args, options, pipedInput) => {
+        // "sudo" 只是一个装饰器，用于触发 "apt" 内部的权限检查
+        if (!args[0]) {
+            term.writeLine("sudo: a command is required");
+            return;
+        }
+        const command = args[0];
+        const commandArgs = args.slice(1);
+
+        let commandFunc = null;
+        if (bookmarkSystem.commands[command]) {
+            commandFunc = bookmarkSystem.commands[command];
+        } else if (globalCommands[command]) {
+            commandFunc = globalCommands[command];
+        }
+
+        if (commandFunc) {
+            // 传递 "sudo: true" 选项
+            options.sudo = true;
+            // Await the command, in case it's async (like apt)
+            return await commandFunc(commandArgs, options, pipedInput);
+        } else {
+            term.writeHtml(`<span class="term-error">sudo: ${t('cmdNotFound')}: ${command}</span>`);
+        }
+    },
+
+    // --- `apt` 命令 (使用 fetch) ---
+    'apt': async (args, options) => {
+        const REPO_URL = "https://raw.githubusercontent.com/BradleyBao/StartTerminal2/main/start-terminal-bookmark-extension/repo/";
+        const subCommand = args[0];
+        const pkgName = args[1];
+
+        // 检查 sudo 权限
+        if (!options.sudo && (subCommand === 'install' || subCommand === 'update' || subCommand === 'remove')) {
+            term.writeLine(`apt: This command requires superuser privileges (try 'sudo apt ...')`);
+            return;
+        }
+
+        try {
+            switch (subCommand) {
+                case 'update':
+                    term.writeLine("Updating package lists from GitHub...");
+                    const response = await fetch(REPO_URL + "index.json");
+                    if (!response.ok) {
+                        throw new Error(`Failed to fetch index: ${response.statusText}`);
+                    }
+                    const index = await response.json();
+                    localStorage.setItem('apt_repo_index', JSON.stringify(index));
+                    term.writeLine("... Done.");
+                    break;
+
+                case 'list':
+                    {
+                        const index = JSON.parse(localStorage.getItem('apt_repo_index') || '{}');
+                        const installed = JSON.parse(localStorage.getItem('installed_packages') || '{}');
+                        term.writeLine("Available packages:");
+                        for (const key in index) {
+                            const installedMark = installed[key] ? "[installed]" : "";
+                            term.writeLine(`  ${key} - ${index[key].desc} ${installedMark}`);
+                        }
+                    }
+                    break;
+                
+                case 'install':
+                    if (!pkgName) { term.writeLine("Usage: sudo apt install <package>"); return; }
+                    
+                    const repoIndex = JSON.parse(localStorage.getItem('apt_repo_index') || '{}');
+                    const pkg = repoIndex[pkgName];
+
+                    if (!pkg) {
+                        term.writeLine(`E: Unable to locate package ${pkgName}`);
+                        return;
+                    }
+
+                    // [!!] 交互式 I/O [!!]
+                    term.writeLine(`Package '${pkgName}' will be installed.`);
+                    term.writeLine(pkg.desc);
+                    if (pkg.permissions && pkg.permissions.length > 0) {
+                        term.writeLine(`[!] This package requires new permissions: ${pkg.permissions.join(', ')}`);
+                    }
+                    const answer = await term.readInput("Do you want to continue? [Y/n]");
+
+                    if (answer !== 'y' && answer !== '') {
+                        term.writeLine("Install aborted.");
+                        return;
+                    }
+
+                    // [!!] Chrome 权限请求 [!!]
+                    if (pkg.permissions && pkg.permissions.length > 0) {
+                        const granted = await new Promise((resolve) => {
+                            chrome.permissions.request({ permissions: pkg.permissions }, resolve);
+                        });
+                        if (!granted) {
+                            term.writeLine("Permissions not granted. Install failed.");
+                            return;
+                        }
+                    }
+                    
+                    // [!!] Fetch 和安装代码 [!!]
+                    term.writeLine(`Fetching ${pkgName} from ${pkg.file}...`);
+                    const codeResponse = await fetch(REPO_URL + pkg.file);
+                    if (!codeResponse.ok) {
+                        throw new Error(`Failed to fetch package code: ${codeResponse.statusText}`);
+                    }
+                    const codeString = await codeResponse.text();
+
+                    let installed = JSON.parse(localStorage.getItem('installed_packages') || '{}');
+                    installed[pkgName] = { code: codeString };
+                    localStorage.setItem('installed_packages', JSON.stringify(installed));
+                    term.writeLine(`Successfully installed ${pkgName}.`);
+                    break;
+
+                case 'remove':
+                     if (!pkgName) { term.writeLine("Usage: sudo apt remove <package>"); return; }
+                     {
+                        let installed = JSON.parse(localStorage.getItem('installed_packages') || '{}');
+                        if (!installed[pkgName]) {
+                            term.writeLine(`${pkgName} is not installed.`);
+                            return;
+                        }
+                        delete installed[pkgName];
+                        localStorage.setItem('installed_packages', JSON.stringify(installed));
+                        term.writeLine(`Successfully removed ${pkgName}.`);
+                     }
+                    break;
+
+                default:
+                    term.writeLine("Usage: sudo apt [update|list|install|remove] <package>");
+            }
+        } catch (e) {
+            term.writeHtml(`<span class="term-error">apt error: ${e.message}</span>`);
+        }
+    }
 };
 // --- 结束替换 ---
 
@@ -2045,24 +2203,29 @@ async function executeLine(line) {
                 pipeBuffer = []; // 如果是，准备好缓冲区
             }
 
+            const installedPkgs = JSON.parse(localStorage.getItem('installed_packages') || '{}');
+            const sandboxPkg = installedPkgs[command];
+
             if (commandFunc) {
-                if (command === 'clear') {
-                    commandFunc(args, options);
-                    lastOutput = null; // clear 会重置一切
+                // --- A. 执行原生命令 ---
+                const result = commandFunc(args, options, lastOutput);
+                if (result instanceof Promise) {
+                    lastOutput = await result;
                 } else {
-                    // 将上一个命令的输出 (lastOutput) 作为管道输入 (pipedInput) 传递
-                    const result = commandFunc(args, options, lastOutput);
-                    
-                    if (result instanceof Promise) {
-                        lastOutput = await result;
-                    } else {
-                        lastOutput = result;
-                    }
+                    lastOutput = result;
                 }
+            } else if (sandboxPkg) {
+                // --- B. 执行沙盒命令 ---
+                term.writeHtml(`<span style="color:gray;">[Executing sandboxed script: ${command}]</span>`);
+                // lastOutput (pipedInput) 会被传递
+                const result = await term.executeInSandbox(sandboxPkg.code, args, lastOutput);
+                lastOutput = result; // "result" 是从 sandbox.js 返回的
+            
             } else if (command.trim() !== '') {
+                // --- C. 命令未找到 ---
                 term.writeHtml(`<span class="term-error">startsh: ${t('cmdNotFound')}: ${command}</span>`);
-                isPiping = false; // 命令失败，中断管道
-                break; // 停止执行此管道
+                isPiping = false; 
+                break; 
             }
 
             // 5. 如果正在管道中，将缓冲区设为 "lastOutput" 供下一个命令使用
