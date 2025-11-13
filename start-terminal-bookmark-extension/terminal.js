@@ -227,7 +227,20 @@ class Terminal {
         // 捕获中文输入法 (IME) 或粘贴
         this.inputHandler.addEventListener('input', (e) => this._handleInput(e));
         // 点击终端时，始终聚焦到隐藏的输入框
-        this.container.addEventListener('click', () => this.focus());
+        // this.container.addEventListener('click', () => this.focus());
+        
+        this.container.addEventListener('mouseup', (e) => {
+            const selection = window.getSelection();
+            
+            // 仅当 selection "collapsed" (即用户是点击，而不是拖拽)
+            // 或者 selection 不在 terminal 内部时，才重新聚焦。
+            if (selection.isCollapsed || !this.container.contains(selection.anchorNode)) {
+                this.focus();
+            }
+            // 如果用户拖拽选择了文本 (selection.isCollapsed 为 false)，
+            // 我们什么也不做，以保留他们的选中内容。
+        });
+        
         // 窗口大小调整时，重新计算
         window.addEventListener('resize', () => this._handleResize());
 
@@ -1017,6 +1030,15 @@ class NanoEditor {
         const editorHeight = this.termRows - 3;
         for (let y = 0; y < editorHeight; y++) {
             const lineIndex = this.topRow + y;
+
+            // [!! 核心修复 2.B !!]
+            // 仅当*不是*光标行时，才使用 _padLine (它会转义HTML)
+            // 我们将在第 4 步专门处理光标行。
+            if (lineIndex === this.cursorY) {
+                continue;
+            }
+            // [!! 修复结束 !!]
+
             if (lineIndex < this.lines.length) {
                 this.term.buffer[y + 1] = this._padLine(this.lines[lineIndex]);
             } else {
@@ -1031,17 +1053,27 @@ class NanoEditor {
         // 4. 绘制光标 (手动插入 <span>)
         const bufferY = (this.cursorY - this.topRow) + 1; // +1 因为顶栏
         if (bufferY > 0 && bufferY < this.termRows - 2) { // 确保在文本区域内
-            let line = this.term.buffer[bufferY];
-            // 解码 (因为 _padLine 编码了)
-            line = line.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
             
-            const char = this.term.escapeHtml(line[this.cursorX] || ' ');
-            const cursorSpan = `<span class="term-cursor">${char}</span>`;
+            // 1. 从 this.lines (原始) 而不是 this.term.buffer (已转义) 获取
+            let line = this.lines[this.cursorY] || ""; 
             
+            // 2. 获取光标下的原始字符
+            const char = line[this.cursorX] || ' ';
+            // 3. 转义光标字符
+            const escapedChar = this.term.escapeHtml(char);
+            const cursorSpan = `<span class="term-cursor">${escapedChar}</span>`;
+            
+            // 4. 转义光标前后的部分
             const lineBefore = this.term.escapeHtml(line.substring(0, this.cursorX));
             const lineAfter = this.term.escapeHtml(line.substring(this.cursorX + 1));
 
-            this.term.buffer[bufferY] = lineBefore + cursorSpan + lineAfter;
+            // 5. 组合，然后填充 (padding)
+            const combinedLine = lineBefore + cursorSpan + lineAfter;
+            const visibleLength = line.length; // 原始长度
+            const padding = ' '.repeat(Math.max(0, this.termCols - visibleLength));
+
+            // 6. 将最终构建的行放入缓冲区
+            this.term.buffer[bufferY] = combinedLine + padding;
         }
 
         // 5. 渲染到 DOM
@@ -1486,17 +1518,21 @@ class BookmarkSystem {
             const foundNode = (currentNode.children || []).find(child => child.title.trim() === segment);
             if (foundNode) {
                 currentNode = foundNode;
-                // --- 修复：确保只有当找到的是目录时才更新路径 ---
-                if (foundNode.children) {
-                        // 检查 newPathArray 是否已经包含此节点，避免重复添加
-                        if (!newPathArray.find(p => p.id === foundNode.id)) {
-                            newPathArray.push(currentNode);
-                        }
-                } else if (i < pathSegments.length - 1) {
-                        // 如果路径中间部分不是目录，则路径无效
-                        return null;
+                // --- 确保只有当找到的是目录时才更新路径 ---
+                // if (foundNode.children) {
+                //         // 检查 newPathArray 是否已经包含此节点，避免重复添加
+                //         if (!newPathArray.find(p => p.id === foundNode.id)) {
+                //             newPathArray.push(currentNode);
+                //         }
+                // } else if (i < pathSegments.length - 1) {
+                //         // 如果路径中间部分不是目录，则路径无效
+                //         return null;
+                // }
+                newPathArray.push(currentNode);
+                if (!foundNode.children && i < pathSegments.length - 1) {
+                    return null;
                 }
-                // --- 结束修复 ---
+
             } else {
                 return null;
             }
@@ -1899,34 +1935,62 @@ const globalCommands = {
         // nano 是一个异步命令
         return new Promise(async (resolve) => {
             let content = "";
-            let node; // 书签节点
+            let node = null; // 书签节点
+            let resolvedPath = path; // 默认为用户输入的路径
 
-            if (path === '/etc/.startrc') {
-                content = loadVirtualStartrc(); // 使用 VFS 函数
-            } else {
-                const result = bookmarkSystem._findNodeByPath(path);
-                if (result && result.node) {
-                    if (result.node.url) {
-                        node = result.node;
-                        content = node.url; // 编辑书签 URL
-                    } else if (result.node.children) {
-                        term.writeLine(`nano: ${path} is a directory.`);
-                        resolve(); // 结束命令
-                        return;
-                    }
+            // [!! 核心修复逻辑 !!]
+            // 1. 无论路径是什么，首先尝试解析它
+            const result = bookmarkSystem._findNodeByPath(path);
+
+            if (result && result.node) {
+                // 2. 如果找到了节点
+                node = result.node;
+                
+                // 3. 重建一个标准化的绝对路径 (例如 "/etc/.startrc")
+                //    这能修复 Nano 编辑器标题栏显示 ".startrc" 的问题
+                resolvedPath = "/" + result.newPathArray.slice(1).map(p => p.title).join("/");
+
+                // 4. 按 ID 检查，而不是按路径字符串检查
+                if (node.id === 'vfs-startrc') {
+                    // 4a. 这是 .startrc 文件。加载解码后的内容。
+                    content = loadVirtualStartrc();
+                } else if (node.url) {
+                    // 4b. 这是普通书签。加载其 URL 作为内容。
+                    content = node.url; 
+                } else if (node.children) {
+                    // 4c. 这是个目录。
+                    term.writeLine(`nano: ${resolvedPath} is a directory.`);
+                    resolve(); // 结束命令
+                    return;
                 }
-                // (如果文件不存在，content 保持为 ""，即新文件)
+            } else {
+                // 5. 如果未找到节点，说明这是一个新文件。
+                // 'content' 保持为 ""
+                // 'node' 保持为 null
+                // 'resolvedPath' 保持为用户输入的路径 (例如 "/etc/myscript.sh")
             }
+            // [!! 修复结束 !!]
+
 
             const onSave = (savedPath, savedContent) => {
                 try {
-                    if (savedPath === '/etc/.startrc') {
+                    // 使用 'resolvedPath' 进行检查，因为 'savedPath' 
+                    // 总是等于传递给 NanoEditor 的路径。
+                    if (resolvedPath === '/etc/.startrc') {
                         localStorage.setItem('.startrc', savedContent);
                         parseStartrc(savedContent); // 重新加载配置
                         bookmarkSystem.update_user_path(); // 更新提示符
-                    } else if (node) {
-                        // 如果我们在编辑一个书签，更新它的 URL
+                    } else if (node && node.id !== 'vfs-startrc') {
+                        // 如果我们在编辑一个*已存在的*书签，更新它的 URL
                         chrome.bookmarks.update(node.id, { url: savedContent });
+                    } else if (!node) {
+                        // 准备为 'sh' 命令支持！
+                        // 这是一个新文件 (例如 /etc/myscript.sh)
+                        // 目前，我们还不支持在 VFS 中*创建*新文件
+                        term.writeHtml(`<span class="term-error">nano: Error: Cannot save new file '${savedPath}'. (Not implemented)</span>`);
+                    } else {
+                        // (以防万一)
+                        console.error("Nano save error: Unknown state.", resolvedPath);
                     }
                 } catch (e) {
                     console.error("Nano save error:", e);
@@ -1937,11 +2001,130 @@ const globalCommands = {
                 resolve(); // 告诉 executeLine 命令已完成
             };
 
-            // 创建并启动 nano
-            const editor = new NanoEditor(term, path, content, onSave, onExit);
+            // 创建并启动 nano (现在传递 'resolvedPath')
+            const editor = new NanoEditor(term, resolvedPath, content, onSave, onExit);
             editor.open();
         });
      },
+
+     'open': (args, options) => {
+        if (!args[0]) {
+            term.writeHtml(`<span class="term-error">${t('missingOperand')}</span>`);
+            return;
+        }
+        const path = args[0];
+        const result = bookmarkSystem._findNodeByPath(path);
+
+        if (!result || !result.node) {
+            term.writeHtml(`<span class="term-error">${t('noSuchFileOrDir')}: ${path}</span>`);
+            return;
+        }
+        if (result.node.children) {
+            term.writeHtml(`<span class="term-error">open: ${path}: ${t('isADir')}</span>`);
+            return;
+        }
+        const url = result.node.url;
+        if (!url || url.startsWith('data:text/plain')) {
+            term.writeHtml(`<span class="term-error">open: '${path}': invalid or internal URL.</span>`);
+            return;
+        }
+
+        if (typeof chrome !== 'undefined' && chrome.tabs) {
+            // [!! 逻辑修复 !!]
+            // 默认在当前标签页打开。
+            // options.n (new tab) 会在新标签页中打开。
+            if (options.n) {
+                // 在新标签页打开
+                chrome.tabs.create({ url: url });
+            } else {
+                // 在当前标签页打开 (默认)
+                chrome.tabs.update({ url: url });
+            }
+        } else {
+            term.writeHtml(`<span class="term-error">open: cannot access chrome.tabs API.</span>`);
+        }
+    },
+
+    'search': (args, options) => {
+        if (args.length === 0) {
+            term.writeHtml(`<span class="term-error">Usage: search [-n] <query...></span>`);
+            return;
+        }
+        const queryText = args.join(' ');
+
+        if (typeof chrome !== 'undefined' && chrome.search) {
+            // [!! 逻辑修复 !!]
+            // 默认在当前标签页打开。
+            // options.n (new tab) 会在新标签页中打开。
+            const disposition = options.n ? "NEW_TAB" : "CURRENT_TAB";
+
+            chrome.search.query({ 
+                text: queryText,
+                disposition: disposition
+            });
+        } else {
+            term.writeHtml(`<span class="term-error">search: API not available.</span>`);
+        }
+    },
+
+    'date': (args, options) => {
+        const now = new Date();
+        // 使用 i18n 友好的方式显示
+        const lang = Environment.LANG || 'en';
+        const option = {
+            weekday: 'short', year: 'numeric', month: 'short',
+            day: 'numeric', hour: '2-digit', minute: '2-digit',
+            second: '2-digit', timeZoneName: 'short'
+        };
+        try {
+            term.writeLine(new Intl.DateTimeFormat(lang, option).format(now));
+        } catch (e) {
+            // 回退到简单模式 (如果 lang code 不标准)
+            term.writeLine(now.toString());
+        }
+    },
+
+    'cal': (args, options) => {
+        const now = new Date();
+        const year = now.getFullYear();
+        const month = now.getMonth(); // 0-11
+        const lang = Environment.LANG || 'en';
+        
+        const firstDay = new Date(year, month, 1).getDay(); // 0-6 (Sun-Sat)
+        const daysInMonth = new Date(year, month + 1, 0).getDate(); // 0 是上个月的最后一天
+
+        // 打印月份和年份
+        const monthName = now.toLocaleString(lang, { month: 'long' });
+        const header = `${monthName} ${year}`;
+        term.writeLine(header.padStart(Math.floor((20 - header.length) / 2) + header.length)); // 居中
+        term.writeLine("Su Mo Tu We Th Fr Sa");
+
+        let line = "   ".repeat(firstDay); // 用空格填充第一天之前
+        
+        for (let day = 1; day <= daysInMonth; day++) {
+            line += (day < 10 ? " " : "") + day + " ";
+            
+            // 如果是周六 (firstDay + day - 1) % 7 === 6
+            // 或者到了最后一天
+            if ((day + firstDay) % 7 === 0 || day === daysInMonth) {
+                term.writeLine(line.trimEnd()); // 打印一行
+                line = ""; // 重置
+            }
+        }
+    },
+    
+    'uptime': (args, options) => {
+        // 读取我们在 main() 中设置的全局变量
+        const startTime = window.st2_startTime || Date.now();
+        const durationMs = Date.now() - startTime;
+        
+        const seconds = Math.floor((durationMs / 1000) % 60);
+        const minutes = Math.floor((durationMs / (1000 * 60)) % 60);
+        const hours = Math.floor((durationMs / (1000 * 60 * 60)) % 24);
+        const days = Math.floor(durationMs / (1000 * 60 * 60 * 24));
+        
+        term.writeLine(`Terminal up for: ${days}d ${hours}h ${minutes}m ${seconds}s.`);
+    },
 
      // --- export 命令 ---
      'export': (args, options) => {
@@ -2242,6 +2425,9 @@ async function executeLine(line) {
 
 
 async function main() {
+
+    // Uptime 
+    window.st2_startTime = Date.now();
 
     // Load Settings 
     loadStyleSettings();
