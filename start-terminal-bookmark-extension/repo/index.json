@@ -1,0 +1,12 @@
+{
+  "cowsay": {
+    "desc": "A friendly cow says your message.",
+    "permissions": [],
+    "file": "cowsay.js"
+  },
+  "wallpaper": {
+    "desc": "Allows changing the new tab wallpaper.",
+    "permissions": ["wallpaper"],
+    "file": "wallpaper.js"
+  }
+}
