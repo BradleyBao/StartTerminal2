@@ -12,10 +12,13 @@
     "host_permissions": []
   },
   "weather": {
-    "desc": "Fetch simple weather using Open-Meteo.",
+    "desc": "Fetch weather by city name (e.g., 'weather Fujisawa').",
     "file": "weather.js",
     "permissions": [],
-    "host_permissions": ["https://api.open-meteo.com/*"]
+    "host_permissions": [
+      "https://api.open-meteo.com/*",
+      "https://geocoding-api.open-meteo.com/*"
+    ]
   },
   "curl": {
     "desc": "Fetch the text content of a URL.",
