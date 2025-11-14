@@ -23,6 +23,7 @@
   "host_permissions": [
     "https://login.microsoftonline.com/*",
     "https://graph.microsoft.com/*",
+    "https://www.googleapis.com/*",
     "https://raw.githubusercontent.com/BradleyBao/StartTerminal2/main/start-terminal-bookmark-extension/repo/*"
   ],
   "sandbox": {
@@ -34,6 +35,13 @@
       "matches": ["<all_urls>"]
     }
   ],
+  "oauth2": {
+    "client_id": "627153522315-8fdkqcf86hq1fkjmg10q1dj2afv6s1gk.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/userinfo.email",
+      "https://www.googleapis.com/auth/userinfo.profile"
+    ]
+  },
   "action": {
     "default_icon": "icons/icon128.png"
   }

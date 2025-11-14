@@ -41,6 +41,45 @@ const Environment = {
     // More will load by .startrc
 }
 
+/**
+ * 加载指定用户的环境
+ * @param {string} username - "user" 或 "bradley" 等
+ */
+function loadEnvironment(username) {
+    // 1. 清空别名
+    AliasEnvironment = {};
+    
+    // 2. 重置环境变量 (硬重置)
+    Object.keys(Environment).forEach(key => delete Environment[key]);
+    
+    // 3. 设置新会话的基础
+    Environment.USER = username;
+    Environment.HOST = 'ST2.0';
+    // (不再保留 oldPS1/oldLANG)
+
+    // 4. 从 .startrc 加载配置
+    //    这会为新会话设置 PS1, LANG, 和所有别名
+    try {
+        // 首先加载默认值
+        parseStartrc(defaultStartrcContent);
+        // 然后加载用户的 .startrc (这会覆盖默认值)
+        parseStartrc(loadVirtualStartrc());
+    } catch (e) {
+        console.warn("Error parsing .startrc during loadEnvironment", e);
+        // 如果 .startrc 损坏，确保我们至少有一个 PS1
+        if (!Environment.PS1) {
+            Environment.PS1 = '\\u@\\h:\\w % ';
+        }
+    }
+    
+    // 5. 更新提示符 (它现在将使用新的 USER 和 .startrc 中的 PS1)
+    if (bookmarkSystem) {
+        bookmarkSystem.update_user_path();
+    }
+}
+
+let AliasEnvironment = {}; // 存储别名的对象（临时）
+
 // International Help Function 
 function t(key) {
     const lang = Environment.LANG || 'en';
@@ -946,11 +985,46 @@ class Terminal {
      * 处理窗口大小调整
      */
     async _handleResize() {
-        // 这是一个简化的重绘，它会清空屏幕
+        // 1. 保存旧的行数
+        const oldRows = this.rows;
+
+        // 2. 重新计算新尺寸
         await this._calculateDimensions();
-        this._initBuffer();
-        this.writeLine("--- Terminal resized. Buffer cleared. ---");
-        this.setPrompt(this.prompt);
+        const newRows = this.rows;
+        const newCols = this.cols;
+
+        // 3. 调整 buffer 数组以匹配 newRows (在顶部添加/删除行)
+        if (newRows > oldRows) {
+            // 窗口变高了，在顶部添加新行（模拟内容向上滚动）
+            const diff = newRows - oldRows;
+            const newLines = Array(diff).fill(' '.repeat(newCols));
+            this.buffer.splice(0, 0, ...newLines); // 在 buffer 顶部插入
+        } else if (newRows < oldRows) {
+            // 窗口变矮了，从顶部删除行（模拟内容滚出屏幕）
+            const diff = oldRows - newRows;
+            this.buffer.splice(0, diff); // 从 buffer 顶部删除
+        }
+        
+        // 4. 调整 buffer 中*每行*的宽度 (天真的重排：截断或填充)
+        //    用户接受这种 "被打乱" 的布局
+        this.buffer = this.buffer.map(line => {
+            const textContent = this._stripHtml(line); // 获取纯文本
+            if (textContent.length > newCols) {
+                // 截断
+                return this.escapeHtml(textContent.substring(0, newCols)); 
+            } else {
+                // 填充
+                return this.escapeHtml(textContent) + ' '.repeat(newCols - textContent.length);
+            }
+        });
+
+        // 5. 确保光标在调整后的最后一行
+        //    (在我们的设计中，光标总是在缓冲区之外的“当前行”)
+        //    我们只需要确保 cursorY 是最后一行，_render 会处理的
+        this.cursorY = this.rows - 1;
+
+        // 6. 重新渲染 (将显示 reflowed 缓冲区和新提示符)
+        //    setPrompt 会被 _render 隐式调用
         this._render();
     }
 
@@ -969,17 +1043,18 @@ class Terminal {
 // ===============================================
 
 class NanoEditor {
-    constructor(term, filePath, initialContent, onSave, onExit) {
+    constructor(term, filePath, initialContent, onSave, onExit, isReadOnly = false) {
         this.term = term;
         this.filePath = filePath;
         this.onSave = onSave;
         this.onExit = onExit;
+        this.isReadOnly = isReadOnly;
 
         this.lines = initialContent.split('\n'); // 文件内容（字符串数组）
         this.cursorY = 0;   // 光标在文件中的行号
         this.cursorX = 0;   // 光标在文件中的列号
         this.topRow = 0;    // 屏幕上显示的第一行文件
-        this.status = "Press ^X to Exit, ^O to Save";
+        this.status = "Press ^X to Exit" + (this.isReadOnly ? "" : ", ^O to Save")
         this.dirty = false; // 是否有未保存的修改
         this.termRows = term.rows;
         this.termCols = term.cols;
@@ -1030,7 +1105,8 @@ class NanoEditor {
         this.term._initBuffer(); // 清空 term.buffer
 
         // 1. 绘制顶栏
-        const topBar = `Nano 1.0 | File: ${this.filePath} ${this.dirty ? '*' : ''}`;
+        const roText = this.isReadOnly ? ' [ Read Only ]' : '';
+        const topBar = `Nano 1.0 | File: ${this.filePath} ${this.dirty ? '*' : ''}${roText}`;
         this.term.buffer[0] = this._padLine(topBar, true);
 
         // 2. 绘制文本区域
@@ -1054,7 +1130,8 @@ class NanoEditor {
         }
 
         // 3. 绘制底栏
-        this.term.buffer[this.termRows - 2] = this._padLine("^X Exit   ^O Save", true);
+        const saveText = this.isReadOnly ? "" : "  ^O Save";
+        this.term.buffer[this.termRows - 2] = this._padLine(`^X Exit${saveText}`, true);
         this.term.buffer[this.termRows - 1] = this._padLine(this.status, true);
 
         // 4. 绘制光标 (手动插入 <span>)
@@ -1107,10 +1184,22 @@ class NanoEditor {
                     }
                     return; // 退出，不重绘
                 case 'o':
+                    if (this.isReadOnly) {
+                        this.status = "File is read-only";
+                        this._render(); // 重新渲染以显示状态
+                        return; // 阻止调用 _save()
+                    }
                     this._save();
                     break;
             }
         } else {
+            const isEditKey = ['Backspace', 'Enter'].includes(e.key) || 
+                              (e.key.length === 1 && !e.ctrlKey && !e.metaKey);
+            if (this.isReadOnly && isEditKey) {
+                this.status = "File is read-only"; // (可选) 再次提醒
+                this._render(); // 重新渲染以显示状态
+                return; // 阻止所有编辑键
+            }
             // --- 常规编辑 ---
             switch (e.key) {
                 case 'ArrowUp':
@@ -1187,11 +1276,18 @@ class NanoEditor {
 
     _save() {
         this.status = "Saving...";
+        
         try {
             const content = this.lines.join('\n');
-            this.onSave(this.filePath, content);
-            this.dirty = false;
-            this.status = `File saved! (${content.length} bytes)`;
+            const success = this.onSave(this.filePath, content);
+            if (success) {
+                this.dirty = false;
+                this.status = `File saved! (${content.length} bytes)`;
+            } else {
+                if (this.status === "Saving...") {
+                    this.status = "Error: Could not save file.";
+                }
+            }
         } catch (e) {
             this.status = `Error saving: ${e.message}`;
         }
@@ -1300,7 +1396,7 @@ class BookmarkSystem {
                     children = children.filter(child => !child.title.startsWith('.'));
                 }
                 
-                // [!! 新增 'ls -l' 逻辑 !!]
+                // 'ls -l' 长列表格式化函数
                 if (options.l) {
                     // 长列表格式
                     for (const child of children) {
@@ -1308,8 +1404,8 @@ class BookmarkSystem {
                         const isDir = !!child.children;
                         const modeStr = formatMode(meta.mode, isDir);
                         const links = 1;
-                        const owner = "user";
-                        const group = "user";
+                        const owner = meta.owner || "user";
+                        const group = meta.group || "user";
                         const size = 0; // (大小对书签没有意义)
                         const date = new Date(child.dateAdded || Date.now()).toLocaleDateString('en-US', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 
@@ -1318,13 +1414,59 @@ class BookmarkSystem {
                         this.term.writeHtml(`${modeStr} ${links} ${owner} ${group} ${String(size).padStart(6)} ${date} ${name}`);
                     }
                 } else {
-                    // 默认短列表格式
-                    for (const child of children) {
-                        if (child.children) {
-                            this.term.writeHtml(`<span class="term-folder">${child.title}/</span>`);
+                    if (children.length === 0) return; // 目录为空
+
+                    // 1. 格式化所有名称并找到最大宽度
+                    let maxNameWidth = 0;
+                    const formattedNames = children.map(child => {
+                        const title = child.title.trim();
+                        const isDir = !!child.children;
+                        const nameLength = title.length + (isDir ? 1 : 0); // "name/"
+                        
+                        let html;
+                        if (isDir) {
+                            html = `<span class="term-folder">${this.term.escapeHtml(title)}/</span>`;
                         } else {
-                            this.term.writeLine(child.title); 
+                            html = this.term.escapeHtml(title);
                         }
+                        
+                        if (nameLength > maxNameWidth) {
+                            maxNameWidth = nameLength;
+                        }
+                        return { html: html, length: nameLength };
+                    });
+
+                    // 2. 计算列
+                    const colPadding = 2; // "name  name  name"
+                    const colWidth = maxNameWidth + colPadding;
+                    const termWidth = this.term.cols;
+                    let numCols = Math.floor(termWidth / colWidth);
+                    if (numCols === 0) {
+                        numCols = 1; // 至少一列
+                    }
+
+                    // 3. 构建并打印行 (Row-major order)
+                    let currentLine = "";
+                    let currentCols = 0;
+
+                    for (const name of formattedNames) {
+                        // 准备带 padding 的 HTML
+                        const padding = ' '.repeat(Math.max(0, colWidth - name.length));
+                        currentLine += name.html + padding;
+                        currentCols++;
+
+                        if (currentCols >= numCols) {
+                            // 此行已满，打印
+                            // writeHtml 会自动为我们处理换行
+                            this.term.writeHtml(currentLine); 
+                            currentLine = "";
+                            currentCols = 0;
+                        }
+                    }
+
+                    // 4. 打印最后一行（如果不为空）
+                    if (currentLine.trim().length > 0) {
+                        this.term.writeHtml(currentLine);
                     }
                 }
             },
@@ -1334,19 +1476,34 @@ class BookmarkSystem {
                     this.term.writeHtml(`<span class="term-error">mkdir: missing operand</span>`);
                     return;
                 }
-                const currentMeta = getMetadata(this.current);
-                if (!(currentMeta.mode & 0o200)) { // 0o200 = U_WRITE
+
+                if (!hasPermission(this.current, 'w')) {
                     term.writeHtml(`<span class="term-error">mkdir: cannot create directory: Permission denied</span>`);
                     return;
                 }
+
+                // const currentMeta = getMetadata(this.current);
+                // if (!(currentMeta.mode & 0o200)) { // 0o200 = U_WRITE
+                //     term.writeHtml(`<span class="term-error">mkdir: cannot create directory: Permission denied</span>`);
+                //     return;
+                // }
                 const dirName = args[0];
                 if (this._findChildByTitle(this.current.children, dirName)) {
                     this.term.writeHtml(`<span class="term-error">mkdir: ${dirName}: File exists</span>`);
                     return;
                 }
-                await new Promise(resolve => {
+                // await new Promise(resolve => {
+                //     chrome.bookmarks.create({ parentId: this.current.id, title: dirName }, resolve);
+                // });
+
+                const newNode = await new Promise(resolve => { // [!!] 获取新节点 [!!]
                     chrome.bookmarks.create({ parentId: this.current.id, title: dirName }, resolve);
                 });
+
+                // [!!] 新增：设置新目录的元数据 [!!]
+                if (newNode) {
+                    setMetadata(newNode, 0o777, Environment.USER, Environment.USER);
+                }
             },
             
             'rmdir': async (args, options) => {
@@ -1374,29 +1531,30 @@ class BookmarkSystem {
                 const path = args[0];
                 let target;
                 if (!path.startsWith('/') && !path.startsWith('~/')) {
-                    // 'rm' 查找当前目录
                     target = this._findChildByTitle(this.current.children, path);
                 } else {
                     const result = this._findNodeByPath(path);
                     target = result ? result.node : null;
                 }
+                
                 if (!target) {
                     term.writeHtml(`<span class="term-error">rm: ${args[0]}: No such file or directory</span>`);
                     return;
                 }
 
-                const meta = getMetadata(target);
-                if (!(meta.mode & 0o200)) { // 0o200 = U_WRITE
+                // [!! 核心修复：立即检查权限 !!]
+                // 无论文件是 VFS 还是书签，都必须先检查权限。
+                if (!hasPermission(target, 'w')) {
                     term.writeHtml(`<span class="term-error">rm: cannot remove '${args[0]}': Permission denied</span>`);
                     return;
                 }
+                // [!! 修复结束 !!]
+
                 
-                // [VFS 'rm' 逻辑]
+                // VFS 'rm' 逻辑 (现在是安全的)
                 if (target.id.startsWith('vfs-bin-')) {
                     if (this.current.id === 'vfs-bin') {
-                        // 1. 从 localStorage 删除
                         deleteVfsScript(target.title);
-                        // 2. 从 VFS (内存中) 删除
                         this.vfsBin.children = this.vfsBin.children.filter(c => c.id !== target.id);
                         term.writeLine(`Removed VFS script: ${target.title}`);
                         return;
@@ -1406,10 +1564,11 @@ class BookmarkSystem {
                     }
                 }
 
+                // 书签 'rm' 逻辑 (现在是安全的)
                 const recursive = options.r || options.recurse;
                 
                 if (target.children && !recursive) {
-                    // ... (is a directory)
+                    term.writeHtml(`<span class="term-error">rm: ${args[0]}: is a directory</span>`);
                 } else if (target.children && recursive) {
                     await this._removeRecursive(target.id);
                 } else {
@@ -1669,6 +1828,10 @@ export PS1="\\u@\\h:\\w\\$ "
 # 'en' for English
 # 'zh' for 简体中文
 export LANG="en"
+
+# --- Aliases ---
+alias ll='ls -l -a'
+alias la='ls -a'
 `
 
 /**
@@ -1678,9 +1841,10 @@ export LANG="en"
 function parseStartrc(content) {
     const lines = content.split('\n');
     const exportRegex = /^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/;
+    const aliasRegex = /^\s*alias\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*['"]?(.*?)['"]?\s*$/;
 
     for (const line of lines) {
-        const match = line.match(exportRegex);
+        let match = line.match(exportRegex);
         if (match) {
             const key = match[1];
             let value = match[2];
@@ -1692,6 +1856,15 @@ function parseStartrc(content) {
             
             Environment[key] = value;
             console.log(`[Env] Set ${key} = "${value}"`);
+        } else if (match = line.match(aliasRegex)) {
+            const key = match[1];
+            let value = match[2];
+            // 清理可能被捕获的引号
+            if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+                value = value.substring(1, value.length - 1);
+            }
+            AliasEnvironment[key] = value;
+            console.log(`[Alias] Set ${key} = "${value}"`);
         }
     }
 }
@@ -1873,7 +2046,9 @@ function loadVfsScripts() {
             id: `vfs-bin-${name}`,
             title: name,
             url: `data:text/plain;base64,${btoa(encodeURIComponent(scripts[name].content))}`,
-            mode: scripts[name].mode, // [!!] 附带权限 [!!]
+            mode: scripts[name].mode,
+            owner: scripts[name].owner || 'user', // [!!] 加载 owner
+            group: scripts[name].group || 'user', // [!!] 加载 group
             children: null,
             parentId: 'vfs-bin'
         });
@@ -1887,31 +2062,33 @@ function loadVfsScripts() {
  * @returns {Object} - { mode: 0o755 }
  */
 function getMetadata(node) {
-    if (!node) return { mode: 0 }; // 安全回退
+    if (!node) return { mode: 0, owner: 'root', group: 'root' };
     
-    // 1. VFS 内部节点 (权限是硬编码的)
-    if (node.mode) {
-        return { mode: node.mode };
+    // 1. VFS 内部节点
+    if (node.owner) { // /bin/ 脚本有 'owner' 属性
+        return { mode: node.mode, owner: node.owner, group: node.group || 'user' };
     }
-    if (node.id === 'vfs-etc') return { mode: 0o755 }; // drwxr-xr-x
-    if (node.id === 'vfs-bin') return { mode: 0o755 }; // drwxr-xr-x
-    if (node.id === 'vfs-startrc') return { mode: 0o644 }; // -rw-r--r--
-    if (node.id.startsWith('vfs-bin-')) {
-        // (这个应该在 loadVfsScripts 中被设置，但作为回退)
-        return { mode: 0o755 };
-    }
+    // 硬编码的 VFS 目录/文件
+    if (node.id === 'vfs-etc') return { mode: 0o755, owner: 'root', group: 'root' };
+    if (node.id === 'vfs-bin') return { mode: 0o777, owner: 'root', group: 'root' };
+    if (node.id === 'vfs-startrc') return { mode: 0o666, owner: 'root', group: 'root' };
 
     // 2. 真实书签 (从 localStorage 读取)
     const metadataStore = JSON.parse(localStorage.getItem('vfs_metadata') || '{}');
-    if (metadataStore[node.id]) {
-        return metadataStore[node.id];
+    const meta = metadataStore[node.id];
+    if (meta) {
+        return {
+            mode: meta.mode || (node.children ? 0o777 : 0o666),
+            owner: meta.owner || 'user', // [!!] 加载 owner
+            group: meta.group || 'user'
+        };
     }
     
-    // 3. 默认书签权限
+    // 3. 默认书签权限 (未被追踪的)
     if (node.children) {
-        return { mode: 0o777 }; // 目录 (drwxrwxrwx)
+        return { mode: 0o777, owner: 'user', group: 'user' }; // 目录
     } else {
-        return { mode: 0o666 }; // 文件 (-rw-rw-rw-)
+        return { mode: 0o666, owner: 'user', group: 'user' }; // 文件
     }
 }
 
@@ -1920,12 +2097,21 @@ function getMetadata(node) {
  * @param {Object} node - VFS 节点
  * @param {number} newMode - 八进制权限 (e.g., 0o755)
  */
-function setMetadata(node, newMode) {
+function setMetadata(node, newMode, newOwner, newGroup) { // [!! 修改：添加 owner/group !!]
     if (!node) return;
 
-    // 1. VFS /bin/ 脚本 (可写)
+    // 1. VFS /bin/ 脚本
     if (node.id.startsWith('vfs-bin-')) {
-        updateVfsScriptMode(node.title, newMode);
+        let scripts = JSON.parse(localStorage.getItem('vfs_bin_scripts') || '{}');
+        if (scripts[node.title]) {
+            if (newMode) scripts[node.title].mode = newMode;
+            if (newOwner) scripts[node.title].owner = newOwner;
+            if (newGroup) scripts[node.title].group = newGroup;
+            localStorage.setItem('vfs_bin_scripts', JSON.stringify(scripts));
+            if (newMode) node.mode = newMode;
+            if (newOwner) node.owner = newOwner;
+            if (newGroup) node.group = newGroup;
+        }
         return;
     }
     
@@ -1935,11 +2121,14 @@ function setMetadata(node, newMode) {
         return;
     }
 
-    // 3. 真实书签 (可写)
+    // 3. 真实书签
     let metadataStore = JSON.parse(localStorage.getItem('vfs_metadata') || '{}');
-    // 获取当前元数据 (以防有其他设置)
     let currentMeta = metadataStore[node.id] || getMetadata(node); 
-    currentMeta.mode = newMode;
+    
+    if (newMode) currentMeta.mode = newMode;
+    if (newOwner) currentMeta.owner = newOwner;
+    if (newGroup) currentMeta.group = newGroup;
+
     metadataStore[node.id] = currentMeta;
     localStorage.setItem('vfs_metadata', JSON.stringify(metadataStore));
 }
@@ -1966,16 +2155,96 @@ function formatMode(mode, isDir) {
 }
 
 /**
+ * 解析符号权限 (e.g., "u+x", "go=rw")
+ * @param {string} modeStr - e.g., "o-x"
+ * @param {number} currentMode - e.g., 0o755
+ * @returns {number|null} - The new mode, or null if invalid
+ */
+function parseSymbolicMode(modeStr, currentMode) {
+    const parts = modeStr.split(','); // e.g., "u+x,g-w"
+    let newMode = currentMode;
+
+    for (const part of parts) {
+        // Regex: 1=who, 2=op, 3=perms
+        const match = part.match(/^([ugoa]*)([+-=])([rwx]*)$/);
+        if (!match) return null; // 格式无效
+
+        let [, who, op, perms] = match;
+
+        if (who === '') who = 'a'; // 默认为 "all" (e.g., "+x")
+
+        // 1. 确定要操作的权限位
+        let permMask = 0;
+        if (perms.includes('r')) permMask |= 0o4;
+        if (perms.includes('w')) permMask |= 0o2;
+        if (perms.includes('x')) permMask |= 0o1;
+
+        // 2. 确定这些位应用到谁身上 (user, group, other)
+        let finalMask = 0;
+        if (who.includes('u') || who.includes('a')) finalMask |= (permMask << 6); // 0o400, 0o200, 0o100
+        if (who.includes('g') || who.includes('a')) finalMask |= (permMask << 3); // 0o040, 0o020, 0o010
+        if (who.includes('o') || who.includes('a')) finalMask |= permMask;         // 0o004, 0o002, 0o001
+
+        // 3. 应用操作
+        if (op === '+') {
+            newMode |= finalMask; // 添加权限
+        } else if (op === '-') {
+            newMode &= ~finalMask; // 移除权限
+        } else if (op === '=') {
+            // 'set' 操作: 必须先清除 'who' 的所有位，再设置新位
+            let clearMask = 0;
+            if (who.includes('u') || who.includes('a')) clearMask |= 0o700;
+            if (who.includes('g') || who.includes('a')) clearMask |= 0o070;
+            if (who.includes('o') || who.includes('a')) clearMask |= 0o007;
+
+            newMode &= ~clearMask; // 清除
+            newMode |= finalMask; // 设置
+        }
+    }
+    return newMode;
+}
+
+/**
+ * 检查活动用户是否有权对节点执行操作
+ * @param {Object} node - VFS 节点
+ * @param {'r'|'w'|'x'} permissionType - 'r', 'w', or 'x'
+ * @returns {boolean}
+ */
+function hasPermission(node, permissionType) {
+    const meta = getMetadata(node);
+    const activeUser = Environment.USER;
+
+    if (activeUser === 'root') return true; // (未来的 'sudo' 可以利用这个)
+
+    if (meta.owner === activeUser) {
+        // --- 我是所有者 ---
+        if (permissionType === 'r') return (meta.mode & 0o400); // 检查 U_READ
+        if (permissionType === 'w') return (meta.mode & 0o200); // 检查 U_WRITE
+        if (permissionType === 'x') return (meta.mode & 0o100); // 检查 U_EXEC
+    } 
+    // (此处可以添加 group 检查)
+    else {
+        // --- 我是 "other" ---
+        if (permissionType === 'r') return (meta.mode & 0o004); // 检查 O_READ
+        if (permissionType === 'w') return (meta.mode & 0o002); // 检查 O_WRITE
+        if (permissionType === 'x') return (meta.mode & 0o001); // 检查 O_EXEC
+    }
+    return false; // 默认拒绝
+}
+
+/**
  * 将脚本保存到 localStorage
  */
-function saveVfsScript(name, content, mode = 0o755) { // 默认 755 (rwxr-xr-x)
+function saveVfsScript(name, content, mode = 0o755, owner = 'user') { // [!! 修改：添加 owner !!]
     let scripts = JSON.parse(localStorage.getItem('vfs_bin_scripts') || '{}');
-    // 如果已有脚本，只更新内容并保留旧 mode
-    const oldMode = scripts[name] ? scripts[name].mode : mode;
+    
+    const oldData = scripts[name] || {};
     
     scripts[name] = {
         content: content,
-        mode: oldMode // 保留旧权限，或使用默认权限
+        mode: oldData.mode || mode, // 保留旧权限
+        owner: oldData.owner || owner, // [!!] 保留旧所有者或设置新所有者
+        group: oldData.group || 'user' // (暂不支持 group)
     };
     localStorage.setItem('vfs_bin_scripts', JSON.stringify(scripts));
 }
@@ -2092,6 +2361,11 @@ const globalCommands = {
             return;
         }
 
+        if (!hasPermission(result.node, 'x')) {
+             term.writeHtml(`<span class="term-error">startsh: permission denied: ${path}</span>`);
+             return;
+        }
+
         // --- 核心执行 ---
         // 我们只需递归调用 executeLine，它现在可以处理 \n
         // await/return 链和 executeNestLevel 会处理好一切。
@@ -2105,11 +2379,45 @@ const globalCommands = {
         const modeStr = args[0];
         const path = args[1];
 
-        const newMode = parseInt(modeStr, 8); // 解析八进制
-        if (isNaN(newMode)) {
-            term.writeHtml(`<span class="term-error">chmod: invalid mode: '${modeStr}'</span>`);
+        const result = bookmarkSystem._findNodeByPath(path);
+        if (!result || !result.node) {
+            term.writeHtml(`<span class="term-error">${t('noSuchFileOrDir')}: ${path}</span>`);
             return;
         }
+
+        if (getMetadata(result.node).owner !== Environment.USER) {
+            term.writeHtml(`<span class="term-error">chmod: changing permissions of '${path}': Operation not permitted</span>`);
+            return;
+        }
+
+        // [!! 核心修复：支持 Octal 和 Symbolic !!]
+        let newMode;
+        const octalMode = parseInt(modeStr, 8); // 尝试解析八进制
+
+        if (!isNaN(octalMode)) {
+            // 1. 它是八进制 (e.g., 755)
+            newMode = octalMode;
+        } else {
+            // 2. 它不是八进制，尝试解析符号 (e.g., "o-x")
+            const currentMode = getMetadata(result.node).mode;
+            newMode = parseSymbolicMode(modeStr, currentMode);
+            
+            if (newMode === null) {
+                term.writeHtml(`<span class="term-error">chmod: invalid mode: '${modeStr}'</span>`);
+                return;
+            }
+        }
+
+        setMetadata(result.node, newMode, null, null);
+     },
+     'chown': (args, options) => {
+        // (这是一个简化的 chown，只更改 owner)
+        if (args.length < 2) {
+            term.writeHtml(`<span class="term-error">chown: missing operand</span>`);
+            return;
+        }
+        const newOwner = args[0];
+        const path = args[1];
 
         const result = bookmarkSystem._findNodeByPath(path);
         if (!result || !result.node) {
@@ -2117,8 +2425,132 @@ const globalCommands = {
             return;
         }
 
-        setMetadata(result.node, newMode);
+        // 权限检查 (只有 root 或 owner 可以 chown)
+        if (getMetadata(result.node).owner !== Environment.USER) {
+            term.writeHtml(`<span class="term-error">chown: changing ownership of '${path}': Operation not permitted</span>`);
+            return;
+        }
+        setMetadata(result.node, null, newOwner, null);
      },
+     'whoami': (args, options) => {
+        term.writeLine(Environment.USER);
+        },
+
+    'login': async (args, options) => {
+        const provider = args[0];
+        if (provider !== 'google') {
+            term.writeHtml(`<span class="term-error">Usage: login google</span>`);
+            return;
+        }
+
+        term.writeLine("Logging in with Google...");
+        
+        // --- ST1.0 loginWithGoogle 逻辑 (已适配 ST2.0) ---
+        const token = await new Promise((resolve) => {
+            chrome.identity.getAuthToken({ interactive: true }, (token) => {
+                if (chrome.runtime.lastError || !token) {
+                    term.writeHtml(`<span class="term-error">Google Auth Failed: ${chrome.runtime.lastError?.message || "User cancelled."}</span>`);
+                    resolve(null);
+                } else {
+                    resolve(token);
+                }
+            });
+        });
+
+        if (!token) return; // 登录失败
+
+        try {
+            const response = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+                headers: { 'Authorization': `Bearer ${token}` }
+            });
+            const userInfo = await response.json();
+            if (userInfo.error) throw new Error(userInfo.error.message);
+
+            // 1. 获取一个简单的用户名 (例如 "bradley")
+            const username = (userInfo.email || userInfo.name).split('@')[0].replace(/[^a-z0-9]/gi, '');
+            if (!username) throw new Error("Could not determine username.");
+
+            // 2. 将此用户添加到 "密钥链"
+            let keychain = JSON.parse(localStorage.getItem('st2_user_keychain') || '{}');
+            keychain[username] = {
+                type: 'google',
+                token: token,
+                email: userInfo.email,
+                name: userInfo.name
+            };
+            localStorage.setItem('st2_user_keychain', JSON.stringify(keychain));
+
+            term.writeLine(`Successfully added user: ${username} (${userInfo.name})`);
+            term.writeLine(`To switch to this user, run: su ${username}`);
+
+        } catch (error) {
+            term.writeHtml(`<span class="term-error">Failed to get user info: ${error.message}</span>`);
+        }
+    },
+
+    'su': (args, options) => {
+        const username = args[0] || 'user'; // 'su' 默认切换回 "user"
+
+        if (username === Environment.USER) {
+            term.writeLine(`Already user ${username}.`);
+            return;
+        }
+
+        // 检查用户是否在密钥链中 (或是否是 "user")
+        let keychain = JSON.parse(localStorage.getItem('st2_user_keychain') || '{}');
+        if (username !== 'user' && !keychain[username]) {
+            term.writeHtml(`<span class="term-error">su: user ${username} does not exist. (Try 'login google')</span>`);
+            return;
+        }
+
+        // 1. 设置活动用户
+        localStorage.setItem('st2_active_user', username);
+        
+        // 2. 重新加载环境
+        term.writeLine(`Switching to user ${username}...`);
+        loadEnvironment(username);
+        // (loadEnvironment 已经调用了 update_user_path)
+    },
+
+    'logout': (args, options) => {
+        const username = args[0];
+        if (!username) {
+            term.writeHtml(`<span class="term-error">Usage: logout <username></span>`);
+            return;
+        }
+
+        let keychain = JSON.parse(localStorage.getItem('st2_user_keychain') || '{}');
+        const userData = keychain[username];
+        if (!userData) {
+            term.writeHtml(`<span class="term-error">logout: user ${username} not found in keychain.</span>`);
+            return;
+        }
+
+        // --- ST1.0 logoutWithGoogle 逻辑 (已适配 ST2.0) ---
+        try {
+            if (userData.type === 'google' && userData.token) {
+                const token = userData.token;
+                // 1. 撤销 Google 端的 token
+                fetch(`https://accounts.google.com/o/oauth2/revoke?token=${token}`);
+                // 2. 从 Chrome 缓存中移除
+                chrome.identity.removeCachedAuthToken({ token: token });
+            }
+        } catch (e) {
+            console.warn("Error during token revocation:", e);
+        }
+
+        // 3. 从我们的密钥链中移除
+        delete keychain[username];
+        localStorage.setItem('st2_user_keychain', JSON.stringify(keychain));
+        term.writeLine(`User ${username} removed from keychain.`);
+
+        // 4. 如果登出的是*活动*用户，则切换回 "user"
+        if (Environment.USER === username) {
+            term.writeLine("Active user logged out. Switching to default user.");
+            localStorage.setItem('st2_active_user', 'user');
+            loadEnvironment('user');
+        }
+    },
      'grep': (args, options, pipedInput) => {
         if (!args[0]) { term.writeHtml(`<span class="term-error">${t('grepMissingPattern')}</span>`); return; }
         if (!pipedInput) { term.writeHtml(`<span class="term-error">${t('grepRequiresPipe')}</span>`); return; }
@@ -2251,11 +2683,17 @@ const globalCommands = {
             let node = null;
             let resolvedPath = path;
 
+            let isReadOnly = false;
+
             const result = bookmarkSystem._findNodeByPath(path);
 
             if (result && result.node) {
                 node = result.node;
                 resolvedPath = "/" + result.newPathArray.slice(1).map(p => p.title).join("/");
+
+                if (!hasPermission(node, 'w')) {
+                    isReadOnly = true;
+                }
 
                 // [加载 VFS]
                 if (node.id.startsWith('vfs-')) {
@@ -2274,6 +2712,13 @@ const globalCommands = {
                     resolve();
                     return;
                 }
+            } else {
+                // 这是一个新文件，检查父目录的 'w' 权限
+                const parentPath = resolvedPath.substring(0, resolvedPath.lastIndexOf('/')) || '/';
+                const parentResult = bookmarkSystem._findNodeByPath(parentPath);
+                if (!parentResult || !parentResult.node || !hasPermission(parentResult.node, 'w')) {
+                    isReadOnly = true;
+                }
             }
             // (如果是新文件, 'content' 保持为 "")
 
@@ -2281,23 +2726,29 @@ const globalCommands = {
                 try {
                     // (权限检查保持不变)
                     if (node) { 
-                        const meta = getMetadata(node);
-                        if (!(meta.mode & 0o200)) {
-                            term.writeHtml(`<span class="term-error">Error: Permission denied.</span>`); return;
+                        if (!hasPermission(node, 'w')) {
+                            term.writeHtml(`<span class="term-error">Error: Permission denied.</span>`); 
+                            return false; // [!!] 1. 返回 false
                         }
                     } else {
                         const parentPath = savedPath.substring(0, savedPath.lastIndexOf('/')) || '/';
                         const parentResult = bookmarkSystem._findNodeByPath(parentPath);
-                        if (!parentResult || !parentResult.node || !(getMetadata(parentResult.node).mode & 0o200)) {
-                            term.writeHtml(`<span class="term-error">Error: Parent directory not writable.</span>`); return;
+                        if (!parentResult || !parentResult.node || !hasPermission(parentResult.node, 'w')) {
+                            term.writeHtml(`<span class="term-error">Error: Parent directory not writable.</span>`); 
+                            return false; // [!!] 2. 返回 false
                         }
                     }
 
-                    // [!! 核心修复 2：保存 VFS !!]
+                    // 保存 VFS
                     if (resolvedPath === '/etc/.startrc') {
                         localStorage.setItem('.startrc', savedContent);
-                        parseStartrc(savedContent);
-                        bookmarkSystem.update_user_path();
+                        // parseStartrc(savedContent);
+                        // bookmarkSystem.update_user_path();
+                        const startrcNode = bookmarkSystem._findNodeByPath('/etc/.startrc').node;
+                        if (startrcNode) {
+                            startrcNode.url = `data:text/plain;base64,${btoa(encodeURIComponent(savedContent))}`;
+                        }
+
                     
                     } else if (node && node.id.startsWith('vfs-bin-')) {
                         // A. 正在更新一个*已存在的* /bin/ 脚本
@@ -2313,13 +2764,15 @@ const globalCommands = {
                         // C. 正在创建*新的* /bin/ 脚本
                         const scriptName = savedPath.substring(5);
                         if (scriptName && !scriptName.includes('/')) {
-                            saveVfsScript(scriptName, savedContent);
+                            saveVfsScript(scriptName, savedContent, 0o755, Environment.USER);
                             // 更新 VFS (内存中)
                             const newNode = {
                                 id: `vfs-bin-${scriptName}`,
                                 title: scriptName,
                                 url: `data:text/plain;base64,${btoa(encodeURIComponent(savedContent))}`,
                                 mode: 0o755, // 默认权限
+                                owner: Environment.USER, // 设置 owner
+                                group: Environment.USER,
                                 children: null,
                                 parentId: 'vfs-bin'
                             };
@@ -2327,13 +2780,17 @@ const globalCommands = {
                             term.writeLine(`Saved to VFS: ${savedPath}`);
                         } else {
                             term.writeHtml(`<span class="term-error">nano: Invalid path.</span>`);
+                            return false; // [!!] 3. 返回 false
                         }
                     } else if (!node) {
                         // D. 正在创建*新的*书签 (不支持)
-                         term.writeHtml(`<span class="term-error">nano: Error: Cannot save new file to '${savedPath}'. Only /bin/ is supported.</span>`);
+                        term.writeHtml(`<span class="term-error">nano: Error: Cannot save new file to '${savedPath}'. Only /bin/ is supported.</span>`);
+                        return false; // [!!] 4. 返回 false
                     }
+                    return true;
                 } catch (e) {
                     console.error("Nano save error:", e);
+                    return false; // [!!] 5. 返回 false
                 }
             };
 
@@ -2341,7 +2798,7 @@ const globalCommands = {
                 resolve();
             };
 
-            const editor = new NanoEditor(term, resolvedPath, content, onSave, onExit);
+            const editor = new NanoEditor(term, resolvedPath, content, onSave, onExit, isReadOnly);
             editor.open();
         });
      },
@@ -2382,6 +2839,47 @@ const globalCommands = {
         } else {
             term.writeHtml(`<span class="term-error">open: cannot access chrome.tabs API.</span>`);
         }
+    },
+
+    'source': async (args, options) => {
+        if (!args[0]) {
+            term.writeHtml(`<span class="term-error">source: filename argument required</span>`);
+            return;
+        }
+        const path = args[0];
+        
+        // 1. 使用类似 'cat' 的逻辑读取文件
+        const result = bookmarkSystem._findNodeByPath(path);
+        if (!result || !result.node || result.node.children) {
+            term.writeHtml(`<span class="term-error">source: ${t('noSuchFileOrDir')}: ${path}</span>`);
+            return;
+        }
+
+        const url = result.node.url;
+        let fileContent = "";
+        if (result.node.id.startsWith('vfs-')) {
+            try {
+                const base64Content = (url || '').split(',')[1] || '';
+                fileContent = decodeURIComponent(atob(base64Content));
+            } catch (e) {
+                term.writeHtml(`<span class="term-error">source: error reading file: ${e.message}</span>`);
+                return;
+            }
+        } else {
+            term.writeHtml(`<span class="term-error">source: cannot execute bookmark: ${path}</span>`);
+            return;
+        }
+        
+        // 2. [!!] 解析内容 [!!]
+        parseStartrc(fileContent);
+
+        // 3. [!!] 刷新提示符 [!!]
+        bookmarkSystem.update_user_path();
+    },
+
+    '.': (args, options) => {
+        // 'source' 的别名
+        return globalCommands.source(args, options);
     },
 
     'search': (args, options) => {
@@ -2499,7 +2997,52 @@ const globalCommands = {
             term.writeLine(`export: invalid format. Use KEY=VALUE`);
         }
      },
-     // --- sudo 命令 (实现我上一个回复中的 Step C) ---
+     'alias': (args, options) => {
+        if (args.length === 0) {
+            // 0. 没有参数：打印所有别名
+            for (const key in AliasEnvironment) {
+                term.writeLine(`alias ${key}='${AliasEnvironment[key]}'`);
+            }
+            return;
+        }
+
+        const assignment = args.join(' '); // e.g., "ll='ls -l'"
+        const match = assignment.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*['"]?(.*?)['"]?\s*$/);
+
+        if (match) {
+            // 1. 设置别名：alias ll='ls -l'
+            const key = match[1];
+            let value = match[2];
+            // 清理可能残留的引号
+            if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+                value = value.substring(1, value.length - 1);
+            }
+            AliasEnvironment[key] = value;
+            console.log(`[Alias] Set (runtime) ${key} = "${value}"`);
+        } else if (AliasEnvironment[args[0]]) {
+            // 2. 打印单个别名：alias ll
+            term.writeLine(`alias ${args[0]}='${AliasEnvironment[args[0]]}'`);
+        } else {
+            term.writeHtml(`<span class="term-error">alias: ${args[0]}: not found</span>`);
+        }
+    },
+
+    'unalias': (args, options) => {
+        if (args.length === 0) {
+            term.writeHtml(`<span class="term-error">unalias: usage: unalias [-a] name [...]</span>`);
+            return;
+        }
+
+        for (const key of args) {
+            if (AliasEnvironment[key]) {
+                delete AliasEnvironment[key];
+                console.log(`[Alias] Unset (runtime) ${key}`);
+            } else {
+                term.writeHtml(`<span class="term-error">unalias: ${key}: not found</span>`);
+            }
+        }
+    },
+     // --- sudo 命令 ---
     'sudo': async (args, options, pipedInput) => {
         // "sudo" 只是一个装饰器，用于触发 "apt" 内部的权限检查
         if (!args[0]) {
@@ -2721,7 +3264,22 @@ async function executeLine(line) {
             const parsed = parseSingleCommand(commandStr);
             if (!parsed) continue;
 
-            const { command, args, options } = parsed;
+            let { command, args, options } = parsed;
+
+            // Check alias
+            if (AliasEnvironment[command]) {
+                const aliasContent = AliasEnvironment[command];
+                
+                // 将别名内容 (e.g., 'ls -l') 和
+                // 用户输入的多余参数 (e.g., '/bin') 重新组合
+                const reCombinedArgs = args.map(a => a.includes(' ') ? `"${a}"` : a).join(' '); // 确保带空格的参数被引用
+                const aliasParsed = parseSingleCommand(aliasContent + " " + reCombinedArgs);
+
+                // 替换原始命令
+                command = aliasParsed.command;
+                args = aliasParsed.args;
+                options = { ...aliasParsed.options, ...options }; // 合并选项
+            }
             
             let commandFunc = null;
 
@@ -2734,10 +3292,9 @@ async function executeLine(line) {
                 
                 const meta = getMetadata(result.node);
                 // 检查用户执行权限 (0o100 = --x------)
-                if (meta.mode & 0o100) {
-                    // 是可执行文件，将其交给 'sh'
+                if (hasPermission(result.node, 'x')) {
                     commandFunc = globalCommands.sh;
-                    args.unshift(command); // 将路径作为第一个参数
+                    args.unshift(command);
                 } else {
                     term.writeHtml(`<span class="term-error">startsh: permission denied: ${command}</span>`);
                     isPiping = false; break;
@@ -2807,6 +3364,10 @@ async function main() {
 
     // 1. 初始化 Bookmark System
     await bookmarkSystem.initialize();
+
+    // 加载用户环境
+    const activeUser = localStorage.getItem('st2_active_user') || 'user'; // 默认为 "user"
+    loadEnvironment(activeUser);
 
     // 2. 异步计算尺寸 (等待字体)
     // await term._calculateDimensions();
