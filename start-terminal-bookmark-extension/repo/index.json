@@ -17,4 +17,28 @@
     "permissions": [],
     "host_permissions": ["https://api.open-meteo.com/*"]
   },
+  "curl": {
+    "desc": "Fetch the text content of a URL.",
+    "file": "",
+    "permissions": [],
+    "host_permissions": ["<all_urls>"]
+  },
+  "wget": {
+    "desc": "Download a file from a URL (uses 'downloads' permission).",
+    "file": "", 
+    "permissions": ["downloads"],
+    "host_permissions": []
+  },
+  "tree": {
+    "desc": "Display bookmarks in a tree structure (uses 'bookmarks' permission).",
+    "file": "", 
+    "permissions": ["bookmarks"],
+    "host_permissions": []
+  },
+  "history": {
+    "desc": "Search your browser history (uses 'history' permission).",
+    "file": "",
+    "permissions": ["history"],
+    "host_permissions": []
+  }
 }
