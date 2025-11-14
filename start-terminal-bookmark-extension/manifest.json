@@ -3,7 +3,7 @@
   "name": "__MSG_appName__",
   "description": "__MSG_appDesc__",  
   "author": "Tian Yi, Bao",
-  "homepage_url": "https://www.tianyibrad.com/projects/start_terminal",
+  "homepage_url": "https://doc.tianyibrad.com/en/documentation/start-terminal-2-0",
   "version": "2.0.0",
   "default_locale": "en",
   "chrome_url_overrides": {
@@ -24,7 +24,15 @@
     "https://login.microsoftonline.com/*",
     "https://graph.microsoft.com/*",
     "https://www.googleapis.com/*",
+    "https://api.tianyibrad.com/*",
     "https://raw.githubusercontent.com/BradleyBao/StartTerminal2/main/start-terminal-bookmark-extension/repo/*"
+  ],
+  "optional_permissions": [
+    "history"
+  ],
+  
+  "optional_host_permissions": [
+    "<all_urls>"
   ],
   "sandbox": {
     "pages": ["sandbox.html"]

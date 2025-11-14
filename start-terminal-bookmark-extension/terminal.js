@@ -45,7 +45,7 @@ const Environment = {
  * 加载指定用户的环境
  * @param {string} username - "user" 或 "bradley" 等
  */
-function loadEnvironment(username) {
+async function loadEnvironment(username) {
     // 1. 清空别名
     AliasEnvironment = {};
     
@@ -61,9 +61,9 @@ function loadEnvironment(username) {
     //    这会为新会话设置 PS1, LANG, 和所有别名
     try {
         // 首先加载默认值
-        parseStartrc(defaultStartrcContent);
+        // await parseStartrc(defaultStartrcContent);
         // 然后加载用户的 .startrc (这会覆盖默认值)
-        parseStartrc(loadVirtualStartrc());
+        await parseStartrc(loadVirtualStartrc());
     } catch (e) {
         console.warn("Error parsing .startrc during loadEnvironment", e);
         // 如果 .startrc 损坏，确保我们至少有一个 PS1
@@ -1590,6 +1590,183 @@ class BookmarkSystem {
                 // --- 结束修复 ---
                 this.term.writeLine(displayPath); // 使用 writeLine 输出纯文本
             },
+            'mv': async (args, options) => {
+                if (args.length < 2) {
+                    term.writeHtml(`<span class="term-error">mv: missing destination</span>`); return;
+                }
+                const sourcePath = args[0];
+                const destPath = args[1];
+
+                const sourceResult = this._findNodeByPath(sourcePath); //
+                if (!sourceResult || !sourceResult.node) {
+                    term.writeHtml(`<span class="term-error">mv: ${t('noSuchFileOrDir')}: ${sourcePath}</span>`); return;
+                }
+                const sourceNode = sourceResult.node;
+
+                // 1. 检查源权限
+                if (!hasPermission(sourceNode, 'w')) { //
+                    term.writeHtml(`<span class="term-error">mv: cannot move '${sourcePath}': Permission denied</span>`); return;
+                }
+
+                // 2. 查找目标
+                const destResult = this._findNodeByPath(destPath);
+                let destNode = destResult ? destResult.node : null;
+                
+                // --- Case A: VFS 脚本重命名 (仅 /bin) ---
+                if (sourceNode.id.startsWith('vfs-bin-')) {
+                    const newName = destPath.split('/').pop();
+                    if (destPath.startsWith('/bin/') && !destNode) {
+                        // VFS 重命名
+                        let scripts = JSON.parse(localStorage.getItem('vfs_bin_scripts') || '{}');
+                        const scriptData = scripts[sourceNode.title];
+                        if (scriptData) {
+                            delete scripts[sourceNode.title];
+                            scripts[newName] = scriptData;
+                            localStorage.setItem('vfs_bin_scripts', JSON.stringify(scripts));
+                            await this._refreshBookmarks(); // 重载 VFS
+                        }
+                    } else {
+                        term.writeHtml(`<span class="term-error">mv: VFS scripts can only be renamed within /bin.</span>`);
+                    }
+                    return;
+                }
+                if (sourceNode.id.startsWith('vfs-etc')) {
+                    term.writeHtml(`<span class="term-error">mv: VFS core files (like /etc) cannot be moved.</span>`); return;
+                }
+
+                // --- Case B: 书签移动/重命名 ---
+                let destParentNode = null;
+                let destTitle = null;
+
+                if (destNode && destNode.children) {
+                    // 1. 目标是目录: 移入
+                    destParentNode = destNode;
+                    destTitle = sourceNode.title; // 保持原名
+                } else if (!destNode) {
+                    // 2. 目标不存在: 移动并重命名
+                    const lastSlash = destPath.lastIndexOf('/');
+                    // [!!] 修复：使用 '.' (当前目录) 作为相对路径的父级
+                    const parentPath = (lastSlash > -1) ? destPath.substring(0, lastSlash) : '.'; 
+                    const newTitle = (lastSlash > -1) ? destPath.substring(lastSlash + 1) : destPath;
+                    
+                    const parentResult = this._findNodeByPath(parentPath);
+                    if (parentResult && parentResult.node && parentResult.node.children) {
+                        destParentNode = parentResult.node;
+                        destTitle = newTitle;
+                    } else {
+                        term.writeHtml(`<span class="term-error">mv: destination path not found: ${parentPath}</span>`); return;
+                    }
+                } else {
+                    term.writeHtml(`<span class="term-error">mv: destination is not a directory: ${destPath}</span>`); return;
+                }
+                
+                if (destParentNode) {
+                    // 检查目标父目录权限
+                    if (!hasPermission(destParentNode, 'w')) {
+                         term.writeHtml(`<span class="term-error">mv: cannot write to destination: Permission denied</span>`); return;
+                    }
+                    
+                    // [!! 核心修复：区分 Move 和 Update !!]
+                    const needsMove = sourceNode.parentId !== destParentNode.id;
+                    const needsRename = destTitle && sourceNode.title !== destTitle;
+
+                    try {
+                        if (needsMove) {
+                            // 1. 执行移动
+                            await new Promise((resolve, reject) => {
+                                chrome.bookmarks.move(sourceNode.id, { parentId: destParentNode.id }, (node) => {
+                                    if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+                                    else resolve(node);
+                                });
+                            });
+                        }
+                        if (needsRename) {
+                            // 2. 执行重命名 (使用同一个 ID)
+                            await new Promise((resolve, reject) => {
+                                chrome.bookmarks.update(sourceNode.id, { title: destTitle }, (node) => {
+                                    if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+                                    else resolve(node);
+                                });
+                            });
+                        }
+                    } catch (e) {
+                         term.writeHtml(`<span class="term-error">mv: API Error: ${e.message}</span>`);
+                    }
+                }
+            },
+
+            // [!! 新增 'cp' !!]
+            'cp': async (args, options) => {
+                if (args.length < 2) {
+                    term.writeHtml(`<span class="term-error">cp: missing destination</span>`); return;
+                }
+                const sourcePath = args[0];
+                const destPath = args[1];
+
+                const sourceResult = this._findNodeByPath(sourcePath); //
+                if (!sourceResult || !sourceResult.node) {
+                    term.writeHtml(`<span class="term-error">cp: ${t('noSuchFileOrDir')}: ${sourcePath}</span>`); return;
+                }
+                const sourceNode = sourceResult.node;
+                
+                // 1. 检查源 'r' 权限
+                if (!hasPermission(sourceNode, 'r')) { //
+                    term.writeHtml(`<span class="term-error">cp: cannot read '${sourcePath}': Permission denied</span>`); return;
+                }
+                
+                // 2. 查找目标
+                const destResult = this._findNodeByPath(destPath);
+                let destNode = destResult ? destResult.node : null;
+                let destParentNode = null;
+                let newName = null;
+                
+                if (destNode && destNode.children) {
+                    // Case 1: cp file dir (目标是目录)
+                    destParentNode = destNode;
+                    // newName 保持 null, _copyRecursive 将使用原名
+                } else if (!destNode) {
+                    // Case 2: cp file newfile (目标是新路径)
+                    // [!!] 修复相对路径解析
+                    const lastSlash = destPath.lastIndexOf('/');
+                    const parentPath = (lastSlash > -1) ? destPath.substring(0, lastSlash) : '.'; // 使用 '.' (当前)
+                    newName = (lastSlash > -1) ? destPath.substring(lastSlash + 1) : destPath;
+                    
+                    const parentResult = this._findNodeByPath(parentPath);
+                    if (parentResult && parentResult.node && parentResult.node.children) {
+                        destParentNode = parentResult.node; // [!!] 直接存储找到的父节点
+                    }
+                }
+                
+                if (!destParentNode) {
+                    term.writeHtml(`<span class="term-error">cp: invalid destination: ${destPath}</span>`); return;
+                }
+                
+                // 3. 检查目标 'w' 权限 (直接使用节点)
+                if (!hasPermission(destParentNode, 'w')) {
+                    term.writeHtml(`<span class="term-error">cp: cannot write to '${destPath}': Permission denied</span>`); return;
+                }
+
+                // --- Case A: VFS 脚本复制 (仅 /bin) ---
+                if (sourceNode.id.startsWith('vfs-bin-')) {
+                    if (destParentNode.id === 'vfs-bin') {
+                        const scriptName = newName || sourceNode.title;
+                        const base64Content = (sourceNode.url || '').split(',')[1] || '';
+                        const content = decodeURIComponent(atob(base64Content));
+                        //
+                        saveVfsScript(scriptName, content, 0o755, Environment.USER); 
+                        await this._refreshBookmarks(); // 重载 VFS
+                    } else {
+                        term.writeHtml(`<span class="term-error">cp: VFS scripts can only be copied to /bin.</span>`);
+                    }
+                    return;
+                }
+                if (sourceNode.id.startsWith('vfs-etc')) {
+                    term.writeHtml(`<span class="term-error">cp: cannot copy core VFS files.</span>`); return;
+                }
+
+                // --- Case B: 书签/文件夹递归复制 ---
+                await this._copyRecursive(sourceNode, destParentNode.id, newName);
+            },
         };
     }
 
@@ -1599,25 +1776,61 @@ class BookmarkSystem {
             this.vfsBin.children = loadVfsScripts();
             await this._refreshBookmarks(); // 加载并合并 VFS
             
-            try {
-                const startrcNode = this._findNodeByPath('/etc/.startrc');
-                if (startrcNode && startrcNode.node && startrcNode.node.url) {
-                    const base64Content = startrcNode.node.url.split(',')[1] || '';
-                    const rcContent = decodeURIComponent(atob(base64Content));
-                    parseStartrc(rcContent);
-                } else {
-                    console.warn(".startrc not found, using default environment.");
-                    parseStartrc(defaultStartrcContent); 
-                }
-            } catch (e) {
-                console.error("Error loading .startrc:", e);
-            }
+            // try {
+            //     const startrcNode = this._findNodeByPath('/etc/.startrc');
+            //     if (startrcNode && startrcNode.node && startrcNode.node.url) {
+            //         const base64Content = startrcNode.node.url.split(',')[1] || '';
+            //         const rcContent = decodeURIComponent(atob(base64Content));
+            //         await parseStartrc(rcContent);
+            //     } else {
+            //         console.warn(".startrc not found, using default environment.");
+            //         await parseStartrc(defaultStartrcContent); 
+            //     }
+            // } catch (e) {
+            //     console.error("Error loading .startrc:", e);
+            // }
 
-            // --- 关键修复：在 _refreshBookmarks 之后设置初始路径 ---
+            // --- 在 _refreshBookmarks 之后设置初始路径 ---
             this.current = this.homeDirNode || this.virtualRoot; // 默认启动目录 (Home 或 Root)
             this.path = this.homeDirNode ? [this.virtualRoot, this.homeDirNode] : [this.virtualRoot];
             // --- 结束 ---
-            this.update_user_path();
+            // this.update_user_path();
+    }
+
+    async _copyRecursive(node, destParentId, newName = null) {
+        if (!node) return;
+        const newOwner = Environment.USER; //
+        const newGroup = Environment.USER; // 默认为 user group
+
+        const title = newName || node.title; // 允许在复制时重命名
+
+        if (node.children) {
+            // 这是一个目录
+            const newFolder = await new Promise(r => chrome.bookmarks.create({
+                parentId: destParentId,
+                title: title
+            }, r));
+            
+            // 为新文件夹设置元数据 (所有者是当前用户)
+            setMetadata(newFolder, 0o777, newOwner, newGroup); //
+            
+            // 递归复制子项
+            if (node.children.length > 0) {
+                // 必须使用 Promise.all 来等待所有子项完成
+                await Promise.all(node.children.map(child => 
+                    this._copyRecursive(child, newFolder.id)
+                ));
+            }
+        } else {
+            // 这是一个文件 (书签)
+            const newBookmark = await new Promise(r => chrome.bookmarks.create({
+                parentId: destParentId,
+                title: title,
+                url: node.url
+            }, r));
+            // 为新书签设置元数据
+            setMetadata(newBookmark, 0o666, newOwner, newGroup); //
+        }
     }
 
     async _refreshBookmarks() {
@@ -1816,7 +2029,6 @@ const defaultStartrcContent = `
 #
 # Set Environment Variables 
 # use export KEY=VALUE
-
 # --- Prompt String ---
 # \\u = user (user)
 # \\h = host (ST2.0)
@@ -1832,13 +2044,14 @@ export LANG="en"
 # --- Aliases ---
 alias ll='ls -l -a'
 alias la='ls -a'
+welcome
 `
 
 /**
  * 解析 .startrc 内容并更新 Environment 对象
  * @param {string} content - .startrc 文件内容
  */
-function parseStartrc(content) {
+async function parseStartrc(content) {
     const lines = content.split('\n');
     const exportRegex = /^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/;
     const aliasRegex = /^\s*alias\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*['"]?(.*?)['"]?\s*$/;
@@ -1865,6 +2078,10 @@ function parseStartrc(content) {
             }
             AliasEnvironment[key] = value;
             console.log(`[Alias] Set ${key} = "${value}"`);
+        } else if (line.trim().length > 0 && !line.trim().startsWith('#')) {
+            // 既不是 export 也不是 alias，也不是注释
+            // 尝试将其作为常规命令执行 (例如 'welcome')
+            await executeLine(line); // [!!] 3. await executeLine
         }
     }
 }
@@ -1907,71 +2124,118 @@ function arraysAreEqual(arr1, arr2) {
 function handleTabCompletion(line, pos) {
     const currentTime = Date.now();
     
-    // 1. 找出要补全的 "token" (逻辑不变)
+    // 1. 找出光标前的所有 token
     const lineUpToCursor = line.substring(0, pos);
-    const lastSpace = lineUpToCursor.lastIndexOf(' ');
-    const tokenToComplete = lineUpToCursor.substring(lastSpace + 1);
-    const tokenStartIndex = lastSpace + 1; 
+    const tokens = lineUpToCursor.split(' ').filter(Boolean);
+    const tokenCount = tokens.length;
+    
+    let isCompletingFirstWord = false;
+    let isCompletingSubCommand = false;
+    let isCompletingPath = false;
 
-    // 2. 确定搜索目录和 "partial" (逻辑不变)
-    let searchDirNode;
-    let partial;
-    let pathPrefix = ''; 
+    let tokenToComplete = "";
+    let tokenStartIndex = 0;
+    
+    if (line.endsWith(' ')) {
+        // 光标在空格后 -> 准备补全下一个 token
+        tokenToComplete = "";
+        tokenStartIndex = pos;
+    } else {
+        // 光标在一个 token 中间
+        tokenToComplete = tokens[tokens.length - 1] || "";
+        tokenStartIndex = lineUpToCursor.lastIndexOf(tokenToComplete);
+    }
 
-    const lastSlash = tokenToComplete.lastIndexOf('/');
-    if (lastSlash > -1) {
-        pathPrefix = tokenToComplete.substring(0, lastSlash + 1);
-        partial = tokenToComplete.substring(lastSlash + 1);
-        const result = bookmarkSystem._findNodeByPath(pathPrefix);
-        if (result && result.node && result.node.children) {
-            searchDirNode = result.node;
+    const command = tokens[0] || "";
+
+    // 2. 决定要补全什么
+    if (tokenCount === 0 || (tokenCount === 1 && !line.endsWith(' '))) {
+        isCompletingFirstWord = true;
+    } else if (subCommandCompletions.hasOwnProperty(command) && (tokenCount === 1 || (tokenCount === 2 && !line.endsWith(' ')))) {
+        // 如果命令在我们的 map 中，并且我们在补全第二个词
+        if (subCommandCompletions[command].length > 0) {
+            isCompletingSubCommand = true;
         } else {
-            return; 
+            isCompletingPath = true; // e.g., 'cd ' (map 为 [])
         }
     } else {
-        searchDirNode = bookmarkSystem.current;
-        partial = tokenToComplete;
+        isCompletingPath = true; // 默认补全路径
     }
 
-    if (!searchDirNode || !searchDirNode.children) {
-        return; 
+    // 3. 查找匹配项
+    let matches = [];
+    let completionPrefix = ''; // 用于路径 (e.g., /bin/)
+
+    let partial = "";
+    
+    if (isCompletingFirstWord) {
+        const allCommands = getAllCommandNames();
+        matches = allCommands.filter(cmd => cmd.startsWith(tokenToComplete)).map(cmd => ({ title: cmd }));
+        partial = tokenToComplete; // [!! 2. 赋值 (而不是声明) !!]
+        
+    } else if (isCompletingSubCommand) {
+        matches = subCommandCompletions[command].filter(cmd => cmd.startsWith(tokenToComplete)).map(cmd => ({ title: cmd }));
+        partial = tokenToComplete; // [!! 3. 赋值 (而不是声明) !!]
+    
+    } else if (isCompletingPath) {
+        // --- 使用现有的文件补全逻辑 ---
+        let isQuoted = false;
+        let searchToken = tokenToComplete;
+        if (searchToken.startsWith('"')) {
+            isQuoted = true;
+            searchToken = searchToken.substring(1);
+        }
+
+        const lastSlash = searchToken.lastIndexOf('/');
+        if (lastSlash > -1) {
+            completionPrefix = searchToken.substring(0, lastSlash + 1);
+            partial = searchToken.substring(lastSlash + 1); // [!!] (L1362: 赋值, 保持不变)
+            const result = bookmarkSystem._findNodeByPath(completionPrefix);
+            if (result && result.node && result.node.children) {
+                matches = result.node.children.filter(child => child.title.trim().startsWith(partial));
+            }
+        } else {
+            partial = searchToken; // [!!] (L1370: 赋值, 保持不变)
+            if (bookmarkSystem.current && bookmarkSystem.current.children) {
+                matches = bookmarkSystem.current.children.filter(child => child.title.trim().startsWith(partial));
+            }
+        }
+        // (文件补全逻辑现在嵌套在这里)
     }
 
-    // 3. 查找所有匹配项 (逻辑不变)
-    const matches = searchDirNode.children.filter(child => 
-        child.title.trim().startsWith(partial)
-    );
-
-    // --- 4. [新] 补全逻辑 ---
-
+    // --- 4. [新] 补全逻辑 (通用) ---
     if (matches.length === 0) {
-        lastTabMatches = []; // 重置
-        return; // 没有匹配项
+        lastTabMatches = []; return;
     }
 
+    const textBeforeToken = line.substring(0, tokenStartIndex);
+    const textAfterCursor = line.substring(pos);
+    
     if (matches.length === 1) {
-        // 4a. 只有一个匹配项：直接补全
-        lastTabMatches = []; // 重置
+        // 4a. 只有一个匹配项
+        lastTabMatches = [];
         const match = matches[0];
-        let matchName = match.title.trim(); // e.g., "UPDF Account Center"
+        let matchName = match.title.trim();
+        let completion = completionPrefix + matchName;
         
-        let completion = pathPrefix + matchName;
-        if (match.children) {
-            completion += '/'; // e.g., "My Documents/"
-        }
+        if (match.children) completion += '/'; // 目录
 
-        // [!! 修复空格 Bug !!]
-        // 如果补全包含空格，并且原始 token 不带引号，则添加引号
-        if (completion.includes(' ') && !tokenToComplete.startsWith('"')) {
-            completion = `"${completion}"`; // e.g., '"UPDF Account Center"'
+        // [!!] 处理空格和引号 [!!]
+        if (completion.includes(' ') && (isCompletingPath && !tokenToComplete.startsWith('"'))) {
+            if (match.children) {
+                completion = `"${completion.slice(0, -1)}"\/`; // "My Dir"/
+            } else {
+                completion = `"${completion}"`; // "My File"
+            }
         }
         
-        const textBeforeToken = line.substring(0, tokenStartIndex);
-        const textAfterCursor = line.substring(pos); // 光标后的文本
+        // 如果不是目录，在末尾添加一个空格
+        if (!match.children) {
+            completion += ' ';
+        }
         
         const newLine = textBeforeToken + completion + textAfterCursor;
         const newCursorPos = (textBeforeToken + completion).length;
-        
         term.setCommand(newLine, newCursorPos);
 
     } else {
@@ -1980,26 +2244,31 @@ function handleTabCompletion(line, pos) {
 
         if (lcp.length > partial.length) {
             // 我们可以补全更多 (LCP)
-            lastTabMatches = []; // 重置
+            lastTabMatches = [];
+            let completion = completionPrefix + lcp;
             
-            const completion = pathPrefix + lcp;
-            // (注意：LCP 补全暂未处理空格转义，这更复杂)
+            if (completion.includes(' ') && (isCompletingPath && !tokenToComplete.startsWith('"'))) {
+                completion = `"${completion}`;
+            }
             
-            const textBeforeToken = line.substring(0, tokenStartIndex);
-            const textAfterCursor = line.substring(pos);
             const newLine = textBeforeToken + completion + textAfterCursor;
             const newCursorPos = (textBeforeToken + completion).length;
             term.setCommand(newLine, newCursorPos);
 
         } else {
             // 4c. 无法进一步补全 (LCP === partial)。检查双击。
-            const isDoubleTap = (currentTime - lastTabTime < 500); // 500ms 阈值
+            const isDoubleTap = (currentTime - lastTabTime < 500);
             
-            if (isDoubleTap && arraysAreEqual(matches, lastTabMatches)) {
-                // 这是第二次 Tab，列出所有选项
+            // (注意: 'arraysAreEqual' 依赖 'id'，
+            // 我们的新 'matches' 数组 (用于命令) 没有 'id'，所以这个检查可能会失败)
+            // (为了简单起见，我们暂时忽略 'arraysAreEqual' 检查)
+
+            if (isDoubleTap) {
+                // 列出所有选项
                 term._handleNewline(); 
                 const output = matches.map(m => {
-                    const title = m.title.trim();
+                    let title = m.title.trim();
+                    if (title.includes(' ')) title = `"${title}"`;
                     return m.children ? `${title}/` : title;
                 }).join('   ');
                 
@@ -2008,15 +2277,14 @@ function handleTabCompletion(line, pos) {
                 bookmarkSystem.update_user_path(); 
                 term.setCommand(line, pos); // 恢复当前行
                 
-                lastTabMatches = []; // 重置
+                lastTabMatches = [];
             } else {
-                // 这是第一次 Tab。只存储状态
-                lastTabMatches = matches;
+                lastTabMatches = matches.map(m => ({ id: m.title, title: m.title })); // 存储一个可比较的格式
             }
         }
     }
     
-    lastTabTime = currentTime; // 记录本次 Tab 时间
+    lastTabTime = currentTime;
 }
 
 /**
@@ -2294,6 +2562,11 @@ function saveStyleSettings() {
     localStorage.setItem('terminalFontSize', currentSize);
 }
 
+function formatHelp(cmd, key) {
+    const padding = ' '.repeat(Math.max(0, 12 - cmd.length));
+    // 你可以在 CSS 中定义 --color-accent-green，或者使用一个明亮的颜色
+    return `  <span style="color: var(--color-accent-green, #4CAF50);">${cmd}</span>${padding}${t(key)}`;
+}
 
 
 let isPiping = false;
@@ -2488,7 +2761,7 @@ const globalCommands = {
         }
     },
 
-    'su': (args, options) => {
+    'su':  async (args, options) => {
         const username = args[0] || 'user'; // 'su' 默认切换回 "user"
 
         if (username === Environment.USER) {
@@ -2508,8 +2781,122 @@ const globalCommands = {
         
         // 2. 重新加载环境
         term.writeLine(`Switching to user ${username}...`);
-        loadEnvironment(username);
+        await loadEnvironment(username);
         // (loadEnvironment 已经调用了 update_user_path)
+    },
+
+    'tabs': async (args, options) => {
+        const subCommand = args[0] || 'ls';
+
+        if (typeof chrome === 'undefined' || !chrome.tabs) {
+            term.writeHtml(`<span class="term-error">tabs: 'chrome.tabs' API not available.</span>`);
+            return;
+        }
+
+        switch (subCommand) {
+            case 'ls':
+                const allTabs = await new Promise(resolve => chrome.tabs.query({}, resolve));
+                if (allTabs.length === 0) {
+                    term.writeLine("No open tabs.");
+                    return;
+                }
+                allTabs.forEach(tab => {
+                    const activeMark = tab.active ? '*' : ' ';
+                    const title = tab.title || "No Title";
+                    const url = tab.url || "no-url";
+                    // 格式化：[ID] * 标题... (URL...)
+                    term.writeLine(`[${tab.id}] ${activeMark} ${title.substring(0, 50)}... (${url.substring(0, 40)}...)`);
+                });
+                break;
+
+            case 'switch':
+            case 'close':
+                const tabIdStr = args[1];
+                if (!tabIdStr) {
+                    term.writeHtml(`<span class="term-error">Usage: tabs ${subCommand} <tabId></span>`);
+                    return;
+                }
+                const tabId = parseInt(tabIdStr);
+                if (isNaN(tabId)) {
+                    term.writeHtml(`<span class="term-error">Error: Invalid tabId '${tabIdStr}'.</span>`);
+                    return;
+                }
+
+                try {
+                    if (subCommand === 'switch') {
+                        // 切换到标签页
+                        await new Promise((resolve, reject) => {
+                            chrome.tabs.update(tabId, { active: true }, (tab) => {
+                                if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+                                // 还需更新标签页所在的窗口
+                                if (tab) chrome.windows.update(tab.windowId, { focused: true }, () => resolve(tab));
+                                else resolve(tab);
+                            });
+                        });
+                    } else {
+                        // 关闭标签页
+                        await new Promise((resolve, reject) => {
+                            chrome.tabs.remove(tabId, () => {
+                                if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+                                else resolve();
+                            });
+                        });
+                    }
+                } catch (e) {
+                    term.writeHtml(`<span class="term-error">Error: Tab with id ${tabId} not found or protected.</span>`);
+                }
+                break;
+
+            default:
+                term.writeHtml(`<span class="term-error">Unknown command: 'tabs ${subCommand}'. Try 'tabs ls'.</span>`);
+        }
+    },
+
+    'whatsnew': async (args, options) => {
+        const API_URL = "https://api.tianyibrad.com/api/collections/ST2_0/records?sort=-created&perPage=1"; 
+        
+        term.writeLine("Fetching latest updates from api.tianyibrad.com...");
+        
+        try {
+            const response = await fetch(API_URL);
+            if (!response.ok) {
+                throw new Error(`Server responded with ${response.status}`);
+            }
+            
+            const data = await response.json(); 
+
+            if (data.items && data.items.length > 0) {
+                const latestPost = data.items[0];
+                const version = latestPost.version || "N/A";
+                const title = latestPost.title || "Latest Update";
+                const contentHtml = latestPost.content || "<p>No content found.</p>"; 
+
+                term.writeHtml(`\n<b>What's New in v${term.escapeHtml(version)}: ${term.escapeHtml(title)}</b>`);
+                term.writeLine("---");
+                
+                // [!! 核心修复 !!]
+                // 1. 使用 DOMParser (L515) 来解析 HTML
+                const doc = new DOMParser().parseFromString(contentHtml, 'text/html');
+                
+                // 2. 遍历所有段落（或其他元素）并打印其 *text content*
+                doc.body.childNodes.forEach(node => {
+                    if (node.textContent) {
+                        term.writeLine(node.textContent.trim()); // 打印纯文本
+                    }
+                });
+                // [!! 修复结束 !!]
+                
+            } else {
+                term.writeHtml(`<span class="term-error">No update records found.</span>`);
+            }
+            
+        } catch (e) {
+            term.writeHtml(`<span class="term-error">Failed to fetch updates: ${e.message}</span>`);
+        }
+    },
+
+    'welcome': async (args, options) => {
+        term.writeLine(t('welcome'));
     },
 
     'logout': (args, options) => {
@@ -2567,10 +2954,276 @@ const globalCommands = {
         term.writeLine(` ${lines}  ${words}  ${chars}`);
      },
      'clear': (args, options) => { term._initBuffer(); },
+     'history': async (args, options) => {
+        if (typeof chrome === 'undefined' || !chrome.history) {
+            term.writeHtml(`<span class="term-error">history: 'chrome.history' API not available.</span>`);
+            term.writeHtml(`<span class="term-error">Did you add 'history' to manifest.json?</span>`);
+            return;
+        }
+
+        const query = args.join(' ');
+        const results = await new Promise(resolve => {
+            chrome.history.search({ text: query, maxResults: 50 }, resolve);
+        });
+        results.forEach(item => {
+            term.writeLine(`[${new Date(item.lastVisitTime).toLocaleString()}] ${item.title.substring(0, 50)}...`);
+        });
+    },
+
+    'history': async (args, options) => {
+        if (typeof chrome === 'undefined' || !chrome.history) {
+            term.writeHtml(`<span class="term-error">'chrome.history' API not available.</span>`);
+            term.writeHtml(`<span class="term-error">Try: sudo apt install history</span>`);
+            return;
+        }
+
+        const query = args.join(' ');
+        term.writeLine(`Searching history for: "${query || '...'}"...`);
+        
+        const results = await new Promise(resolve => {
+            chrome.history.search({
+                text: query,
+                maxResults: 50 // 限制为 50 条
+            }, resolve);
+        });
+
+        if (results.length === 0) {
+            term.writeLine("No history items found.");
+            return;
+        }
+
+        // 准备一个数组用于管道
+        const outputLines = [];
+        results.forEach(item => {
+            const dt = new Date(item.lastVisitTime).toLocaleString(Environment.LANG || 'en');
+            const title = item.title || "No Title";
+            const url = item.url || "no-url";
+            const line = `[${dt}] ${title.substring(0, 50)}... (${url.substring(0, 40)}...)`;
+            term.writeLine(line);
+            outputLines.push(line);
+        });
+        return outputLines; // 返回给管道
+    },
+
+    'downloads': async (args, options) => {
+        const subCommand = args[0] || 'ls';
+        
+        if (typeof chrome === 'undefined' || !chrome.downloads) {
+            term.writeHtml(`<span class="term-error">'chrome.downloads' API not available.</span>`);
+            // 'downloads' 权限是默认安装的，所以我们不需要提示 apt install
+            return;
+        }
+
+        switch (subCommand) {
+            case 'ls':
+                const items = await new Promise(resolve => {
+                    chrome.downloads.search({ limit: 20, orderBy: ['-startTime'] }, resolve);
+                });
+                if (items.length === 0) { term.writeLine("No downloads found."); return; }
+                
+                const outputLines = [];
+                items.forEach(item => {
+                    const state = item.state === 'complete' ? ' ' : `[${item.state}]`;
+                    const line = `[${item.id}] ${state} ${item.filename.split(/[\\\/]/).pop()}`;
+                    term.writeLine(line);
+                    outputLines.push(line);
+                });
+                return outputLines; // 返回给管道
+            
+            case 'open':
+                const id = parseInt(args[1]);
+                if (isNaN(id)) { term.writeHtml(`<span class="term-error">Usage: downloads open <id></span>`); return; }
+                
+                try {
+                    await new Promise((resolve, reject) => {
+                        chrome.downloads.open(id, () => {
+                            if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+                            else resolve();
+                        });
+                    });
+                } catch(e) {
+                     term.writeHtml(`<span class="term-error">Error: ${e.message}. (File may not exist)</span>`);
+                }
+                break;
+            
+            default:
+                 term.writeHtml(`<span class="term-error">Usage: downloads [ls|open]</span>`);
+        }
+    },
+
+    'wget': async (args, options) => {
+        const url = args[0];
+        if (!url) { term.writeHtml('<span class="term-error">Usage: wget <url></span>'); return; }
+        
+        if (typeof chrome === 'undefined' || !chrome.downloads) {
+            term.writeHtml(`<span class="term-error">'chrome.downloads' API not available.</span>`);
+            // 'downloads' 权限是默认安装的
+            return;
+        }
+
+        try {
+            term.writeLine(`Starting download: ${url}`);
+            const downloadId = await new Promise((resolve, reject) => {
+                chrome.downloads.download({ url: url }, (id) => {
+                    if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+                    else resolve(id);
+                });
+            });
+            term.writeLine(`Download started (ID: ${downloadId}).`);
+        } catch(e) {
+            term.writeHtml(`<span class="term-error">Download failed: ${e.message}</span>`);
+        }
+    },
+    'curl': async (args, options, pipedInput) => {
+        const url = args[0];
+        if (!url) {
+            term.writeHtml('<span class="term-error">Usage: curl <url></span>');
+            return;
+        }
+
+        // 权限检查
+        const hasPermission = await new Promise(resolve => {
+            chrome.permissions.contains({ origins: ["<all_urls>"] }, resolve);
+        });
+
+        if (!hasPermission) {
+            term.writeHtml(`<span class="term-error">Permission to access all URLs denied.</span>`);
+            term.writeHtml(`<span class="term-error">Try: sudo apt install curl</span>`);
+            return;
+        }
+
+        try {
+            term.writeLine(`Fetching ${url}...`);
+            const response = await fetch(url, { cache: 'no-store', mode: 'cors' });
+            
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+            
+            const text = await response.text();
+            term.writeLine(text); // 打印纯文本响应
+            return text.split('\n'); // 返回给管道
+            
+        } catch(e) {
+            term.writeHtml(`<span class="term-error">${e.message}</span>`);
+        }
+    },
+
+    'tree': async (args, options) => {
+        if (typeof chrome === 'undefined' || !chrome.bookmarks) {
+            term.writeHtml(`<span class="term-error">'chrome.bookmarks' API not available.</span>`);
+            return;
+        }
+        
+        // 'tree' 只显示真实的书签，不显示 VFS
+        const tree = await new Promise(resolve => chrome.bookmarks.getTree(resolve));
+        const root = tree[0];
+        
+        term.writeLine("."); // 根
+        
+        // 递归辅助函数
+        function printNode(node, indent) {
+            if (!node || !node.children) return;
+            
+            node.children.forEach((child, i) => {
+                const isLast = i === node.children.length - 1;
+                const prefix = indent + (isLast ? "└── " : "├── ");
+                
+                if (child.children) {
+                    // 目录
+                    term.writeHtml(`${prefix}<span class="term-folder">${term.escapeHtml(child.title)}/</span>`);
+                    printNode(child, indent + (isLast ? "    " : "│   "));
+                } else {
+                    // 文件
+                    term.writeLine(`${prefix}${term.escapeHtml(child.title)}`);
+                }
+            });
+        }
+        
+        printNode(root, ""); // 从根开始
+    },
+
+    'downloads': async (args, options) => {
+        const subCommand = args[0] || 'ls';
+        
+        if (typeof chrome === 'undefined' || !chrome.downloads) {
+            term.writeHtml(`<span class="term-error">downloads: 'chrome.downloads' API not available.</span>`);
+            return;
+        }
+
+        switch (subCommand) {
+            case 'ls':
+                const items = await new Promise(resolve => {
+                    chrome.downloads.search({ limit: 20, orderBy: ['-startTime'] }, resolve);
+                });
+                if (items.length === 0) { term.writeLine("No downloads found."); return; }
+                
+                items.forEach(item => {
+                    const state = item.state === 'complete' ? ' ' : `[${item.state}]`;
+                    term.writeLine(`[${item.id}] ${state} ${item.filename.split(/[\\\/]/).pop()}`);
+                });
+                break;
+
+            case 'open':
+                const id = parseInt(args[1]);
+                if (isNaN(id)) { term.writeHtml(`<span class="term-error">Usage: downloads open <id></span>`); return; }
+                
+                try {
+                    await new Promise((resolve, reject) => {
+                        chrome.downloads.open(id, () => {
+                            if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+                            else resolve();
+                        });
+                    });
+                } catch(e) {
+                     term.writeHtml(`<span class="term-error">Error: ${e.message}. (File may not exist)</span>`);
+                }
+                break;
+            
+            // 还可以添加 'rm' (chrome.downloads.removeFile), 'pause', 'resume' 等
+            default:
+                 term.writeHtml(`<span class="term-error">Usage: downloads [ls|open]</span>`);
+        }
+    },
      'help': (args, options) => {
-         term.writeLine(t('welcome'));
-         term.writeLine(t('features'));
-     },
+        term.writeLine(t('helpTitle'));
+        term.writeLine("---");
+        
+        term.writeHtml(`<b>${t('helpFS')}</b>`);
+        term.writeHtml(formatHelp('ls', 'help_ls'));
+        term.writeHtml(formatHelp('cd', 'help_cd'));
+        term.writeHtml(formatHelp('cat', 'help_cat'));
+        term.writeHtml(formatHelp('nano', 'help_nano'));
+        term.writeHtml(formatHelp('mkdir', 'help_mkdir'));
+        term.writeHtml(formatHelp('rm', 'help_rm'));
+        term.writeHtml(formatHelp('sh, ./', 'help_sh'));
+        term.writeHtml(formatHelp('chmod', 'help_chmod'));
+        term.writeHtml(formatHelp('chown', 'help_chown'));
+        
+        term.writeHtml(`\n<b>${t('helpEnv')}</b>`);
+        term.writeHtml(formatHelp('login', 'help_login'));
+        term.writeHtml(formatHelp('logout', 'help_logout'));
+        term.writeHtml(formatHelp('su', 'help_su'));
+        term.writeHtml(formatHelp('whoami', 'help_whoami'));
+        term.writeHtml(formatHelp('export', 'help_export'));
+        term.writeHtml(formatHelp('alias', 'help_alias'));
+        term.writeHtml(formatHelp('unalias', 'help_unalias'));
+        term.writeHtml(formatHelp('source, .', 'help_source'));
+        
+        term.writeHtml(`\n<b>${t('helpUtil')}</b>`);
+        term.writeHtml(formatHelp('apt', 'help_apt'));
+        term.writeHtml(formatHelp('open', 'help_open'));
+        term.writeHtml(formatHelp('search', 'help_search'));
+        term.writeHtml(formatHelp('style', 'help_style'));
+        term.writeHtml(formatHelp('date', 'help_date'));
+        term.writeHtml(formatHelp('cal', 'help_cal'));
+        term.writeHtml(formatHelp('uptime', 'help_uptime'));
+        term.writeHtml(formatHelp('clear', 'help_clear'));
+        term.writeHtml(formatHelp('whatsnew', 'help_whatsnew'));
+        term.writeHtml(formatHelp('help', 'help_help'));
+        
+        term.writeLine("\n" + t('helpMore'));
+    },
      'echo': (args, options) => { term.writeLine(args.join(' ')); },
      'greet': (args, options) => {
          const name = args[0];
@@ -2871,7 +3524,7 @@ const globalCommands = {
         }
         
         // 2. [!!] 解析内容 [!!]
-        parseStartrc(fileContent);
+        await parseStartrc(fileContent);
 
         // 3. [!!] 刷新提示符 [!!]
         bookmarkSystem.update_user_path();
@@ -3117,23 +3770,38 @@ const globalCommands = {
                         return;
                     }
 
-                    // [!!] 交互式 I/O [!!]
+                    // [!! 1. 组合所有需要的权限 !!]
+                    const reqPermissions = pkg.permissions || [];
+                    const reqHostPermissions = pkg.host_permissions || [];
+                    const allPermissions = {
+                        permissions: reqPermissions,
+                        origins: reqHostPermissions // host_permissions 在 API 中被称为 'origins'
+                    };
+
                     term.writeLine(`Package '${pkgName}' will be installed.`);
                     term.writeLine(pkg.desc);
-                    if (pkg.permissions && pkg.permissions.length > 0) {
-                        term.writeLine(`[!] This package requires new permissions: ${pkg.permissions.join(', ')}`);
+                    
+                    // [!! 2. 检查并询问 !!]
+                    let needsPerms = false;
+                    if (reqPermissions.length > 0) {
+                        term.writeLine(`[!] This package requires new API permissions: ${reqPermissions.join(', ')}`);
+                        needsPerms = true;
                     }
-                    const answer = await term.readInput("Do you want to continue? [Y/n]");
-
-                    if (answer !== 'y' && answer !== '') {
-                        term.writeLine("Install aborted.");
-                        return;
+                    if (reqHostPermissions.length > 0) {
+                        term.writeLine(`[!] This package needs to access new hosts: ${reqHostPermissions.join(', ')}`);
+                        needsPerms = true;
                     }
 
-                    // [!!] Chrome 权限请求 [!!]
-                    if (pkg.permissions && pkg.permissions.length > 0) {
+                    if (needsPerms) {
+                        const answer = await term.readInput("Do you want to continue? [Y/n]");
+                        if (answer !== 'y' && answer !== '') {
+                            term.writeLine("Install aborted.");
+                            return;
+                        }
+                        
+                        // [!! 3. 请求权限 !!]
                         const granted = await new Promise((resolve) => {
-                            chrome.permissions.request({ permissions: pkg.permissions }, resolve);
+                            chrome.permissions.request(allPermissions, resolve);
                         });
                         if (!granted) {
                             term.writeLine("Permissions not granted. Install failed.");
@@ -3141,17 +3809,23 @@ const globalCommands = {
                         }
                     }
                     
-                    // [!!] Fetch 和安装代码 [!!]
-                    term.writeLine(`Fetching ${pkgName} from ${pkg.file}...`);
-                    const codeResponse = await fetch(REPO_URL + pkg.file);
-                    if (!codeResponse.ok) {
-                        throw new Error(`Failed to fetch package code: ${codeResponse.statusText}`);
+                    // [!! 4. 安装 (如果 file 存在) !!]
+                    if (pkg.file) {
+                        term.writeLine(`Fetching ${pkgName} from ${pkg.file}...`);
+                        const codeResponse = await fetch(REPO_URL + pkg.file);
+                        if (!codeResponse.ok) {
+                            throw new Error(`Failed to fetch package code: ${codeResponse.statusText}`);
+                        }
+                        const codeString = await codeResponse.text();
+                        
+                        let installed = JSON.parse(localStorage.getItem('installed_packages') || '{}');
+                        installed[pkgName] = { code: codeString };
+                        localStorage.setItem('installed_packages', JSON.stringify(installed));
+                    } else {
+                        // 这是一个“虚拟”包 (如 history, tree, wget)，只用于授权
+                        term.writeLine(`Permissions for built-in command ${pkgName} are now active.`);
                     }
-                    const codeString = await codeResponse.text();
-
-                    let installed = JSON.parse(localStorage.getItem('installed_packages') || '{}');
-                    installed[pkgName] = { code: codeString };
-                    localStorage.setItem('installed_packages', JSON.stringify(installed));
+                    
                     term.writeLine(`Successfully installed ${pkgName}.`);
                     break;
 
@@ -3210,6 +3884,39 @@ function parseSingleCommand(commandStr) {
     }
     return { command: commandName, args: args, options: options };
 }
+
+/**
+ * Tab 补全：获取所有可执行命令的列表
+ */
+function getAllCommandNames() {
+    const builtins = Object.keys(globalCommands); //
+    const fsCmds = Object.keys(bookmarkSystem.commands); //
+    const vfsScripts = bookmarkSystem.vfsBin.children.map(node => node.title.trim()); //
+    const aptPkgs = Object.keys(JSON.parse(localStorage.getItem('installed_packages') || '{}')); //
+    
+    // 使用 Set 确保唯一性
+    const allNames = new Set([...builtins, ...fsCmds, ...vfsScripts, ...aptPkgs]);
+    return Array.from(allNames);
+}
+
+/**
+ * Tab 补全：子命令的定义
+ */
+const subCommandCompletions = {
+    'downloads': ['ls', 'open'],
+    'tabs': ['ls', 'switch', 'close'],
+    'apt': ['update', 'list', 'install', 'remove'],
+    'style': ['font', 'size', 'reset'],
+    'mv': [], // 标记为 'path'
+    'cp': [], // 标记为 'path'
+    'cd': [], // 标记为 'path'
+    'ls': [], // 标记为 'path'
+    'cat': [], // 标记为 'path'
+    'nano': [], // 标记为 'path'
+    'rm': [], // 标记为 'path'
+    'mkdir': [], // 标记为 'path'
+    'sh': [], // 标记为 'path'
+};
 
 function awaiting() {
     if (executeNestLevel === 0) {
@@ -3304,6 +4011,24 @@ async function executeLine(line) {
                 commandFunc = bookmarkSystem.commands[command];
             } else if (globalCommands[command]) {
                 commandFunc = globalCommands[command];
+            } else {
+                // 如果在内置命令中找不到，检查 /bin/ VFS
+                const vfsPath = '/bin/' + command;
+                const result = bookmarkSystem._findNodeByPath(vfsPath);
+                
+                if (result && result.node && !result.node.children) {
+                    // 找到了一个 /bin/ 中的 VFS 脚本
+                    const meta = getMetadata(result.node);
+                    if (hasPermission(result.node, 'x')) {
+                        commandFunc = globalCommands.sh;
+                        // 将其作为 sh /bin/welcome arg1 arg2 ... 执行
+                        args.unshift(vfsPath); 
+                    } else {
+                        term.writeHtml(`<span class="term-error">startsh: permission denied: ${vfsPath}</span>`);
+                        isPiping = false; 
+                        break;
+                    }
+                }
             }
 
             // 4. [!!] 设置管道状态 [!!]
@@ -3352,44 +4077,36 @@ async function executeLine(line) {
 
 
 async function main() {
-
     // Uptime 
     window.st2_startTime = Date.now();
 
     // Load Settings 
     loadStyleSettings();
 
-    // --- 修改：将初始化移到 load 事件内部 ---
-    term.writeLine("ST 2.0 Booting..."); // 这可能在尺寸计算前显示
+    term.writeLine("ST 2.0 Booting..."); // 1.
 
-    // 1. 初始化 Bookmark System
-    await bookmarkSystem.initialize();
-
-    // 加载用户环境
-    const activeUser = localStorage.getItem('st2_active_user') || 'user'; // 默认为 "user"
-    loadEnvironment(activeUser);
-
-    // 2. 异步计算尺寸 (等待字体)
-    // await term._calculateDimensions();
+    // 2. [!!] 初始化终端 (清空缓冲区) [!!]
+    // 必须在任何 .startrc 打印之前运行
     await term.initialize();
 
-    // 3. 使用正确尺寸初始化缓冲区
-    // term._initBuffer();
+    // 3. [!!] 初始化文件系统 (现在不运行 .startrc) [!!]
+    await bookmarkSystem.initialize();
 
-    // 4. 设置命令处理器
+    // 4. [!!] 加载用户环境 (这将运行 .startrc 并打印 'welcome' 命令) [!!]
+    const activeUser = localStorage.getItem('st2_active_user') || 'user';
+    await loadEnvironment(activeUser); // 'welcome' 在这里被打印
+
+    // 5. 设置处理器
     term.onCommand = executeLine;
     term.onTab = handleTabCompletion;
 
-    // 5. 打印欢迎信息 (现在缓冲区尺寸正确)
-    // term.writeLine("Welcome to Start-Terminal 2.0!");
-    term.writeLine(t('welcome'));
-    term.writeLine(t('features'));
+    // 6. 打印静态欢迎信息
+    // term.writeLine(t('welcome'));
+    // term.writeLine(t('features'));
 
-    // 6. 显示第一个提示符
-    // done();
-
-    bookmarkSystem.update_user_path(); // 1. 显示提示符
-    term.enableInput(); // 2. 启用光标和输入
+    // 7. [!!] 启用输入 [!!]
+    // 我们不需要 update_user_path()，因为 loadEnvironment() (L77) 已经调用了它。
+    term.enableInput(); 
 }
 
 // --- 修改：使用 load 事件 ---
