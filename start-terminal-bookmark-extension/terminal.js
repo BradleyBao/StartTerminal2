@@ -514,7 +514,7 @@ class Terminal {
             // --- 关键调用点 2 ---
             this.buffer[this.cursorY] = this._overwriteHtml(this.buffer[this.cursorY], this.cursorX, htmlFragment);
 
-            this.cursorX += visibleLength; // 更新光标位置
+            // this.cursorX += visibleLength; // 更新光标位置
         }
     }
 
@@ -529,6 +529,12 @@ class Terminal {
         if (isPiping) {
             pipeBuffer.push(textString);
             return;
+        }
+
+        if (this.cursorX > 0) {
+            // this._handleNewline();
+            this.cursorX = 0;
+            
         }
 
         this.writeHtml(this.escapeHtml(textString));
@@ -725,6 +731,10 @@ class Terminal {
             this._writeSingleLine(lines[i]);
             if (i < lines.length - 1) { // 显式处理换行符
                 this._handleNewline();
+            } else {
+                // 手动更新 cursorX，因为 _writeSingleLine (L420) 是错误的
+                const textContent = this._stripHtml(lines[i]);
+                this.cursorX += textContent.length;
             }
         }
         this._handleNewline(); // 默认在每次打印后换行
@@ -1909,7 +1919,6 @@ class BookmarkSystem {
         } else {
                 displayPath = "/"; 
         }
-        // --- 结束修复 ---
         
         let promptString = Environment.PS1 || '\\$ '; // 回退
         promptString = promptString.replace(/\\u/g, Environment.USER || 'user');
@@ -1919,9 +1928,10 @@ class BookmarkSystem {
 
         this.full_path = promptString;
         
-        if (!this.term.inputDisabled) {
-            this.term.setPrompt(this.full_path);
-        }
+        // if (!this.term.inputDisabled) {
+        //     this.term.setPrompt(this.full_path);
+        // }
+        this.term.setPrompt(this.full_path);
     }
 
     getPWD() {
@@ -3928,8 +3938,9 @@ function awaiting() {
 function done() {
     executeNestLevel--;
     if (executeNestLevel === 0) {
-        term.enableInput();
+        
         bookmarkSystem.update_user_path();
+        term.enableInput();
     }
      // 使用 BookmarkSystem 的方法
 }
