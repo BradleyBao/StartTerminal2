@@ -808,14 +808,17 @@ class Terminal {
                     this.cursorY = 0;
                     this.cursorX = this.prompt.length;
                     break;
-                // ... (case 'c' 保持不变) ...
+                
                 case 'c': 
+                    const fullLineText = this.prompt + this.currentLine;
+                    const escapedLine = this.escapeHtml(fullLineText);
+                    const padding = ' '.repeat(Math.max(0, this.cols - fullLineText.length));
+                    this.buffer[this.cursorY] = escapedLine + padding;
+                    this.buffer[this.cursorY] += this.escapeHtml('^C');
                     this._handleNewline();
-                    this.currentLine = ''; 
-                    this.cursorX = 0;
-                    if (this.onCommand) {
-                        this.onCommand(""); 
-                    }
+                    this.currentLine = '';
+                    bookmarkSystem.update_user_path();
+                    this.enableInput();
                     break;
 
                 case 'arrowleft': 
@@ -2906,7 +2909,71 @@ const globalCommands = {
     },
 
     'welcome': async (args, options) => {
-        term.writeLine(t('welcome'));
+        // --- 1. 系统版本 (模拟) ---
+        term.writeLine("Welcome to Start-Terminal 2.0.0 (ST2-Shell / VFS)");
+        term.writeLine(""); // 空行
+        
+        // --- 2. 链接 (使用 VFS 文件夹样式) ---
+        // (你可以用 CSS 在 .term-folder 中定义一个亮色)
+        term.writeHtml("  * Documentation: <span class='term-folder'>https://github.com/BradleyBao/StartTerminal2</span>");
+        term.writeHtml("  * Management:    <span class='term-folder'>chrome://extensions</span>");
+        term.writeHtml("  * Support:       <span class='term-folder'>https://www.tianyibrad.com</span>");
+        term.writeLine("");
+
+        // --- 3. 系统信息 (真实 + 模拟) ---
+        const lang = Environment.LANG || 'en';
+        const now = new Date().toLocaleString(lang, { dateStyle: 'long', timeStyle: 'medium' });
+        term.writeLine(`  System information as of ${now}`);
+        term.writeLine("");
+
+        // --- 4. 获取动态数据 ---
+        // (A) 获取标签页数量 (需要 'tabs' 权限, 你已经有了)
+        const tabs = await new Promise(r => chrome.tabs.query({}, r));
+        const tabCount = tabs.length;
+
+        // (B) 模拟 "磁盘使用" (使用 localStorage 大小)
+        const storageSize = JSON.stringify(localStorage).length;
+        const storageMB = (storageSize / (1024 * 1024)).toFixed(2);
+        
+        // (C) 获取活动用户
+        const activeUser = Environment.USER || 'user';
+
+        // --- 5. 格式化并打印统计数据 ---
+        // 我们使用 padding 来对齐列
+        const stat_tabs = `  Tab count:`;
+        const val_tabs = `${tabCount}`;
+        const stat_user = `User logged in:`;
+        const val_user = `${activeUser}`;
+        
+        const stat_vfs = `  VFS usage:`;
+        const val_vfs = `${storageMB} / 5.00 MB`; // 5MB 是 localStorage 的大致限制
+
+        const col1Width = 18; // 统一第一列的宽度
+        const pad_tabs = ' '.repeat(col1Width - stat_tabs.length);
+        const pad_vfs = ' '.repeat(col1Width - stat_vfs.length);
+
+        // 打印两列
+        term.writeLine(`${stat_tabs}${pad_tabs}${val_tabs}        ${stat_user} ${val_user}`);
+        term.writeLine(`${stat_vfs}${pad_vfs}${val_vfs}`);
+        term.writeLine("");
+
+        // --- 6. "广告" / 功能高亮 (模拟) ---
+        // (你可以用 CSS 定义一个亮色, 比如 --color-accent-cyan)
+        term.writeHtml("  * <span style='color: #26c6da;'>New!</span> Multi-user permissions & VFS scripting are now live.");
+        term.writeHtml("    Run login google or nano /bin/hello.sh to try it.");
+        term.writeLine("");
+
+        // --- 7. 'apt' 状态 (模拟) ---
+        term.writeLine("Run 'sudo apt update' to check for new packages.");
+        term.writeLine("");
+
+        // --- 8. 上次登录 (来自 L1804 的新 localStorage 条目) ---
+        const lastLogin = localStorage.getItem('st2_last_login');
+        if (lastLogin) {
+            const lastLoginDate = new Date(lastLogin).toLocaleString(lang);
+            term.writeLine(`Last login: ${lastLoginDate}`);
+            term.writeLine(""); // 最后的空行
+        }
     },
 
     'logout': (args, options) => {
@@ -4114,6 +4181,7 @@ async function main() {
     // 6. 打印静态欢迎信息
     // term.writeLine(t('welcome'));
     // term.writeLine(t('features'));
+    localStorage.setItem('st2_last_login', new Date().toISOString());
 
     // 7. [!!] 启用输入 [!!]
     // 我们不需要 update_user_path()，因为 loadEnvironment() (L77) 已经调用了它。
