@@ -2926,44 +2926,39 @@ const globalCommands = {
     },
 
     'welcome': async (args, options) => {
-        // --- 1. 系统版本 (模拟) ---
-        term.writeLine("Welcome to Start-Terminal 2.0.0 (ST2-Shell / VFS)");
-        term.writeLine(""); // 空行
+        // --- 1. 系统版本 ---
+        term.writeLine(t('welcomeTitle'));
+        term.writeLine("");
         
         // --- 2. 链接 (使用 VFS 文件夹样式) ---
         // (你可以用 CSS 在 .term-folder 中定义一个亮色)
-        term.writeHtml("  * Documentation: <span class='term-folder'>https://github.com/BradleyBao/StartTerminal2</span>");
-        term.writeHtml("  * Management:    <span class='term-folder'>chrome://extensions</span>");
-        term.writeHtml("  * Support:       <span class='term-folder'>https://www.tianyibrad.com</span>");
+        term.writeHtml(`${t('welcomeDoc')} <span class='term-folder'>https://github.com/BradleyBao/StartTerminal2</span>`);
+        term.writeHtml(`${t('welcomeMgmt')} <span class='term-folder'>chrome://extensions</span>`);
+        term.writeHtml(`${t('welcomeSupport')} <span class='term-folder'>https://www.tianyibrad.com</span>`);
         term.writeLine("");
 
         // --- 3. 系统信息 (真实 + 模拟) ---
         const lang = Environment.LANG || 'en';
         const now = new Date().toLocaleString(lang, { dateStyle: 'long', timeStyle: 'medium' });
-        term.writeLine(`  System information as of ${now}`);
+        term.writeLine(`  ${t('welcomeSysInfo')} ${now}`);
         term.writeLine("");
 
         // --- 4. 获取动态数据 ---
-        // (A) 获取标签页数量 (需要 'tabs' 权限, 你已经有了)
         const tabs = await new Promise(r => chrome.tabs.query({}, r));
         const tabCount = tabs.length;
-
-        // (B) 模拟 "磁盘使用" (使用 localStorage 大小)
         const storageSize = JSON.stringify(localStorage).length;
         const storageMB = (storageSize / (1024 * 1024)).toFixed(2);
-        
-        // (C) 获取活动用户
         const activeUser = Environment.USER || 'user';
+        
 
         // --- 5. 格式化并打印统计数据 ---
-        // 我们使用 padding 来对齐列
-        const stat_tabs = `  Tab count:`;
+        const stat_tabs = `  ${t('welcomeTabCount')}`;
         const val_tabs = `${tabCount}`;
-        const stat_user = `User logged in:`;
+        const stat_user = `${t('welcomeUser')}`;
         const val_user = `${activeUser}`;
         
-        const stat_vfs = `  VFS usage:`;
-        const val_vfs = `${storageMB} / 5.00 MB`; // 5MB 是 localStorage 的大致限制
+        const stat_vfs = `  ${t('welcomeVFS')}`;
+        const val_vfs = `${storageMB} / 5.00 MB`;
 
         const col1Width = 18; // 统一第一列的宽度
         const pad_tabs = ' '.repeat(col1Width - stat_tabs.length);
@@ -2975,20 +2970,19 @@ const globalCommands = {
         term.writeLine("");
 
         // --- 6. "广告" / 功能高亮 (模拟) ---
-        // (你可以用 CSS 定义一个亮色, 比如 --color-accent-cyan)
-        term.writeHtml("  * <span style='color: #26c6da;'>New!</span> Multi-user permissions & VFS scripting are now live.");
-        term.writeHtml("    Run login google or nano /bin/hello.sh to try it.");
+        term.writeHtml(t('welcomeNew'));
+        term.writeHtml(t('welcomeTry'));
         term.writeLine("");
 
         // --- 7. 'apt' 状态 (模拟) ---
-        term.writeLine("Run 'sudo apt update' to check for new packages.");
+        term.writeLine(t('welcomeApt'));
         term.writeLine("");
 
         // --- 8. 上次登录 (来自 L1804 的新 localStorage 条目) ---
         const lastLogin = localStorage.getItem('st2_last_login');
         if (lastLogin) {
             const lastLoginDate = new Date(lastLogin).toLocaleString(lang);
-            term.writeLine(`Last login: ${lastLoginDate}`);
+            term.writeLine(`${t('welcomeLastLogin')} ${lastLoginDate}`);
             term.writeLine(""); // 最后的空行
         }
     },
@@ -3724,6 +3718,14 @@ const globalCommands = {
         term.writeLine(`Terminal up for: ${days}d ${hours}h ${minutes}m ${seconds}s.`);
     },
 
+    'env': (args, options) => {
+        // 打印所有环境变量
+        for (const key in Environment) {
+            // 匹配 'export' (L1694) 命令的输出格式
+            term.writeLine(`${key}="${Environment[key]}"`);
+        }
+    },
+
      // --- export 命令 ---
      'export': (args, options) => {
         if (args.length === 0) {
@@ -3980,15 +3982,26 @@ function parseSingleCommand(commandStr) {
     const args = [];
     const options = {};
     for (let i = 1; i < tokens.length; i++) {
-        let token = tokens[i];
+        let token = tokens[i]; //
+
+        // 让 'executeLine' 来处理引号和扩展
         if ((token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'"))) {
-            token = token.slice(1, -1); args.push(token); continue;
+            args.push(token); // (例如 "Hello $USER")
+            continue;
         }
-        if (token.startsWith('--')) { 
-            const optName = token.substring(2); if (optName) { options[optName] = true; }
-        } else if (token.startsWith('-')) { 
-            const optString = token.substring(1); if (optString.length > 0) { for (const char of optString) { options[char] = true; } }
-        } else { args.push(token); }
+
+        // 处理选项
+        if (token.startsWith('--')) { //
+            const optName = token.substring(2);
+            if (optName) { options[optName] = true; } //
+        } else if (token.startsWith('-')) { //
+            const optString = token.substring(1);
+            if (optString.length > 0) {
+                for (const char of optString) { options[char] = true; } //
+            }
+        } else {
+            args.push(token); 
+        }
     }
     return { command: commandName, args: args, options: options };
 }
@@ -4081,6 +4094,41 @@ async function executeLine(line) {
             if (!parsed) continue;
 
             let { command, args, options } = parsed;
+
+            // 变量替换
+            const varRegex = /\$([A-Za-z_][A-Za-z0-9_]*)/g; // 查找 $VAR
+            const varRegexBrace = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g; // 查找 ${VAR}
+
+            const expandVars = (str) => {
+                let expanded = str.replace(varRegex, (match, varName) => {
+                    return Environment[varName] || ""; //
+                });
+                expanded = expanded.replace(varRegexBrace, (match, varName) => {
+                    return Environment[varName] || ""; //
+                });
+                return expanded;
+            };
+
+            // 处理 args 数组：扩展变量并剥离引号
+            args = args.map(arg => {
+                if (arg.startsWith('"') && arg.endsWith('"')) {
+                    // 双引号: *先*扩展变量, *再*剥离引号
+                    arg = arg.slice(1, -1);
+                    return expandVars(arg);
+                } else if (arg.startsWith("'") && arg.endsWith("'")) {
+                    // 单引号: *只*剥离引号, 不扩展
+                    return arg.slice(1, -1);
+                } else if (arg.startsWith('-')) {
+                    // 这是一个选项 (例如 -l), 不扩展
+                    return arg;
+                }
+                
+                // 这是一个未加引号的参数 (例如 PS1="value" 或 $LANG)
+                // (export 和 alias 命令会自己处理 KEY=VALUE)
+                return expandVars(arg);
+            });
+
+            command = expandVars(command);
 
             // Check alias
             if (AliasEnvironment[command]) {
