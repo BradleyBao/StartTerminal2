@@ -90,6 +90,30 @@ function t(key) {
     return messages['en'][key] || key;
 }
 
+function getVisualLength(str) {
+    let length = 0;
+    for (let i = 0; i < str.length; i++) {
+        const code = str.charCodeAt(i);
+        
+        // 基于 Unicode 范围的、更精确的全角/半角判断
+        if (
+            (code >= 0x1100 && code <= 0x115f) || // 韩文 Jamo
+            (code >= 0x2e80 && code <= 0xa4cf) || // CJK 偏旁、符号、兼容表意文字
+            (code >= 0xac00 && code <= 0xd7af) || // 韩文音节
+            (code >= 0xf900 && code <= 0xfaff) || // CJK 兼容表意文字
+            (code >= 0xfe10 && code <= 0xfe19) || // 垂直标点
+            (code >= 0xfe30 && code <= 0xfe6f) || // CJK 兼容形式
+            (code >= 0xff00 && code <= 0xff60) || // 全角 ASCII、标点
+            (code >= 0xffe0 && code <= 0xffe6)    // 全角符号
+        ) {
+            length += 2; // 这是一个宽字符
+        } else {
+            length += 1; // 这是一个窄字符
+        }
+    }
+    return length;
+}
+
 /**
  * 核心终端模拟器类
  */
@@ -326,7 +350,6 @@ class Terminal {
                 this.readResolve = null;
                 this.disableInput(); // 交还控制权
 
-            // --- [!! 核心修复 !!] ---
             // (从 _handleKeydown 复制 Backspace 逻辑)
             } else if (e.key === 'Backspace') {
                 const pos = this.cursorX - this.prompt.length;
@@ -341,7 +364,6 @@ class Terminal {
                 this.currentLine = this.currentLine.substring(0, pos) + char + this.currentLine.substring(pos);
                 this.cursorX++;
             }
-            // --- [!! 结束修复 !!] ---
             
             this._render(); // 渲染 Y/n 的输入
         
@@ -371,7 +393,6 @@ class Terminal {
         return new Promise((resolve) => {
             const fullPrompt = prompt + " ";
             
-            // --- [!! 核心修复 !!] ---
             // 1. 不使用 writeLine，而是将提示符 "烘焙" 到当前缓冲区行
             this.buffer[this.cursorY] = this._overwriteHtml(this.buffer[this.cursorY], 0, this.escapeHtml(fullPrompt));
             
@@ -515,11 +536,11 @@ class Terminal {
 
                     // 获取剩余部分
                     const remainingVisibleLength = visibleLength - spaceLeft;
-                    // --- 修复：确保正确获取 part2 ---
+                    // --- 确保正确获取 part2 ---
                     // 我们需要从原始 htmlFragment 中截取，而不是从 textContent
                     // start 参数应为 spaceLeft (跳过已写入的部分)
                     const part2 = this._truncateHtml(htmlFragment, remainingVisibleLength, spaceLeft);
-                    // --- 结束修复 ---
+
 
                     // 如果剩余部分有实际内容，则递归写入
                     if (this._stripHtml(part2).length > 0) {
@@ -1144,13 +1165,11 @@ class NanoEditor {
         for (let y = 0; y < editorHeight; y++) {
             const lineIndex = this.topRow + y;
 
-            // [!! 核心修复 2.B !!]
             // 仅当*不是*光标行时，才使用 _padLine (它会转义HTML)
             // 我们将在第 4 步专门处理光标行。
             if (lineIndex === this.cursorY) {
                 continue;
             }
-            // [!! 修复结束 !!]
 
             if (lineIndex < this.lines.length) {
                 this.term.buffer[y + 1] = this._padLine(this.lines[lineIndex]);
@@ -1304,7 +1323,7 @@ class NanoEditor {
         this._render();           // 重新渲染
     }
 
-    _save() {
+    async _save() {
         this.status = "Saving...";
         
         try {
@@ -1444,170 +1463,209 @@ class BookmarkSystem {
                         this.term.writeHtml(`${modeStr} ${links} ${owner} ${group} ${String(size).padStart(6)} ${date} ${name}`);
                     }
                 } else {
-                    if (children.length === 0) return; // 目录为空
+                    if (children.length === 0) return;
 
-                    // 1. 格式化所有名称并找到最大宽度
+                    // 1. 格式化所有名称并找到最大宽度 (保持不变)
                     let maxNameWidth = 0;
                     const formattedNames = children.map(child => {
                         const title = child.title.trim();
                         const isDir = !!child.children;
-                        const nameLength = title.length + (isDir ? 1 : 0); // "name/"
-                        
+                        const visualLen = getVisualLength(title) + (isDir ? 1 : 0);
                         let html;
                         if (isDir) {
                             html = `<span class="term-folder">${this.term.escapeHtml(title)}/</span>`;
                         } else {
                             html = this.term.escapeHtml(title);
                         }
-                        
-                        if (nameLength > maxNameWidth) {
-                            maxNameWidth = nameLength;
+                        if (visualLen > maxNameWidth) {
+                            maxNameWidth = visualLen;
                         }
-                        return { html: html, length: nameLength };
+                        return { html: html, visualLen: visualLen }; 
                     });
 
-                    // 2. 计算列
-                    const colPadding = 2; // "name  name  name"
+                    // 2. 计算列 (保持不变)
+                    const colPadding = 2; 
                     const colWidth = maxNameWidth + colPadding;
                     const termWidth = this.term.cols;
                     let numCols = Math.floor(termWidth / colWidth);
-                    if (numCols === 0) {
-                        numCols = 1; // 至少一列
-                    }
+                    if (numCols === 0) numCols = 1;
 
-                    // 3. 构建并打印行 (Row-major order)
-                    let currentLine = "";
-                    let currentCols = 0;
+                    // 3. [!!] 计算行数 (新)
+                    const numRows = Math.ceil(formattedNames.length / numCols);
 
-                    for (const name of formattedNames) {
-                        // 准备带 padding 的 HTML
-                        const padding = ' '.repeat(Math.max(0, colWidth - name.length));
-                        currentLine += name.html + padding;
-                        currentCols++;
-
-                        if (currentCols >= numCols) {
-                            // 此行已满，打印
-                            // writeHtml 会自动为我们处理换行
-                            this.term.writeHtml(currentLine); 
-                            currentLine = "";
-                            currentCols = 0;
+                    // 4. [!!] 按“列优先”顺序构建和打印 (新)
+                    for (let y = 0; y < numRows; y++) {
+                        let currentLine = "";
+                        for (let x = 0; x < numCols; x++) {
+                            // (y, x) -> (0,0), (0,1), (0,2)
+                            // (1,0), (1,1), (1,2)
+                            const index = y + (x * numRows); // 列优先索引
+                            
+                            if (index < formattedNames.length) {
+                                const name = formattedNames[index];
+                                const padding = ' '.repeat(Math.max(0, colWidth - name.visualLen));
+                                currentLine += name.html + padding;
+                            }
                         }
-                    }
-
-                    // 4. 打印最后一行（如果不为空）
-                    if (currentLine.trim().length > 0) {
-                        this.term.writeHtml(currentLine);
+                        this.term.writeHtml(currentLine); // 打印一行
                     }
                 }
             },
             
             'mkdir': async (args, options) => {
-                if (!args[0]) {
+                if (args.length === 0) {
                     this.term.writeHtml(`<span class="term-error">mkdir: missing operand</span>`);
                     return;
                 }
 
-                if (!hasPermission(this.current, 'w')) {
-                    term.writeHtml(`<span class="term-error">mkdir: cannot create directory: Permission denied</span>`);
-                    return;
-                }
+                for (const path of args) {
+                    // 1. 检查它是否已存在
+                    const existing = this._findNodeByPath(path);
+                    if (existing && existing.node) {
+                        this.term.writeHtml(`<span class="term-error">mkdir: ${path}: File exists</span>`);
+                        continue; // 继续下一个参数
+                    }
 
-                // const currentMeta = getMetadata(this.current);
-                // if (!(currentMeta.mode & 0o200)) { // 0o200 = U_WRITE
-                //     term.writeHtml(`<span class="term-error">mkdir: cannot create directory: Permission denied</span>`);
-                //     return;
-                // }
-                const dirName = args[0];
-                if (this._findChildByTitle(this.current.children, dirName)) {
-                    this.term.writeHtml(`<span class="term-error">mkdir: ${dirName}: File exists</span>`);
-                    return;
-                }
-                // await new Promise(resolve => {
-                //     chrome.bookmarks.create({ parentId: this.current.id, title: dirName }, resolve);
-                // });
+                    // 2. 解析父路径和新目录名
+                    let parentPath, dirName;
+                    if (path.includes('/')) {
+                        parentPath = path.substring(0, path.lastIndexOf('/')) || '/';
+                        dirName = path.split('/').pop();
+                    } else {
+                        parentPath = '.'; // 相对当前目录
+                        dirName = path;
+                    }
+                    
+                    if (!dirName) {
+                        this.term.writeHtml(`<span class="term-error">mkdir: invalid path: ${path}</span>`);
+                        continue;
+                    }
 
-                const newNode = await new Promise(resolve => { // [!!] 获取新节点 [!!]
-                    chrome.bookmarks.create({ parentId: this.current.id, title: dirName }, resolve);
-                });
+                    // 3. 查找父节点并检查权限
+                    const parentResult = this._findNodeByPath(parentPath);
+                    if (!parentResult || !parentResult.node || !parentResult.node.children) {
+                        this.term.writeHtml(`<span class="term-error">mkdir: ${parentPath}: ${t('noSuchFileOrDir')}</span>`);
+                        continue;
+                    }
+                    
+                    if (!hasPermission(parentResult.node, 'w')) {
+                        this.term.writeHtml(`<span class="term-error">mkdir: ${parentPath}: Permission denied</span>`);
+                        continue;
+                    }
 
-                // [!!] 新增：设置新目录的元数据 [!!]
-                if (newNode) {
-                    setMetadata(newNode, 0o777, Environment.USER, Environment.USER);
+                    // 4. 创建书签文件夹
+                    const newNode = await new Promise(r => chrome.bookmarks.create({ parentId: parentResult.node.id, title: dirName }, r));
+                    
+                    // 5. 设置新目录的元数据
+                    if (newNode) {
+                        setMetadata(newNode, 0o777, Environment.USER, Environment.USER);
+                    }
                 }
             },
             
             'rmdir': async (args, options) => {
-                if (!args[0]) {
+                if (args.length === 0) {
                     this.term.writeHtml(`<span class="term-error">rmdir: missing operand</span>`);
                     return;
                 }
-                const target = this._findChildByTitle(this.current.children, args[0]);
-                if (!target) {
-                    this.term.writeHtml(`<span class="term-error">rmdir: ${args[0]}: No such file or directory</span>`);
-                } else if (!target.children) {
-                    this.term.writeHtml(`<span class="term-error">rmdir: ${args[0]}: Not a directory</span>`);
-                } else if (target.children.length > 0) {
-                    this.term.writeHtml(`<span class="term-error">rmdir: ${args[0]}: Directory not empty</span>`);
-                } else {
+
+                for (const path of args) {
+                    // 修剪末尾的 '/'
+                    const cleanPath = path.endsWith('/') && path.length > 1 ? path.slice(0, -1) : path;
+                    
+                    const result = this._findNodeByPath(cleanPath);
+                    
+                    if (!result || !result.node) {
+                        this.term.writeHtml(`<span class="term-error">rmdir: ${path}: ${t('noSuchFileOrDir')}</span>`);
+                        continue;
+                    }
+                    
+                    const target = result.node;
+
+                    // 添加权限检查
+                    if (!hasPermission(target, 'w')) {
+                        this.term.writeHtml(`<span class="term-error">rmdir: ${path}: Permission denied</span>`);
+                        continue;
+                    }
+                    if (!target.children) {
+                        this.term.writeHtml(`<span class="term-error">rmdir: ${path}: ${t('notADir')}</span>`);
+                        continue;
+                    }
+                    if (target.children.length > 0) {
+                        this.term.writeHtml(`<span class="term-error">rmdir: ${path}: ${t('dirNotEmpty')}</span>`);
+                        continue;
+                    } 
+                    
                     await new Promise(resolve => chrome.bookmarks.remove(target.id, resolve));
                 }
             },
             
             'rm': async (args, options) => {
-                if (!args[0]) {
+                if (args.length === 0) {
                     term.writeHtml(`<span class="term-error">rm: missing operand</span>`);
                     return;
                 }
-                const path = args[0];
-                let target;
-                if (!path.startsWith('/') && !path.startsWith('~/')) {
-                    target = this._findChildByTitle(this.current.children, path);
-                } else {
-                    const result = this._findNodeByPath(path);
-                    target = result ? result.node : null;
-                }
                 
-                if (!target) {
-                    term.writeHtml(`<span class="term-error">rm: ${args[0]}: No such file or directory</span>`);
-                    return;
-                }
-
-                // [!! 核心修复：立即检查权限 !!]
-                // 无论文件是 VFS 还是书签，都必须先检查权限。
-                if (!hasPermission(target, 'w')) {
-                    term.writeHtml(`<span class="term-error">rm: cannot remove '${args[0]}': Permission denied</span>`);
-                    return;
-                }
-                // [!! 修复结束 !!]
-
-                
-                // VFS 'rm' 逻辑 (现在是安全的)
-                if (target.id.startsWith('vfs-bin-')) {
-                    if (this.current.id === 'vfs-bin') {
-                        deleteVfsScript(target.title);
-                        this.vfsBin.children = this.vfsBin.children.filter(c => c.id !== target.id);
-                        term.writeLine(`Removed VFS script: ${target.title}`);
-                        return;
-                    } else {
-                        term.writeHtml(`<span class="term-error">rm: Cannot remove VFS files from here.</span>`);
-                        return;
-                    }
-                }
-
-                // 书签 'rm' 逻辑 (现在是安全的)
                 const recursive = options.r || options.recurse;
                 
-                if (target.children && !recursive) {
-                    term.writeHtml(`<span class="term-error">rm: ${args[0]}: is a directory</span>`);
-                } else if (target.children && recursive) {
-                    await this._removeRecursive(target.id);
-                } else {
-                    await new Promise(resolve => chrome.bookmarks.remove(target.id, resolve));
+                for (const pathArg of args) {
+                    
+                    // 修剪末尾的 '/' ('rm "dir/"')
+                    let pathPattern = pathArg;
+                    if (pathPattern.endsWith('/') && pathPattern.length > 1) {
+                        pathPattern = pathPattern.slice(0, -1);
+                    }
+
+                    // 使用 Glob 解析器 
+                    let targets = [];
+                    if (pathPattern.includes('*')) {
+                        // 这是一个通配符路径
+                        targets = this._globResolver(pathPattern, this.current); //
+                        if (targets.length === 0) {
+                            term.writeHtml(`<span class="term-error">${t('rmNoMatch')} '${pathPattern}'</span>`);
+                            continue; // 跳到下一个参数
+                        }
+                    } else {
+                        // 这是一个常规路径
+                        // 始终使用 _findNodeByPath (L1195)
+                        const result = this._findNodeByPath(pathPattern);
+                        if (!result || !result.node) {
+                            term.writeHtml(`<span class="term-error">rm: ${pathPattern}: ${t('noSuchFileOrDir')}</span>`);
+                            continue; // 跳到下一个参数
+                        }
+                        targets = [result.node];
+                    }
+                    
+                    // 在循环内部处理 targets 
+                    for (const target of targets) {
+                        // 权限检查
+                        if (!hasPermission(target, 'w')) {
+                            term.writeHtml(`<span class="term-error">rm: cannot remove '${target.title}': Permission denied</span>`);
+                            continue; // 跳过这个文件
+                        }
+                        
+                        // VFS 'rm' 逻辑
+                        if (target.id.startsWith('vfs-bin-')) {
+                            deleteVfsScript(target.title);
+                            this.vfsBin.children = this.vfsBin.children.filter(c => c.id !== target.id);
+                            term.writeLine(`Removed VFS script: ${target.title}`);
+                            continue; // 跳过 VFS 文件
+                        }
+
+                        // 书签 'rm' 逻辑
+                        if (target.children && !recursive) {
+                            term.writeHtml(`<span class="term-error">rm: ${target.title}: ${t('isADir')}</span>`);
+                        } else if (target.children && recursive) {
+                            await this._removeRecursive(target.id);
+                        } else if (!target.children) {
+                            await new Promise(resolve => chrome.bookmarks.remove(target.id, resolve));
+                        }
+                    }
                 }
             },
             'pwd': (args, options) => {
                 let displayPath;
-                // --- 核心修复：pwd 始终显示绝对路径，从不显示 ~ ---
+                // --- pwd 始终显示绝对路径，从不显示 ~ ---
                 if (!this.root) {
                     displayPath = "/"; // 容错
                 } else if (this.path.length <= 1) {
@@ -1617,7 +1675,6 @@ class BookmarkSystem {
                     // 获取所有节点的 title 并用 '/' 连接
                     displayPath = "/" + this.path.slice(1).map(node => node.title).join("/");
                 }
-                // --- 结束修复 ---
                 this.term.writeLine(displayPath); // 使用 writeLine 输出纯文本
             },
             'mv': async (args, options) => {
@@ -1675,7 +1732,7 @@ class BookmarkSystem {
                 } else if (!destNode) {
                     // 2. 目标不存在: 移动并重命名
                     const lastSlash = destPath.lastIndexOf('/');
-                    // [!!] 修复：使用 '.' (当前目录) 作为相对路径的父级
+                    // 使用 '.' (当前目录) 作为相对路径的父级
                     const parentPath = (lastSlash > -1) ? destPath.substring(0, lastSlash) : '.'; 
                     const newTitle = (lastSlash > -1) ? destPath.substring(lastSlash + 1) : destPath;
                     
@@ -1696,7 +1753,6 @@ class BookmarkSystem {
                          term.writeHtml(`<span class="term-error">mv: cannot write to destination: Permission denied</span>`); return;
                     }
                     
-                    // [!! 核心修复：区分 Move 和 Update !!]
                     const needsMove = sourceNode.parentId !== destParentNode.id;
                     const needsRename = destTitle && sourceNode.title !== destTitle;
 
@@ -1721,6 +1777,68 @@ class BookmarkSystem {
                         }
                     } catch (e) {
                          term.writeHtml(`<span class="term-error">mv: API Error: ${e.message}</span>`);
+                    }
+                }
+            },
+
+            'touch': async (args, options) => {
+                if (args.length === 0) {
+                    term.writeHtml(`<span class="term-error">touch: missing file operand</span>`);
+                    return;
+                }
+
+                for (const path of args) {
+                    const result = this._findNodeByPath(path);
+
+                    if (result && result.node) {
+                        // 文件已存在，暂时什么都不做 (更新时间戳)
+                        continue;
+                    }
+
+                    // 文件不存在，创建它
+                    let parentPath, fileName;
+                    if (path.includes('/')) {
+                        parentPath = path.substring(0, path.lastIndexOf('/')) || '/';
+                        fileName = path.split('/').pop();
+                    } else {
+                        parentPath = '.';
+                        fileName = path;
+                    }
+
+                    const parentResult = this._findNodeByPath(parentPath);
+                    if (!parentResult || !parentResult.node || !parentResult.node.children) {
+                        term.writeHtml(`<span class="term-error">touch: cannot touch '${path}': ${t('noSuchFileOrDir')}</span>`);
+                        continue;
+                    }
+                    
+                    if (!hasPermission(parentResult.node, 'w')) {
+                        term.writeHtml(`<span class="term-error">touch: cannot touch '${path}': Permission denied</span>`);
+                        continue;
+                    }
+
+                    // Case A: VFS /bin
+                    if (parentResult.node.id === 'vfs-bin') {
+                        saveVfsScript(fileName, "", 0o755, Environment.USER);
+                        const newNode = {
+                            id: `vfs-bin-${fileName}`, title: fileName, url: `data:text/plain;base64,`,
+                            mode: 0o755, owner: Environment.USER, group: Environment.USER, children: null, parentId: 'vfs-bin'
+                        };
+                        this.vfsBin.children.push(newNode);
+                        continue;
+                    }
+                    
+                    // Case B: 普通书签
+                    const newNode = await new Promise(resolve => {
+                        chrome.bookmarks.create({
+                            parentId: parentResult.node.id,
+                            title: fileName,
+                            url: 'data:text/plain,' // 空文本文件
+                        }, resolve);
+                    });
+                    
+                    // 为新文件设置元数据
+                    if (newNode) {
+                        setMetadata(newNode, 0o666, Environment.USER, Environment.USER);
                     }
                 }
             },
@@ -1756,7 +1874,6 @@ class BookmarkSystem {
                     // newName 保持 null, _copyRecursive 将使用原名
                 } else if (!destNode) {
                     // Case 2: cp file newfile (目标是新路径)
-                    // [!!] 修复相对路径解析
                     const lastSlash = destPath.lastIndexOf('/');
                     const parentPath = (lastSlash > -1) ? destPath.substring(0, lastSlash) : '.'; // 使用 '.' (当前)
                     newName = (lastSlash > -1) ? destPath.substring(lastSlash + 1) : destPath;
@@ -2047,6 +2164,42 @@ class BookmarkSystem {
         return new Promise((resolve, reject) => {
             chrome.bookmarks.removeTree(nodeId, resolve);
         });
+    }
+
+    /**
+     * @param {string} pathPattern - e.g., "测试*" or "/bin/test*"
+     * @param {Object} contextNode - 运行 'rm' 时的 this.current
+     * @returns {Array<Object>} - 匹配到的节点数组
+     */
+    _globResolver(pathPattern, contextNode) {
+        let baseNode = contextNode;
+        let pattern = pathPattern;
+
+        // 1. 检查是否是绝对路径 (e.g., /bin/test*)
+        if (pathPattern.includes('/')) {
+            const lastSlash = pathPattern.lastIndexOf('/');
+            const basePath = pathPattern.substring(0, lastSlash) || '/';
+            pattern = pathPattern.substring(lastSlash + 1);
+            
+            const result = this._findNodeByPath(basePath);
+            if (!result || !result.node || !result.node.children) {
+                return []; // 基础路径无效
+            }
+            baseNode = result.node;
+        }
+
+        // 2. 将通配符 '*' 转换为 RegExp
+        // (转义 . ? + $ ^ [ ] ( ) { } | \ 等特殊字符)
+        const regexPattern = pattern
+            .replace(/[.+?$^()[\]{}|\\]/g, '\\$&')
+            .replace(/\*/g, '.*'); // 将 * 替换为 .*
+        
+        const regex = new RegExp('^' + regexPattern + '$');
+
+        // 3. 过滤子节点
+        return (baseNode.children || []).filter(child => 
+            regex.test(child.title.trim())
+        );
     }
 }
 
@@ -2693,7 +2846,7 @@ const globalCommands = {
             return;
         }
 
-        // [!! 核心修复：支持 Octal 和 Symbolic !!]
+        // 支持 Octal 和 Symbolic
         let newMode;
         const octalMode = parseInt(modeStr, 8); // 尝试解析八进制
 
@@ -2904,7 +3057,6 @@ const globalCommands = {
                 term.writeHtml(`\n<b>What's New in v${term.escapeHtml(version)}: ${term.escapeHtml(title)}</b>`);
                 term.writeLine("---");
                 
-                // [!! 核心修复 !!]
                 // 1. 使用 DOMParser (L515) 来解析 HTML
                 const doc = new DOMParser().parseFromString(contentHtml, 'text/html');
                 
@@ -2914,7 +3066,6 @@ const globalCommands = {
                         term.writeLine(node.textContent.trim()); // 打印纯文本
                     }
                 });
-                // [!! 修复结束 !!]
                 
             } else {
                 term.writeHtml(`<span class="term-error">No update records found.</span>`);
@@ -3421,6 +3572,8 @@ const globalCommands = {
         }
      },
 
+     
+
      'nano': (args, options) => {
         let path = args[0];
         if (!path) {
@@ -3477,7 +3630,7 @@ const globalCommands = {
             }
             // (如果是新文件, 'content' 保持为 "")
 
-            const onSave = (savedPath, savedContent) => {
+            const onSave = async (savedPath, savedContent) => {
                 try {
                     // (权限检查保持不变)
                     if (node) { 
@@ -3538,9 +3691,54 @@ const globalCommands = {
                             return false; // [!!] 3. 返回 false
                         }
                     } else if (!node) {
-                        // D. 正在创建*新的*书签 (不支持)
-                        term.writeHtml(`<span class="term-error">nano: Error: Cannot save new file to '${savedPath}'. Only /bin/ is supported.</span>`);
-                        return false; // [!!] 4. 返回 false
+                        // --- C. 创建新文件 ---
+                        
+                        // Case C1: VFS /bin/ 脚本
+                        if (savedPath.startsWith('/bin/')) {
+                            const scriptName = savedPath.substring(5);
+                            if (scriptName && !scriptName.includes('/')) {
+                                saveVfsScript(scriptName, savedContent, 0o755, Environment.USER);
+                                const newNode = {
+                                    id: `vfs-bin-${scriptName}`,
+                                    title: scriptName,
+                                    url: `data:text/plain;base64,${btoa(encodeURIComponent(savedContent))}`,
+                                    mode: 0o755, owner: Environment.USER, group: Environment.USER,
+                                    children: null, parentId: 'vfs-bin'
+                                };
+                                bookmarkSystem.vfsBin.children.push(newNode);
+                                term.writeLine(`Saved to VFS: ${savedPath}`);
+                            } else {
+                                term.writeHtml(`<span class="term-error">nano: Invalid path.</span>`);
+                                return false;
+                            }
+                        } 
+                        // 普通书签文件
+                        else {
+                            // 1. 找到父目录
+                            const parentPath = savedPath.substring(0, savedPath.lastIndexOf('/')) || '/';
+                            const parentResult = bookmarkSystem._findNodeByPath(parentPath);
+                            
+                            if (parentResult && parentResult.node && parentResult.node.children) {
+                                // 2. 获取文件名
+                                const newFileName = savedPath.split('/').pop();
+                                // 3. 检查父目录写权限
+                                if (!hasPermission(parentResult.node, 'w')) {
+                                     term.writeHtml(`<span class="term-error">nano: Parent directory not writable.</span>`);
+                                     return false;
+                                }
+                                // 4. 创建书签
+                                await new Promise(resolve => {
+                                    chrome.bookmarks.create({
+                                        parentId: parentResult.node.id,
+                                        title: newFileName,
+                                        url: savedContent // 内容作为 URL 保存
+                                    }, resolve);
+                                });
+                            } else {
+                                term.writeHtml(`<span class="term-error">nano: Directory not found: ${parentPath}</span>`);
+                                return false;
+                            }
+                        }
                     }
                     return true;
                 } catch (e) {
@@ -3581,7 +3779,6 @@ const globalCommands = {
         }
 
         if (typeof chrome !== 'undefined' && chrome.tabs) {
-            // [!! 逻辑修复 !!]
             // 默认在当前标签页打开。
             // options.n (new tab) 会在新标签页中打开。
             if (options.n) {
@@ -3645,7 +3842,6 @@ const globalCommands = {
         const queryText = args.join(' ');
 
         if (typeof chrome !== 'undefined' && chrome.search) {
-            // [!! 逻辑修复 !!]
             // 默认在当前标签页打开。
             // options.n (new tab) 会在新标签页中打开。
             const disposition = options.n ? "NEW_TAB" : "CURRENT_TAB";
@@ -3847,14 +4043,37 @@ const globalCommands = {
         try {
             switch (subCommand) {
                 case 'update':
-                    term.writeLine("Updating package lists from GitHub...");
+                    term.writeLine(`Hit:1 ${REPO_URL}index.json`);
+                    
                     const response = await fetch(REPO_URL + "index.json");
                     if (!response.ok) {
                         throw new Error(`Failed to fetch index: ${response.statusText}`);
                     }
                     const index = await response.json();
                     localStorage.setItem('apt_repo_index', JSON.stringify(index));
-                    term.writeLine("... Done.");
+
+                    // --- 模拟 Ubuntu 输出 ---
+                    const installed = JSON.parse(localStorage.getItem('installed_packages') || '{}');
+                    
+                    const allPkgsCount = Object.keys(index).length;
+                    const installedCount = Object.keys(installed).length;
+
+                    term.writeLine(`Fetched ${allPkgsCount} packages in 1s (mock data)`);
+                    term.writeLine("Reading package lists... Done");
+                    term.writeLine("Building dependency tree... Done");
+                    term.writeLine("Reading state information... Done");
+
+                    const upgradableCount = 0; // (我们尚未实现版本控制)
+
+                    if (upgradableCount > 0) {
+                        term.writeLine(`${upgradableCount} packages can be upgraded. Run 'apt list --upgradable' to see them.`);
+                    } else {
+                        term.writeLine("All packages are up to date.");
+                    }
+                    
+                    // 总是显示仓库状态，并引导用户
+                    term.writeLine(`\nFound ${allPkgsCount} available packages. ${installedCount} are installed.`);
+                    term.writeLine("Run 'apt list' to see all available packages.");
                     break;
 
                 case 'list':
@@ -4111,20 +4330,37 @@ async function executeLine(line) {
 
             // 处理 args 数组：扩展变量并剥离引号
             args = args.map(arg => {
+                let trailingChars = ''; // e.g., '/'
+
+                // 1. 剥离引号
                 if (arg.startsWith('"') && arg.endsWith('"')) {
-                    // 双引号: *先*扩展变量, *再*剥离引号
+                    // --- Case 1: 完美的双引号 "file" ---
                     arg = arg.slice(1, -1);
-                    return expandVars(arg);
+                    return expandVars(arg); // 扩展 + 剥离
+                
                 } else if (arg.startsWith("'") && arg.endsWith("'")) {
-                    // 单引号: *只*剥离引号, 不扩展
-                    return arg.slice(1, -1);
-                } else if (arg.startsWith('-')) {
-                    // 这是一个选项 (例如 -l), 不扩展
-                    return arg;
+                    // --- Case 2: 完美的单引号 'file' ---
+                    return arg.slice(1, -1); // 只剥离
+                
+                } else if (arg.startsWith('"')) {
+                    // --- Case 3: "脏"的双引号, e.g., "file"/ ---
+                    const lastQuote = arg.lastIndexOf('"');
+                    if (lastQuote > 0) {
+                        trailingChars = arg.substring(lastQuote + 1); // e.g., "/"
+                        arg = arg.substring(1, lastQuote); // e.g., "file"
+                        return expandVars(arg) + trailingChars; // 扩展 + 剥离 + 重新附加
+                    }
+                } else if (arg.startsWith("'")) {
+                    // --- Case 4: "脏"的单引号, e.g., 'file'/ ---
+                    const lastQuote = arg.lastIndexOf("'");
+                    if (lastQuote > 0) {
+                        trailingChars = arg.substring(lastQuote + 1); // e.g., "/"
+                        arg = arg.substring(1, lastQuote); // e.g., "file"
+                        return arg + trailingChars; // 不扩展 + 剥离 + 重新附加
+                    }
                 }
                 
-                // 这是一个未加引号的参数 (例如 PS1="value" 或 $LANG)
-                // (export 和 alias 命令会自己处理 KEY=VALUE)
+                // --- Case 5: 未加引号的参数 (e.g., $LANG or file)
                 return expandVars(arg);
             });
 
