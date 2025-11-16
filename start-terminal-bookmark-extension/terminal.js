@@ -331,6 +331,10 @@ class Terminal {
             // 我们什么也不做，以保留他们的选中内容。
         });
 
+        this.container.addEventListener('mousedown', () => {
+            this.focus();
+        });
+
         this.container.addEventListener('dragstart', (e) => {
             e.preventDefault();
         });
@@ -873,6 +877,7 @@ class Terminal {
                     break;
                 
                 case 'c': 
+                    e.preventDefault();
                     const lineContent = this.prompt + this.currentLine;
                     const lineWithMarker = lineContent + '^C';
                     const escapedLine = this.escapeHtml(lineWithMarker);
