@@ -43,5 +43,17 @@
     "file": "",
     "permissions": ["history"],
     "host_permissions": []
+  },
+  "json": {
+    "desc": "Pretty-prints JSON from piped input. Usage: curl ... | json",
+    "file": "json.js",
+    "permissions": [],
+    "host_permissions": []
+  },
+  "sha256": {
+    "desc": "Calculates the SHA-256 hash of a string.",
+    "file": "sha256.js",
+    "permissions": [],
+    "host_permissions": []
   }
 }
