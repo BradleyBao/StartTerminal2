@@ -200,24 +200,44 @@ class Terminal {
      * 测量单个字符的尺寸，并计算行列数
      */
     async _calculateDimensions() {
-        const tempChar = document.createElement('span');
-        tempChar.textContent = 'W'; // 使用一个标准字符进行测量
-
-        // --- 核心修复：确保测量时使用正确的字体样式 ---
-        // 1. 获取 buffer 最终应用的样式
         const bufferStyle = window.getComputedStyle(this.domBuffer);
-        // 2. 将这些样式应用到临时 span
-        tempChar.style.fontFamily = bufferStyle.fontFamily;
-        tempChar.style.fontSize = bufferStyle.fontSize; // 也最好同步字号
-        tempChar.style.lineHeight = bufferStyle.lineHeight; // 关键：同步行高
-        tempChar.style.whiteSpace = 'pre'; // 确保与 pre 行为一致
-        // --- 结束修复 ---
+        const computedLineHeight = bufferStyle.lineHeight;
+        const computedFontSize = bufferStyle.fontSize;
 
-        // 将带有正确样式的 span 添加到 DOM 以进行测量
-        // 最好添加到 buffer 内部，以确保继承环境最相似
+        if (computedLineHeight && computedFontSize) {
+            // 2. 将 line-height 转换为像素
+            if (computedLineHeight.endsWith('px')) {
+                // '18px' -> 18
+                this.cellHeight = parseFloat(computedLineHeight);
+            } else if (computedLineHeight === 'normal') {
+                // "normal" 是一个常见的默认值，通常是 1.2
+                this.cellHeight = parseFloat(computedFontSize) * 1.2;
+            } else {
+                // 它是相对单位 (e.g., '1.2' or '1.5em')
+                // 创建一个临时元素来计算它
+                const tempLine = document.createElement('div');
+                tempLine.style.padding = '0';
+                tempLine.style.margin = '0';
+                tempLine.style.lineHeight = computedLineHeight;
+                tempLine.textContent = ' '; // 需要内容
+                this.domBuffer.appendChild(tempLine);
+                this.cellHeight = tempLine.getBoundingClientRect().height;
+                this.domBuffer.removeChild(tempLine);
+            }
+        } else {
+            // 回退
+            this.cellHeight = parseFloat(computedFontSize || '14') * 1.2;
+        }
+
+        // 测量 cellWidth (这个方法仍然是正确的)
+        const tempChar = document.createElement('span');
+        tempChar.style.fontFamily = bufferStyle.fontFamily;
+        tempChar.style.fontSize = bufferStyle.fontSize;
+        tempChar.style.lineHeight = bufferStyle.lineHeight;
+        tempChar.style.whiteSpace = 'pre';
+        tempChar.textContent = 'W';
         this.domBuffer.appendChild(tempChar);
         this.cellWidth = tempChar.getBoundingClientRect().width;
-        this.cellHeight = tempChar.getBoundingClientRect().height; // 现在这个高度应该更准确
         this.domBuffer.removeChild(tempChar);
 
         // 使用准确的 cellHeight 计算行数
@@ -225,9 +245,6 @@ class Terminal {
         const containerWidth = this.container.clientWidth;
 
         this.rows = Math.floor(containerHeight / this.cellHeight);
-        // 考虑行高可能不完全等于字体高度，留一点余地可能更好
-        // this.rows = Math.max(1, Math.floor(containerHeight / this.cellHeight) -1); // 减1行试试？
-
         this.cols = Math.floor(containerWidth / this.cellWidth);
 
         // Optional : 进行微调，确保缓冲区宽度与容器宽度匹配
@@ -3310,7 +3327,6 @@ const globalCommands = {
          } else { term.writeHtml(`<span class="term-error">${t('greetUsage')}</span>`); }
      },
      'style': async (args, options) => {
-        // ... (你现有的 style 命令代码保持不变) ...
         const subCommand = args[0];
         const value = args.slice(1).join(' ');
         const rootStyle = getComputedStyle(document.documentElement);
@@ -3325,8 +3341,23 @@ const globalCommands = {
         let needsResize = false;
         switch (subCommand.toLowerCase()) {
             case 'font':
-                if (!value) { term.writeHtml(`<span class="term-error">${t('styleUsageFont')}</span>`); return; }
-                if (value.length < 3) { term.writeHtml(`<span class="term-error">${t('styleInvalidFont')} "${value}"</span>`); return; }
+                if (!value) { 
+                    // 如果用户只输入 "style font"，则显示帮助
+                    term.writeLine("Usage: style font \"<font-name>\"");
+                    term.writeLine("\nRecommended monospace fonts (must be installed on your system):");
+                    // (使用与 'help' (L1538) 命令相同的颜色 (L1453))
+                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>'Fira Code'</span> (Default, supports ligatures)");
+                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>'SF Mono'</span> (macOS, user favorite)");
+                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>'Menlo'</span> (macOS)");
+                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>'Consolas'</span> (Windows)");
+                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>'JetBrains Mono'</span> (Popular, free)");
+                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>'Courier New'</span> (Universal fallback)");
+                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>monospace</span> (Generic)");
+                    term.writeLine("\nExample: style font \"Fira Code\"");
+                    return; // 退出，不执行后续代码
+                }
+
+                if (value.length < 3) { term.writeHtml(`<span class="term-error">${t('styleInvalidSize')} "${value}"</span>`); return; }
                 document.documentElement.style.setProperty('--terminal-font-family', value);
                 term.writeLine(`${t('fontSet')} ${value}`);
                 needsResize = true;
