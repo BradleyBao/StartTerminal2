@@ -313,7 +313,7 @@ class Terminal {
     _attachListeners() {
         // 捕获所有键盘输入
         // this.inputHandler.addEventListener('keydown', (e) => this._handleKeydown(e));
-        this.inputHandler.addEventListener('keydown', (e) => this._masterKeydownHandler(e));
+        window.addEventListener('keydown', (e) => this._masterKeydownHandler(e));
         // 捕获中文输入法 (IME) 或粘贴
         this.inputHandler.addEventListener('input', (e) => this._handleInput(e));
         // 点击终端时，始终聚焦到隐藏的输入框
@@ -327,6 +327,7 @@ class Terminal {
             if (selection.isCollapsed || !this.container.contains(selection.anchorNode)) {
                 this.focus();
             }
+            
             // 如果用户拖拽选择了文本 (selection.isCollapsed 为 false)，
             // 我们什么也不做，以保留他们的选中内容。
         });
@@ -373,10 +374,13 @@ class Terminal {
                 }
             // (从 _handleKeydown 复制字符输入逻辑)
             } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+                e.preventDefault();
                 const pos = this.cursorX - this.prompt.length;
                 const char = e.key;
                 this.currentLine = this.currentLine.substring(0, pos) + char + this.currentLine.substring(pos);
                 this.cursorX++;
+                this.focus();
+                return;
             }
             
             this._render(); // 渲染 Y/n 的输入
@@ -876,17 +880,30 @@ class Terminal {
                     this.cursorX = this.prompt.length;
                     break;
                 
-                case 'c': 
-                    e.preventDefault();
-                    const lineContent = this.prompt + this.currentLine;
-                    const lineWithMarker = lineContent + '^C';
-                    const escapedLine = this.escapeHtml(lineWithMarker);
-                    const padding = ' '.repeat(Math.max(0, this.cols - lineWithMarker.length));
-                    this.buffer[this.cursorY] = escapedLine + padding;
-                    this._handleNewline();
-                    this.currentLine = '';
-                    bookmarkSystem.update_user_path();
-                    this.enableInput();
+                case 'c':
+                    if (e.shiftKey) {
+                        // --- 这是 Ctrl+Shift+C (复制) ---
+                        e.preventDefault();
+                        const selection = window.getSelection();
+                        const selectedText = selection.toString();
+                        if (selectedText) {
+                            navigator.clipboard.writeText(selectedText);
+                        }
+                        // 我们不中断，也不清除选区
+                    } else {
+                        // --- 这是 Ctrl+C (中断) ---
+                        e.preventDefault(); 
+                        
+                        const lineContent = this.prompt + this.currentLine;
+                        const lineWithMarker = lineContent + '^C'; 
+                        const escapedLine = this.escapeHtml(lineWithMarker);
+                        const padding = ' '.repeat(Math.max(0, this.cols - lineWithMarker.length));
+                        this.buffer[this.cursorY] = escapedLine + padding;
+                        this._handleNewline();
+                        this.currentLine = ''; 
+                        bookmarkSystem.update_user_path();
+                        this.enableInput();
+                    }
                     break;
 
                 case 'arrowleft': 
