@@ -114,6 +114,16 @@ function getVisualLength(str) {
     return length;
 }
 
+function escapePath(str) {
+    // 只转义空格，因为这是 parseSingleCommand (L1740) 所关心的
+    return str.replace(/ /g, '\\ ');
+}
+
+function unescapePath(str) {
+    // (这个简单的版本只处理转义的空格)
+    return str.replace(/\\ /g, ' '); 
+}
+
 /**
  * 核心终端模拟器类
  */
@@ -1105,7 +1115,7 @@ class NanoEditor {
         this.cursorY = 0;   // 光标在文件中的行号
         this.cursorX = 0;   // 光标在文件中的列号
         this.topRow = 0;    // 屏幕上显示的第一行文件
-        this.status = "Press ^X to Exit" + (this.isReadOnly ? "" : ", ^O to Save")
+        this.status = t('nanoExit') + (this.isReadOnly ? "" : `, ${t('nanoSave')}`);
         this.dirty = false; // 是否有未保存的修改
         this.termRows = term.rows;
         this.termCols = term.cols;
@@ -1156,8 +1166,8 @@ class NanoEditor {
         this.term._initBuffer(); // 清空 term.buffer
 
         // 1. 绘制顶栏
-        const roText = this.isReadOnly ? ' [ Read Only ]' : '';
-        const topBar = `Nano 1.0 | File: ${this.filePath} ${this.dirty ? '*' : ''}${roText}`;
+        const roText = this.isReadOnly ? ` ${t('nanoReadOnly')}` : '';
+        const topBar = `${t('nanoTitle')} ${this.filePath} ${this.dirty ? '*' : ''}${roText}`;
         this.term.buffer[0] = this._padLine(topBar, true);
 
         // 2. 绘制文本区域
@@ -1223,7 +1233,7 @@ class NanoEditor {
             switch (e.key.toLowerCase()) {
                 case 'x':
                     if (this.dirty) {
-                        this.status = "File is modified. Save? (Y/N)";
+                        this.status = t('nanoStatusModified');
                         // (简易版：我们直接退出)
                         this.term.exitFullScreenApp();
                         this.onExit();
@@ -1234,7 +1244,7 @@ class NanoEditor {
                     return; // 退出，不重绘
                 case 'o':
                     if (this.isReadOnly) {
-                        this.status = "File is read-only";
+                        this.status = t('nanoStatusReadOnly');
                         this._render(); // 重新渲染以显示状态
                         return; // 阻止调用 _save()
                     }
@@ -1245,7 +1255,7 @@ class NanoEditor {
             const isEditKey = ['Backspace', 'Enter'].includes(e.key) || 
                               (e.key.length === 1 && !e.ctrlKey && !e.metaKey);
             if (this.isReadOnly && isEditKey) {
-                this.status = "File is read-only"; // (可选) 再次提醒
+                this.status = t('nanoStatusReadOnly'); // (可选) 再次提醒
                 this._render(); // 重新渲染以显示状态
                 return; // 阻止所有编辑键
             }
@@ -1331,10 +1341,10 @@ class NanoEditor {
             const success = this.onSave(this.filePath, content);
             if (success) {
                 this.dirty = false;
-                this.status = `File saved! (${content.length} bytes)`;
+                this.status = t('nanoStatusSaved').replace('{0}', content.length);
             } else {
                 if (this.status === "Saving...") {
-                    this.status = "Error: Could not save file.";
+                    this.status = t('nanoStatusSaveError');
                 }
             }
         } catch (e) {
@@ -1450,6 +1460,7 @@ class BookmarkSystem {
                     // 长列表格式
                     for (const child of children) {
                         const meta = getMetadata(child);
+                        
                         const isDir = !!child.children;
                         const modeStr = formatMode(meta.mode, isDir);
                         const links = 1;
@@ -1458,9 +1469,16 @@ class BookmarkSystem {
                         const size = 0; // (大小对书签没有意义)
                         const date = new Date(child.dateAdded || Date.now()).toLocaleDateString('en-US', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 
-                        const name = isDir ? `<span class="term-folder">${child.title}/</span>` : child.title;
+                        let name = child.title.trim(); //
+                        // const isDir = !!child.children;
                         
-                        this.term.writeHtml(`${modeStr} ${links} ${owner} ${group} ${String(size).padStart(6)} ${date} ${name}`);
+                        if (name.includes(' ')) {
+                            name = escapePath(name); // e.g., Hello\ World
+                        }
+                        
+                        const nameHtml = isDir ? `<span class="term-folder">${this.term.escapeHtml(name)}/</span>` : this.term.escapeHtml(name);
+                        
+                        this.term.writeHtml(`${modeStr} ${links} ${owner} ${group} ${String(size).padStart(6)} ${date} ${nameHtml}`);
                     }
                 } else {
                     if (children.length === 0) return;
@@ -1468,9 +1486,17 @@ class BookmarkSystem {
                     // 1. 格式化所有名称并找到最大宽度 (保持不变)
                     let maxNameWidth = 0;
                     const formattedNames = children.map(child => {
-                        const title = child.title.trim();
+                        const title = child.title.trim(); // 1. 获取 RAW title
                         const isDir = !!child.children;
-                        const visualLen = getVisualLength(title) + (isDir ? 1 : 0);
+                        
+                        // 2. 创建用于输出和计算的转义标题
+                        let outputTitle = title;
+                        if (title.includes(' ')) {
+                            outputTitle = escapePath(title);
+                        }
+                        
+                        // 3. 基于 *转义后* 的标题计算 visualLen
+                        const visualLen = getVisualLength(outputTitle) + (isDir ? 1 : 0);
                         let html;
                         if (isDir) {
                             html = `<span class="term-folder">${this.term.escapeHtml(title)}/</span>`;
@@ -1549,7 +1575,7 @@ class BookmarkSystem {
                     }
                     
                     if (!hasPermission(parentResult.node, 'w')) {
-                        this.term.writeHtml(`<span class="term-error">mkdir: ${parentPath}: Permission denied</span>`);
+                        this.term.writeHtml(`<span class="term-error">mkdir: ${parentPath}: ${t('permissionDenied')}</span>`);
                         continue;
                     }
 
@@ -1584,7 +1610,7 @@ class BookmarkSystem {
 
                     // 添加权限检查
                     if (!hasPermission(target, 'w')) {
-                        this.term.writeHtml(`<span class="term-error">rmdir: ${path}: Permission denied</span>`);
+                        this.term.writeHtml(`<span class="term-error">rmdir: ${path}: ${t('permissionDenied')}</span>`);
                         continue;
                     }
                     if (!target.children) {
@@ -1602,7 +1628,7 @@ class BookmarkSystem {
             
             'rm': async (args, options) => {
                 if (args.length === 0) {
-                    term.writeHtml(`<span class="term-error">rm: missing operand</span>`);
+                    term.writeHtml(`<span class="term-error">${t('missingOperand')}</span>`);
                     return;
                 }
                 
@@ -1640,7 +1666,7 @@ class BookmarkSystem {
                     for (const target of targets) {
                         // 权限检查
                         if (!hasPermission(target, 'w')) {
-                            term.writeHtml(`<span class="term-error">rm: cannot remove '${target.title}': Permission denied</span>`);
+                            term.writeHtml(`<span class="term-error">rm: ${t('cannotRemove').replace('{0}', target.title)}: ${t('permissionDenied')}</span>`);
                             continue; // 跳过这个文件
                         }
                         
@@ -1648,7 +1674,7 @@ class BookmarkSystem {
                         if (target.id.startsWith('vfs-bin-')) {
                             deleteVfsScript(target.title);
                             this.vfsBin.children = this.vfsBin.children.filter(c => c.id !== target.id);
-                            term.writeLine(`Removed VFS script: ${target.title}`);
+                            term.writeLine(t('rmVfsSuccess').replace('{0}', target.title));
                             continue; // 跳过 VFS 文件
                         }
 
@@ -1682,7 +1708,7 @@ class BookmarkSystem {
                     term.writeHtml(`<span class="term-error">mv: missing destination</span>`); return;
                 }
                 const sourcePath = args[0];
-                const destPath = args[1];
+                let destPath = args[1];
 
                 const sourceResult = this._findNodeByPath(sourcePath); //
                 if (!sourceResult || !sourceResult.node) {
@@ -1692,7 +1718,7 @@ class BookmarkSystem {
 
                 // 1. 检查源权限
                 if (!hasPermission(sourceNode, 'w')) { //
-                    term.writeHtml(`<span class="term-error">mv: cannot move '${sourcePath}': Permission denied</span>`); return;
+                    term.writeHtml(`<span class="term-error">mv: cannot move '${sourcePath}': ${t('permissionDenied')}</span>`); return;
                 }
 
                 // 2. 查找目标
@@ -1730,18 +1756,32 @@ class BookmarkSystem {
                     destParentNode = destNode;
                     destTitle = sourceNode.title; // 保持原名
                 } else if (!destNode) {
-                    // 2. 目标不存在: 移动并重命名
-                    const lastSlash = destPath.lastIndexOf('/');
-                    // 使用 '.' (当前目录) 作为相对路径的父级
-                    const parentPath = (lastSlash > -1) ? destPath.substring(0, lastSlash) : '.'; 
-                    const newTitle = (lastSlash > -1) ? destPath.substring(lastSlash + 1) : destPath;
+                    // --- 目标不存在: 移动并重命名 ---
                     
-                    const parentResult = this._findNodeByPath(parentPath);
-                    if (parentResult && parentResult.node && parentResult.node.children) {
-                        destParentNode = parentResult.node;
-                        destTitle = newTitle;
+                    // 1. 在解析路径之前，先修剪目标路径末尾的 /
+                    if (destPath.endsWith('/') && destPath.length > 1) {
+                        destPath = destPath.slice(0, -1);
+                    }
+
+                    // 2. 现在安全地检查 /
+                    const lastSlash = destPath.lastIndexOf('/');
+                    
+                    if (lastSlash > -1) {
+                        // --- Case 2a: 目标是*新路径* (e.g., mv file /bin/newfile) ---
+                        const parentPath = destPath.substring(0, lastSlash) || '/';
+                        const newTitle = destPath.substring(lastSlash + 1);
+                        
+                        const parentResult = this._findNodeByPath(parentPath);
+                        if (parentResult && parentResult.node && parentResult.node.children) {
+                            destParentNode = parentResult.node;
+                            destTitle = newTitle;
+                        } else {
+                            term.writeHtml(`<span class="term-error">mv: destination path not found: ${parentPath}</span>`); return;
+                        }
                     } else {
-                        term.writeHtml(`<span class="term-error">mv: destination path not found: ${parentPath}</span>`); return;
+                        // --- Case 2b: 目标是*重命名* (e.g., mv file1 "new name") ---
+                        destParentNode = this.current; // 父目录是当前目录
+                        destTitle = destPath; // 目标路径 (L1156) 就是新标题
                     }
                 } else {
                     term.writeHtml(`<span class="term-error">mv: destination is not a directory: ${destPath}</span>`); return;
@@ -1750,7 +1790,7 @@ class BookmarkSystem {
                 if (destParentNode) {
                     // 检查目标父目录权限
                     if (!hasPermission(destParentNode, 'w')) {
-                         term.writeHtml(`<span class="term-error">mv: cannot write to destination: Permission denied</span>`); return;
+                         term.writeHtml(`<span class="term-error">mv: cannot write to destination: ${t('permissionDenied')}</span>`); return;
                     }
                     
                     const needsMove = sourceNode.parentId !== destParentNode.id;
@@ -1812,7 +1852,7 @@ class BookmarkSystem {
                     }
                     
                     if (!hasPermission(parentResult.node, 'w')) {
-                        term.writeHtml(`<span class="term-error">touch: cannot touch '${path}': Permission denied</span>`);
+                        term.writeHtml(`<span class="term-error">touch: cannot touch '${path}': ${t('permissionDenied')}</span>`);
                         continue;
                     }
 
@@ -1849,7 +1889,7 @@ class BookmarkSystem {
                     term.writeHtml(`<span class="term-error">cp: missing destination</span>`); return;
                 }
                 const sourcePath = args[0];
-                const destPath = args[1];
+                let destPath = args[1];
 
                 const sourceResult = this._findNodeByPath(sourcePath); //
                 if (!sourceResult || !sourceResult.node) {
@@ -1859,7 +1899,7 @@ class BookmarkSystem {
                 
                 // 1. 检查源 'r' 权限
                 if (!hasPermission(sourceNode, 'r')) { //
-                    term.writeHtml(`<span class="term-error">cp: cannot read '${sourcePath}': Permission denied</span>`); return;
+                    term.writeHtml(`<span class="term-error">cp: cannot read '${sourcePath}': ${t('permissionDenied')}</span>`); return;
                 }
                 
                 // 2. 查找目标
@@ -1873,14 +1913,29 @@ class BookmarkSystem {
                     destParentNode = destNode;
                     // newName 保持 null, _copyRecursive 将使用原名
                 } else if (!destNode) {
-                    // Case 2: cp file newfile (目标是新路径)
-                    const lastSlash = destPath.lastIndexOf('/');
-                    const parentPath = (lastSlash > -1) ? destPath.substring(0, lastSlash) : '.'; // 使用 '.' (当前)
-                    newName = (lastSlash > -1) ? destPath.substring(lastSlash + 1) : destPath;
+                    // --- Case 2: cp file newfile (目标是新路径) ---
                     
-                    const parentResult = this._findNodeByPath(parentPath);
-                    if (parentResult && parentResult.node && parentResult.node.children) {
-                        destParentNode = parentResult.node; // [!!] 直接存储找到的父节点
+                    // 1. 在解析路径之前，先修剪目标路径末尾的 /
+                    if (destPath.endsWith('/') && destPath.length > 1) {
+                        destPath = destPath.slice(0, -1);
+                    }
+
+                    // 2. 现在安全地检查 /
+                    const lastSlash = destPath.lastIndexOf('/');
+                    
+                    if (lastSlash > -1) {
+                        // --- Case 2a: 目标是*新路径* (e.g., cp file /bin/newfile) ---
+                        const parentPath = destPath.substring(0, lastSlash) || '/';
+                        newName = destPath.substring(lastSlash + 1); // newName 在 L1188 已被定义
+                        
+                        const parentResult = this._findNodeByPath(parentPath);
+                        if (parentResult && parentResult.node && parentResult.node.children) {
+                            destParentNode = parentResult.node;
+                        }
+                    } else {
+                        // --- Case 2b: 目标是*重命名* (e.g., cp file1 "new file") ---
+                        destParentNode = this.current; //
+                        newName = destPath; // 目标路径 (L1179) 就是新标题
                     }
                 }
                 
@@ -1890,7 +1945,7 @@ class BookmarkSystem {
                 
                 // 3. 检查目标 'w' 权限 (直接使用节点)
                 if (!hasPermission(destParentNode, 'w')) {
-                    term.writeHtml(`<span class="term-error">cp: cannot write to '${destPath}': Permission denied</span>`); return;
+                    term.writeHtml(`<span class="term-error">cp: cannot write to '${destPath}': ${t('permissionDenied')}</span>`); return;
                 }
 
                 // --- Case A: VFS 脚本复制 (仅 /bin) ---
@@ -2080,6 +2135,10 @@ class BookmarkSystem {
 
     _findNodeByPath(pathStr) {
         if (!pathStr || !this.root || !this.homeDirNode) return null;
+
+        if (pathStr.endsWith('/') && pathStr.length > 1) {
+            pathStr = pathStr.slice(0, -1);
+        }
 
         if (pathStr === '.') {
             return { node: this.current, newPathArray: [...this.path] };
@@ -2307,9 +2366,9 @@ function arraysAreEqual(arr1, arr2) {
 function handleTabCompletion(line, pos) {
     const currentTime = Date.now();
     
-    // 1. 找出光标前的所有 token
+    // 1. 找出 token
     const lineUpToCursor = line.substring(0, pos);
-    const tokens = lineUpToCursor.split(' ').filter(Boolean);
+    const tokens = lineUpToCursor.match(/(?:"[^"]*"|'[^']*'|(?:\\ |[^\s"'])+)/g) || [];
     const tokenCount = tokens.length;
     
     let isCompletingFirstWord = false;
@@ -2320,73 +2379,71 @@ function handleTabCompletion(line, pos) {
     let tokenStartIndex = 0;
     
     if (line.endsWith(' ')) {
-        // 光标在空格后 -> 准备补全下一个 token
         tokenToComplete = "";
         tokenStartIndex = pos;
-    } else {
-        // 光标在一个 token 中间
-        tokenToComplete = tokens[tokens.length - 1] || "";
+    } else if (tokenCount > 0) {
+        tokenToComplete = tokens[tokens.length - 1];
         tokenStartIndex = lineUpToCursor.lastIndexOf(tokenToComplete);
+    } else {
+        tokenToComplete = "";
+        tokenStartIndex = 0;
     }
 
-    const command = tokens[0] || "";
+    const command = (tokens[0] ? unescapePath(tokens[0]) : ""); // [!!] Unescape (L1751) command
 
     // 2. 决定要补全什么
     if (tokenCount === 0 || (tokenCount === 1 && !line.endsWith(' '))) {
         isCompletingFirstWord = true;
     } else if (subCommandCompletions.hasOwnProperty(command) && (tokenCount === 1 || (tokenCount === 2 && !line.endsWith(' ')))) {
-        // 如果命令在我们的 map 中，并且我们在补全第二个词
         if (subCommandCompletions[command].length > 0) {
             isCompletingSubCommand = true;
         } else {
-            isCompletingPath = true; // e.g., 'cd ' (map 为 [])
+            isCompletingPath = true; 
         }
     } else {
-        isCompletingPath = true; // 默认补全路径
+        isCompletingPath = true;
     }
 
     // 3. 查找匹配项
     let matches = [];
-    let completionPrefix = ''; // 用于路径 (e.g., /bin/)
-
+    let completionPrefix = ''; 
     let partial = "";
     
     if (isCompletingFirstWord) {
         const allCommands = getAllCommandNames();
         matches = allCommands.filter(cmd => cmd.startsWith(tokenToComplete)).map(cmd => ({ title: cmd }));
-        partial = tokenToComplete; // [!! 2. 赋值 (而不是声明) !!]
+        partial = tokenToComplete;
         
     } else if (isCompletingSubCommand) {
         matches = subCommandCompletions[command].filter(cmd => cmd.startsWith(tokenToComplete)).map(cmd => ({ title: cmd }));
-        partial = tokenToComplete; // [!! 3. 赋值 (而不是声明) !!]
+        partial = tokenToComplete;
     
     } else if (isCompletingPath) {
-        // --- 使用现有的文件补全逻辑 ---
-        let isQuoted = false;
-        let searchToken = tokenToComplete;
-        if (searchToken.startsWith('"')) {
-            isQuoted = true;
-            searchToken = searchToken.substring(1);
-        }
-
+        // [!! 核心修复：移除所有 'isQuoted' (L1352) 逻辑 !!]
+        
+        // 1. Unescape (L1751) 整个 token
+        let searchToken = unescapePath(tokenToComplete); // e.g., "Hello\ Wor" -> "Hello Wor"
+        
+        // 2. 查找 /
         const lastSlash = searchToken.lastIndexOf('/');
         if (lastSlash > -1) {
-            completionPrefix = searchToken.substring(0, lastSlash + 1);
-            partial = searchToken.substring(lastSlash + 1); // [!!] (L1362: 赋值, 保持不变)
-            const result = bookmarkSystem._findNodeByPath(completionPrefix);
+            completionPrefix = searchToken.substring(0, lastSlash + 1); // e.g., "Hello World/"
+            partial = searchToken.substring(lastSlash + 1); // e.g., "H"
+            
+            // 3. 查找父节点 (L1195)
+            const result = bookmarkSystem._findNodeByPath(completionPrefix); 
             if (result && result.node && result.node.children) {
                 matches = result.node.children.filter(child => child.title.trim().startsWith(partial));
             }
         } else {
-            partial = searchToken; // [!!] (L1370: 赋值, 保持不变)
+            partial = searchToken; // e.g., "Hello Wor"
             if (bookmarkSystem.current && bookmarkSystem.current.children) {
                 matches = bookmarkSystem.current.children.filter(child => child.title.trim().startsWith(partial));
             }
         }
-        // (文件补全逻辑现在嵌套在这里)
     }
 
-    // --- 4. [新] 补全逻辑 (通用) ---
+    // --- 4. 补全逻辑 (使用 escapePath) ---
     if (matches.length === 0) {
         lastTabMatches = []; return;
     }
@@ -2399,23 +2456,21 @@ function handleTabCompletion(line, pos) {
         lastTabMatches = [];
         const match = matches[0];
         let matchName = match.title.trim();
-        let completion = completionPrefix + matchName;
         
-        if (match.children) completion += '/'; // 目录
+        let completion = completionPrefix + matchName; // e.g., Hello World/Hello World 2
+        let trailingChar = ' ';
 
-        // [!!] 处理空格和引号 [!!]
-        if (completion.includes(' ') && (isCompletingPath && !tokenToComplete.startsWith('"'))) {
-            if (match.children) {
-                completion = `"${completion.slice(0, -1)}"\/`; // "My Dir"/
-            } else {
-                completion = `"${completion}"`; // "My File"
-            }
+        if (match.children) {
+            completion += '/'; // e.g., Hello World/Hello World 2/
+            trailingChar = ''; 
+        }
+
+        // [!!] 在补全时 Escape [!!]
+        if (completion.includes(' ')) {
+            completion = escapePath(completion);
         }
         
-        // 如果不是目录，在末尾添加一个空格
-        if (!match.children) {
-            completion += ' ';
-        }
+        completion += trailingChar;
         
         const newLine = textBeforeToken + completion + textAfterCursor;
         const newCursorPos = (textBeforeToken + completion).length;
@@ -2423,15 +2478,16 @@ function handleTabCompletion(line, pos) {
 
     } else {
         // 4b. 多个匹配项：
-        const lcp = findLCP(matches);
+        const lcp = findLCP(matches); // (L1284) (LCP (L1284) 是 raw text, e.g., "Hello World")
 
         if (lcp.length > partial.length) {
             // 我们可以补全更多 (LCP)
             lastTabMatches = [];
             let completion = completionPrefix + lcp;
             
-            if (completion.includes(' ') && (isCompletingPath && !tokenToComplete.startsWith('"'))) {
-                completion = `"${completion}`;
+            // [!!] 在补全时 Escape [!!]
+            if (completion.includes(' ')) {
+                completion = escapePath(completion);
             }
             
             const newLine = textBeforeToken + completion + textAfterCursor;
@@ -2439,30 +2495,32 @@ function handleTabCompletion(line, pos) {
             term.setCommand(newLine, newCursorPos);
 
         } else {
-            // 4c. 无法进一步补全 (LCP === partial)。检查双击。
+            // 4c. 无法进一步补全 (LCP (L1284) === partial)。检查双击。
             const isDoubleTap = (currentTime - lastTabTime < 500);
             
-            // (注意: 'arraysAreEqual' 依赖 'id'，
-            // 我们的新 'matches' 数组 (用于命令) 没有 'id'，所以这个检查可能会失败)
-            // (为了简单起见，我们暂时忽略 'arraysAreEqual' 检查)
-
-            if (isDoubleTap) {
+            // [!!] 修复 'arraysAreEqual' (L1291)
+            const currentMatchIds = matches.map(m => m.id || m.title);
+            const lastMatchIds = lastTabMatches.map(m => m.id || m.title);
+            
+            if (isDoubleTap && arraysAreEqual(currentMatchIds, lastMatchIds)) {
                 // 列出所有选项
                 term._handleNewline(); 
                 const output = matches.map(m => {
                     let title = m.title.trim();
-                    if (title.includes(' ')) title = `"${title}"`;
+                    if (title.includes(' ')) {
+                        title = escapePath(title); // [!!] 使用 Escape
+                    }
                     return m.children ? `${title}/` : title;
                 }).join('   ');
                 
                 term.writeHtml(output); 
                 
                 bookmarkSystem.update_user_path(); 
-                term.setCommand(line, pos); // 恢复当前行
+                term.setCommand(line, pos);
                 
                 lastTabMatches = [];
             } else {
-                lastTabMatches = matches.map(m => ({ id: m.title, title: m.title })); // 存储一个可比较的格式
+                lastTabMatches = matches; 
             }
         }
     }
@@ -2791,7 +2849,7 @@ const globalCommands = {
 
         const meta = getMetadata(result.node);
         if (!(meta.mode & 0o100)) { // 0o100 = U_EXEC
-             term.writeHtml(`<span class="term-error">startsh: permission denied: ${path}</span>`);
+             term.writeHtml(`<span class="term-error">startsh: ${t('permissionDenied')}: ${path}</span>`);
              return;
         }
 
@@ -2818,7 +2876,7 @@ const globalCommands = {
         }
 
         if (!hasPermission(result.node, 'x')) {
-             term.writeHtml(`<span class="term-error">startsh: permission denied: ${path}</span>`);
+             term.writeHtml(`<span class="term-error">startsh: ${t('permissionDenied')}: ${path}</span>`);
              return;
         }
 
@@ -3635,7 +3693,7 @@ const globalCommands = {
                     // (权限检查保持不变)
                     if (node) { 
                         if (!hasPermission(node, 'w')) {
-                            term.writeHtml(`<span class="term-error">Error: Permission denied.</span>`); 
+                            term.writeHtml(`<span class="term-error">Error: ${t('permissionDenied')}</span>`); 
                             return false; // [!!] 1. 返回 false
                         }
                     } else {
@@ -4089,13 +4147,13 @@ const globalCommands = {
                     break;
                 
                 case 'install':
-                    if (!pkgName) { term.writeLine("Usage: sudo apt install <package>"); return; }
+                    if (!pkgName) { term.writeHtml(`<span class="term-error">${t('aptInstallUsage')}</span>`); return; }
                     
                     const repoIndex = JSON.parse(localStorage.getItem('apt_repo_index') || '{}');
                     const pkg = repoIndex[pkgName];
 
                     if (!pkg) {
-                        term.writeLine(`E: Unable to locate package ${pkgName}`);
+                        term.writeHtml(`<span class="term-error">${t('aptPkgNotFound').replace('{0}', pkgName)}</span>`);
                         return;
                     }
 
@@ -4122,9 +4180,9 @@ const globalCommands = {
                     }
 
                     if (needsPerms) {
-                        const answer = await term.readInput("Do you want to continue? [Y/n]");
+                        const answer = await term.readInput(t('aptConfirm'));
                         if (answer !== 'y' && answer !== '') {
-                            term.writeLine("Install aborted.");
+                            term.writeLine(t('aptAbort'));
                             return;
                         }
                         
@@ -4140,7 +4198,7 @@ const globalCommands = {
                     
                     // [!! 4. 安装 (如果 file 存在) !!]
                     if (pkg.file) {
-                        term.writeLine(`Fetching ${pkgName} from ${pkg.file}...`);
+                        term.writeLine(t('aptFetch').replace('{0}', pkgName).replace('{1}', pkg.file));
                         const codeResponse = await fetch(REPO_URL + pkg.file);
                         if (!codeResponse.ok) {
                             throw new Error(`Failed to fetch package code: ${codeResponse.statusText}`);
@@ -4195,7 +4253,7 @@ function parseLine(line) {
 }
 
 function parseSingleCommand(commandStr) {
-    const tokens = commandStr.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g);
+    const tokens = commandStr.match(/(?:"[^"]*"|'[^']*'|(?:\\ |[^\s"'])+)/g);
     if (!tokens || tokens.length === 0) { return null; }
     const commandName = tokens[0];
     const args = [];
@@ -4328,6 +4386,11 @@ async function executeLine(line) {
                 return expanded;
             };
 
+            const unescape = (str) => {
+                // (这个简单的版本只处理转义的空格)
+                return str.replace(/\\ /g, ' '); 
+            };
+
             // 处理 args 数组：扩展变量并剥离引号
             args = args.map(arg => {
                 let trailingChars = ''; // e.g., '/'
@@ -4361,11 +4424,11 @@ async function executeLine(line) {
                 }
                 
                 // --- Case 5: 未加引号的参数 (e.g., $LANG or file)
+                arg = unescapePath(arg);
                 return expandVars(arg);
             });
 
-            command = expandVars(command);
-
+            command = unescapePath(expandVars(command));
             // Check alias
             if (AliasEnvironment[command]) {
                 const aliasContent = AliasEnvironment[command];
@@ -4396,7 +4459,7 @@ async function executeLine(line) {
                     commandFunc = globalCommands.sh;
                     args.unshift(command);
                 } else {
-                    term.writeHtml(`<span class="term-error">startsh: permission denied: ${command}</span>`);
+                    term.writeHtml(`<span class="term-error">startsh: ${t('permissionDenied')}: ${command}</span>`);
                     isPiping = false; break;
                 }
             }
@@ -4417,7 +4480,7 @@ async function executeLine(line) {
                         // 将其作为 sh /bin/welcome arg1 arg2 ... 执行
                         args.unshift(vfsPath); 
                     } else {
-                        term.writeHtml(`<span class="term-error">startsh: permission denied: ${vfsPath}</span>`);
+                        term.writeHtml(`<span class="term-error">startsh: ${t('permissionDenied')}: ${vfsPath}</span>`);
                         isPiping = false; 
                         break;
                     }
@@ -4444,7 +4507,7 @@ async function executeLine(line) {
                 }
             } else if (sandboxPkg) {
                 // --- B. 执行沙盒命令 ---
-                term.writeHtml(`<span style="color:gray;">[Executing sandboxed script: ${command}]</span>`);
+                term.writeHtml(`<span style="color:gray;">${t('sandboxExec').replace('{0}', command)}</span>`);
                 // lastOutput (pipedInput) 会被传递
                 const result = await term.executeInSandbox(sandboxPkg.code, args, lastOutput);
                 lastOutput = result; // "result" 是从 sandbox.js 返回的
@@ -4476,7 +4539,7 @@ async function main() {
     // Load Settings 
     loadStyleSettings();
 
-    term.writeLine("ST 2.0 Booting..."); // 1.
+    term.writeLine(t('bootProgress'));
 
     // 2. [!!] 初始化终端 (清空缓冲区) [!!]
     // 必须在任何 .startrc 打印之前运行

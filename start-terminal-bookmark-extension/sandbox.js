@@ -32,7 +32,7 @@ window.addEventListener('message', (event) => {
         // [!! 核心修复：添加 'return' !!]
         // 我们必须 explicitly 'return' 脚本的结果,
         // 这样 'result' 才能捕获到 async IIFE 返回的 Promise
-        const userFunction = new Function('st_api', 'args', 'pipedInput', `return ${scriptString}`);
+        const userFunction = new Function('st_api', 'args', 'pipedInput', scriptString);
         
         // 4. 执行函数
         const result = userFunction(st_api, args, pipeInput);
