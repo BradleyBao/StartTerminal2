@@ -810,11 +810,11 @@ class Terminal {
                     break;
                 
                 case 'c': 
-                    const fullLineText = this.prompt + this.currentLine;
-                    const escapedLine = this.escapeHtml(fullLineText);
-                    const padding = ' '.repeat(Math.max(0, this.cols - fullLineText.length));
+                    const lineContent = this.prompt + this.currentLine;
+                    const lineWithMarker = lineContent + '^C';
+                    const escapedLine = this.escapeHtml(lineWithMarker);
+                    const padding = ' '.repeat(Math.max(0, this.cols - lineWithMarker.length));
                     this.buffer[this.cursorY] = escapedLine + padding;
-                    this.buffer[this.cursorY] += this.escapeHtml('^C');
                     this._handleNewline();
                     this.currentLine = '';
                     bookmarkSystem.update_user_path();
