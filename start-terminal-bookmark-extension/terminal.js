@@ -789,6 +789,21 @@ class Terminal {
         // this._render();
     }
 
+    _writeLogLine(text) {
+            const oldPiping = isPiping;
+            isPiping = false; // 暂时禁用管道
+            this.writeLine(text); // 调用常规的 writeLine (L432)
+            isPiping = oldPiping; // 恢复管道状态
+    }
+
+    _writeLogHtml(html) {
+            const oldPiping = isPiping;
+            isPiping = false; // 暂时禁用管道
+            this.writeHtml(html); // 调用常规的 writeHtml (L602)
+            this._handleNewline(); // writeHtml (L602) 不再自动换行，我们补上
+            isPiping = oldPiping; // 恢复管道状态
+    }
+
     disableInput() {
         this.inputDisabled = true;
         this._render(); // 重绘以隐藏光标
@@ -3374,7 +3389,7 @@ const globalCommands = {
     'curl': async (args, options, pipedInput) => {
         const url = args[0];
         if (!url) {
-            term.writeHtml('<span class="term-error">Usage: curl <url></span>');
+            term.writeHtml(`<span class="term-error">${t('curlUsage')}</span>`);
             return;
         }
 
@@ -3384,25 +3399,31 @@ const globalCommands = {
         });
 
         if (!hasPermission) {
-            term.writeHtml(`<span class="term-error">Permission to access all URLs denied.</span>`);
-            term.writeHtml(`<span class="term-error">Try: sudo apt install curl</span>`);
+            // 使用 _writeLogHtml
+            term._writeLogHtml(`<span class="term-error">${t('curlPermDenied')}</span>`);
+            term._writeLogHtml(`<span class="term-error">${t('curlPermTry')}</span>`);
             return;
         }
 
         try {
-            term.writeLine(`Fetching ${url}...`);
+            // 使用 _writeLogLine
+            term._writeLogLine(t('curlProgress').replace('{0}', url)); // 写入 stderr
+            
             const response = await fetch(url, { cache: 'no-store', mode: 'cors' });
             
             if (!response.ok) {
-                throw new Error(`HTTP error! status: ${response.status}`);
+                throw new Error(t('curlHttpError').replace('{0}', response.status));
             }
             
             const text = await response.text();
-            term.writeLine(text); // 打印纯文本响应
-            return text.split('\n'); // 返回给管道
+            
+            // 写入 stdout / 管道
+            term.writeLine(text); 
+            return text.split('\n'); //
             
         } catch(e) {
-            term.writeHtml(`<span class="term-error">${e.message}</span>`);
+            // [!! 核心修复：使用 _writeLogHtml (L629) !!]
+            term._writeLogHtml(`<span class="term-error">${e.message}</span>`); // 写入 stderr
         }
     },
 
@@ -4506,11 +4527,11 @@ async function executeLine(line) {
                     lastOutput = result;
                 }
             } else if (sandboxPkg) {
-                // --- B. 执行沙盒命令 ---
-                term.writeHtml(`<span style="color:gray;">${t('sandboxExec').replace('{0}', command)}</span>`);
+                term._writeLogHtml(`<span style="color:gray;">${t('sandboxExec').replace('{0}', command)}</span>`);
+                
                 // lastOutput (pipedInput) 会被传递
                 const result = await term.executeInSandbox(sandboxPkg.code, args, lastOutput);
-                lastOutput = result; // "result" 是从 sandbox.js 返回的
+                lastOutput = result; // "result" 是从 sandbox.js 返回的输出数组
             
             } else if (command.trim() !== '') {
                 // --- C. 命令未找到 ---
