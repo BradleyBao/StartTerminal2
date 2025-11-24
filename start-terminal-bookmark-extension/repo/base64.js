@@ -1,13 +1,15 @@
 try {
-    const isDecode = args.includes('-d') || args.includes('--decode');
+    // 直接从 options 对象读取，不再解析 args
+    // terminal.js 已经帮你把 -d 解析成 options.d = true 了
+    const isDecode = options.d || options.decode;
+    
     let input;
     
-    // 过滤掉选项参数
-    const contentArgs = args.filter(arg => arg !== '-d' && arg !== '--decode');
+    // args 已经被 terminal.js 清理过了，里面只剩下非选项参数 (例如 "hi")
+    // 所以我们不需要再过滤 -d
+    const contentArgs = args; 
     
-    // 1. 获取输入
     if (pipedInput) {
-        // 如果来自管道，通常是数组，连接成字符串
         input = Array.isArray(pipedInput) ? pipedInput.join('\n') : String(pipedInput);
     } else if (contentArgs.length > 0) {
         input = contentArgs.join(' ');
@@ -18,7 +20,7 @@ try {
         return;
     }
 
-    // 2. 去除首尾引号 (虽然 terminal.js 可能已经处理过，但这层保险是个好习惯)
+    // 去除引号
     if ((input.startsWith('"') && input.endsWith('"')) || (input.startsWith("'") && input.endsWith("'"))) {
         input = input.slice(1, -1);
     }
@@ -26,21 +28,20 @@ try {
     let output = "";
 
     if (isDecode) {
-        // --- 解码 (Base64 -> UTF-8) ---
+        // 解码
         try {
-            output = decodeURIComponent(escape(atob(input.trim()))); // trim 去除可能存在的换行符
+            output = decodeURIComponent(escape(atob(input.trim())));
         } catch (err) {
             throw new Error("Invalid Base64 input");
         }
         st_api.writeLine(output);
     } else {
-        // --- 编码 (UTF-8 -> Base64) ---
+        // 编码
         output = btoa(unescape(encodeURIComponent(input)));
         st_api.writeLine(output);
     }
 
-    // 可以继续通过管道传给下一个命令
-    return output; 
+    return output;
 
 } catch (e) {
     st_api.writeHtml(`<span class="term-error">base64 error: ${e.message}</span>`);

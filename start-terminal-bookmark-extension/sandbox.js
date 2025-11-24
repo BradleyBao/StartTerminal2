@@ -9,7 +9,7 @@ window.addEventListener('message', (event) => {
     //     return;
     // }
 
-    const { scriptString, args, pipeInput } = event.data;
+    const { scriptString, args, options, pipeInput } = event.data;
 
     // 2. 构建 "Bridge API" (st_api)
     const st_api = {
@@ -28,16 +28,15 @@ window.addEventListener('message', (event) => {
     };
 
     try {
-        // 3. [!!] 在沙盒中安全执行 [!!]
-        // [!! 核心修复：添加 'return' !!]
+        // 在沙盒中安全执行 [!!]
         // 我们必须 explicitly 'return' 脚本的结果,
         // 这样 'result' 才能捕获到 async IIFE 返回的 Promise
-        const userFunction = new Function('st_api', 'args', 'pipedInput', scriptString);
+        const userFunction = new Function('st_api', 'args', 'options', 'pipedInput', scriptString);
         
-        // 4. 执行函数
-        const result = userFunction(st_api, args, pipeInput);
+        // 执行函数
+        const result = userFunction(st_api, args, options || {}, pipeInput);
 
-        // 5. 检查返回的是否是一个 Promise
+        // 检查返回的是否是一个 Promise
         if (result && typeof result.then === 'function') {
             // 它是一个 Promise，等待它
             result.then(asyncResult => {

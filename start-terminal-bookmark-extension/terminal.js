@@ -213,13 +213,14 @@ class Terminal {
     /**
      * 在沙盒中执行一个脚本字符串
      */
-    executeInSandbox(scriptString, args, pipeInput) {
+    executeInSandbox(scriptString, args, options, pipeInput) {
         return new Promise((resolve) => {
-            this.sandboxResolve = resolve; // 存储 resolve
+            this.sandboxResolve = resolve;
             // 向 sandbox.js 发送消息
             this.sandboxFrame.contentWindow.postMessage({
                 scriptString,
                 args,
+                options,
                 pipeInput
             }, `*`);
         });
@@ -619,13 +620,36 @@ class Terminal {
             return;
         }
 
-        if (this.cursorX > 0) {
-            this._handleNewline();
-            this.cursorX = 0;
+        // const currentBufferLine = this.buffer[this.cursorY] || "";
+        // const hasContent = this._stripHtml(currentBufferLine).trim().length > 0;
+
+        // if (this.cursorX > 0 || hasContent) {
+        //     this._handleNewline();
+        //     this.cursorX = 0;
             
-        }
+        // }
+        this._prepareOutput();
 
         this.writeHtml(this.escapeHtml(textString));
+    }
+
+    /**
+     * 准备输出：确保当前行是干净的
+     * 如果光标不在行首，或者当前行已经有内容，则强制换行
+     */
+    _prepareOutput() {
+        // 1. 获取当前行的缓冲内容
+        const currentBufferLine = this.buffer[this.cursorY] || "";
+        
+        // 2. 检查是否有内容 (忽略 HTML 标签后的纯文本是否为空)
+        //    注意：trim() 是为了忽略纯空格的行，防止无限换行
+        const hasContent = this._stripHtml(currentBufferLine).trim().length > 0;
+
+        // 3. 核心判断：如果光标不在 0，或者行内已有内容 -> 换行
+        if (this.cursorX > 0 || hasContent) {
+            this._handleNewline();
+            this.cursorX = 0;
+        }
     }
 
     /**
@@ -813,6 +837,8 @@ class Terminal {
             pipeBuffer.push(this._stripHtml(html)); // 管道中只应传递纯文本
             return;
         }
+
+        this._prepareOutput();
         
         const lines = html.split('\n');
         for (let i = 0; i < lines.length; i++) {
@@ -840,7 +866,7 @@ class Terminal {
             const oldPiping = isPiping;
             isPiping = false; // 暂时禁用管道
             this.writeHtml(html); // 调用常规的 writeHtml (L602)
-            this._handleNewline(); // writeHtml (L602) 不再自动换行，我们补上
+            // this._handleNewline(); // writeHtml (L602) 不再自动换行，我们补上
             isPiping = oldPiping; // 恢复管道状态
     }
 
@@ -4444,7 +4470,7 @@ async function executeLine(line) {
     // 依次执行每个顺序命令
     for (const commandSequence of sequentialCommands) {
         
-        // 2. 按管道 (|) 拆分，得到管道命令
+        // 按管道 (|) 拆分，得到管道命令
         const pipelineStrings = commandSequence.split('|').map(cmd => cmd.trim()).filter(cmd => cmd.length > 0);
         
         let lastOutput = null; // 用于存储上一个命令的输出
@@ -4596,7 +4622,7 @@ async function executeLine(line) {
                 term._writeLogHtml(`<span style="color:gray;">${t('sandboxExec').replace('{0}', command)}</span>`);
                 
                 // lastOutput (pipedInput) 会被传递
-                const result = await term.executeInSandbox(sandboxPkg.code, args, lastOutput);
+                const result = await term.executeInSandbox(sandboxPkg.code, args, options, lastOutput);
                 lastOutput = result; // "result" 是从 sandbox.js 返回的输出数组
             
             } else if (command.trim() !== '') {
