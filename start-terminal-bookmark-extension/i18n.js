@@ -172,7 +172,7 @@ var messages = {
 
         // --- Welcome & Help Messages ---
         'welcome': "Welcome to Start-Terminal 2.0!",
-        'welcomeTitle': "Welcome to Start-Terminal 2.0.0 (ST2-Shell / VFS)",
+        'welcomeTitle': "Welcome to Start-Terminal {0} (ST2-Shell / VFS)",
         'welcomeDoc': "  * Documentation:",
         'welcomeMgmt': "  * Management:",
         'welcomeSupport': "  * Support:",
@@ -406,7 +406,7 @@ var messages = {
 
         // --- Welcome & Help Messages ---
         'welcome': "欢迎来到 Start-Terminal 2.0！",
-        'welcomeTitle': "欢迎来到 Start-Terminal 2.0.0 (ST2-Shell / VFS)",
+        'welcomeTitle': "欢迎来到 Start-Terminal {0} (ST2-Shell / VFS)",
         'welcomeDoc': "  * 文档:",
         'welcomeMgmt': "  * 管理:",
         'welcomeSupport': "  * 支持:",

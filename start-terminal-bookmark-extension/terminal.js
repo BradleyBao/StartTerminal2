@@ -3230,24 +3230,25 @@ const globalCommands = {
     },
 
     'welcome': async (args, options) => {
-        // --- 1. 系统版本 ---
-        term.writeLine(t('welcomeTitle'));
+        // 系统版本 
+        const version = localStorage.getItem('st2_system_version') || '2.0.0';
+        term.writeLine(t('welcomeTitle').replace('{0}', version));
         term.writeLine("");
         
-        // --- 2. 链接 (使用 VFS 文件夹样式) ---
+        // 链接 (使用 VFS 文件夹样式)
         // (你可以用 CSS 在 .term-folder 中定义一个亮色)
         term.writeHtml(`${t('welcomeDoc')} <span class='term-folder'>https://github.com/BradleyBao/StartTerminal2</span>`);
         term.writeHtml(`${t('welcomeMgmt')} <span class='term-folder'>chrome://extensions</span>`);
         term.writeHtml(`${t('welcomeSupport')} <span class='term-folder'>https://www.tianyibrad.com</span>`);
         term.writeLine("");
 
-        // --- 3. 系统信息 (真实 + 模拟) ---
+        // 系统信息 (真实 + 模拟)
         const lang = Environment.LANG || 'en';
         const now = new Date().toLocaleString(lang, { dateStyle: 'long', timeStyle: 'medium' });
         term.writeLine(`  ${t('welcomeSysInfo')} ${now}`);
         term.writeLine("");
 
-        // --- 4. 获取动态数据 ---
+        // 获取动态数据
         const tabs = await new Promise(r => chrome.tabs.query({}, r));
         const tabCount = tabs.length;
         const storageSize = JSON.stringify(localStorage).length;
@@ -3255,7 +3256,7 @@ const globalCommands = {
         const activeUser = Environment.USER || 'user';
         
 
-        // --- 5. 格式化并打印统计数据 ---
+        // 格式化并打印统计数据
         const stat_tabs = `  ${t('welcomeTabCount')}`;
         const val_tabs = `${tabCount}`;
         const stat_user = `${t('welcomeUser')}`;
@@ -4446,6 +4447,24 @@ function done() {
      // 使用 BookmarkSystem 的方法
 }
 
+async function updateSystemVersion() {
+    const API_URL = "https://api.tianyibrad.com/api/collections/ST2_0/records?sort=-created&perPage=1";
+    try {
+        const response = await fetch(API_URL);
+        if (response.ok) {
+            const data = await response.json();
+            if (data.items && data.items.length > 0) {
+                const latestVersion = data.items[0].version;
+                // 将版本号存入缓存
+                localStorage.setItem('st2_system_version', latestVersion);
+                // console.log(`[System] Version updated to ${latestVersion}`);
+            }
+        }
+    } catch (e) {
+        console.warn("[System] Failed to check for updates:", e);
+    }
+}
+
 /**
  * 命令执行引擎
  * - 正确处理分号 (;) [顺序执行]
@@ -4654,14 +4673,14 @@ async function main() {
 
     term.writeLine(t('bootProgress'));
 
-    // 2. [!!] 初始化终端 (清空缓冲区) [!!]
+    // 2. 初始化终端 (清空缓冲区) [!!]
     // 必须在任何 .startrc 打印之前运行
     await term.initialize();
 
-    // 3. [!!] 初始化文件系统 (现在不运行 .startrc) [!!]
+    // 3. 初始化文件系统 (现在不运行 .startrc) [!!]
     await bookmarkSystem.initialize();
 
-    // 4. [!!] 加载用户环境 (这将运行 .startrc 并打印 'welcome' 命令) [!!]
+    // 4. 加载用户环境 (这将运行 .startrc 并打印 'welcome' 命令) [!!]
     const activeUser = localStorage.getItem('st2_active_user') || 'user';
     await loadEnvironment(activeUser); // 'welcome' 在这里被打印
 
@@ -4674,12 +4693,14 @@ async function main() {
     // term.writeLine(t('features'));
     localStorage.setItem('st2_last_login', new Date().toISOString());
 
-    // 7. [!!] 启用输入 [!!]
+    // 7. 启用输入 
     // 我们不需要 update_user_path()，因为 loadEnvironment() (L77) 已经调用了它。
     term.enableInput(); 
+
+    updateSystemVersion();
 }
 
-// --- 修改：使用 load 事件 ---
+// 使用 load 事件 
 window.addEventListener('load', main);
 
 // main();
