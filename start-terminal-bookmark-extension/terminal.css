@@ -18,7 +18,7 @@ html, body {
     background-color: var(--terminal-background-color);
     color: var(--terminal-foreground-color);
 
-    overflow: hidden; /* 防止滚动条出现 */
+    /* overflow: hidden; /* 防止滚动条出现 */
 }
 
 html, body::selection {
@@ -36,11 +36,26 @@ html, body::selection {
     bottom: 10px;
     
     cursor: text; /* 提示用户这里可以输入 */
-    overflow: hidden; /* 确保缓冲区内容不会溢出 */
+    overflow-y: auto;
+    overflow-x: hidden; /* 确保缓冲区内容不会溢出 */
+
+    scrollbar-width: thin;
+    scrollbar-color: var(--terminal-foreground-color) transparent;
 }
 
 #terminal-container:hover {
     cursor:default; /* 默认光标 */
+}
+
+#terminal-container::-webkit-scrollbar {
+    width: 8px;
+}
+#terminal-container::-webkit-scrollbar-thumb {
+    background-color: #555;
+    border-radius: 4px;
+}
+#terminal-container::-webkit-scrollbar-track {
+    background: transparent;
 }
 
 #terminal-buffer {

@@ -305,6 +305,7 @@ class Terminal {
         }
         this.cursorX = 0;
         this.cursorY = 0;
+        this.maxLines = 2000;
     }
 
     /**
@@ -441,44 +442,56 @@ class Terminal {
      */
     _render() {
         let html = '';
-        for (let y = 0; y < this.rows; y++) {
+        const renderRows = this.buffer.length;
+        for (let y = 0; y < renderRows; y++) {
             let line = this.buffer[y]; // Line from buffer (might contain HTML)
             
             if (y === this.cursorY && !this.inputDisabled) {
-                // --- [重写] 输入/光标渲染逻辑 ---
+                // --- 输入/光标渲染逻辑 ---
                 const fullLineText = this.prompt + this.currentLine;
 
-                // 1. [新] 先将行用空格填充到正确的总宽度
+                // 先将行用空格填充到正确的总宽度
                 const paddedLine = fullLineText + ' '.repeat(Math.max(0, this.cols - fullLineText.length));
 
-                // 2. [新] 从已填充的行中获取光标下的字符
+                // 从已填充的行中获取光标下的字符
                 //    (这确保了光标在行尾时，我们能正确获取到一个空格)
                 const charAtCursor = paddedLine[this.cursorX] || ' '; 
                 
-                // 3. [新] 替换光标位置的字符，而不是在行尾添加
+                // 替换光标位置的字符，而不是在行尾添加
                 line = this.escapeHtml(paddedLine.substring(0, this.cursorX)) +
                         `<span class="term-cursor">${this.escapeHtml(charAtCursor)}</span>` +
                         this.escapeHtml(paddedLine.substring(this.cursorX + 1));
-                // --- [结束重写] ---
                         
                 html += line + '\n';
             
             } else {
-                html += line + '\n'; 
+                // 如果行是空的，渲染一个空格（或不间断空格）以保持高度
+                if (line === '') {
+                    html += ' \n'; 
+                } else {
+                    html += line + '\n'; 
+                }
             }
         }
         this.domBuffer.innerHTML = html;
+        this.scrollToBottom();
+    }
+
+    scrollToBottom() {
+        requestAnimationFrame(() => {
+            this.container.scrollTop = this.container.scrollHeight;
+        });
     }
 
     /**
-     * [新增] 处理输入法开始
+     * 处理输入法开始
      */
     _handleCompositionStart(e) {
         this.isComposing = true;
     }
 
     /**
-     * [新增] 处理输入法结束 (选择或确认)
+     * 处理输入法结束 (选择或确认)
      */
     _handleCompositionEnd(e) {
         this.isComposing = false;
@@ -514,13 +527,32 @@ class Terminal {
     /**
      * 处理换行符（光标移到下一行开头）
      */
+    // _handleNewline() {
+    //     this.cursorY++;
+    //     this.cursorX = 0;
+    //     if (this.cursorY >= this.rows) {
+    //         this._scrollUp();
+    //         this.cursorY = this.rows - 1; // 光标保持在最后一行
+    //     }
+    // }
+
     _handleNewline() {
         this.cursorY++;
-        this.cursorX = 0;
-        if (this.cursorY >= this.rows) {
-            this._scrollUp();
-            this.cursorY = this.rows - 1; // 光标保持在最后一行
+        
+        // 如果光标超出了当前缓冲区长度，添加新行
+        if (this.cursorY >= this.buffer.length) {
+            this.buffer.push(' ');
         }
+        
+        this.cursorX = 0;
+
+        // 限制缓冲区大小 (History Limit)
+        if (this.buffer.length > this.maxLines) {
+            this.buffer.shift(); // 移除最上面的一行
+            this.cursorY--;      // 光标上移
+        }
+
+        this.scrollToBottom(); // 自动滚动到底部
     }
 
     /**
@@ -794,7 +826,7 @@ class Terminal {
             }
         }
         this._handleNewline(); // 默认在每次打印后换行
-        // this._render();
+        this._render();
     }
 
     _writeLogLine(text) {
@@ -1092,16 +1124,16 @@ class Terminal {
         const newCols = this.cols;
 
         // 3. 调整 buffer 数组以匹配 newRows (在顶部添加/删除行)
-        if (newRows > oldRows) {
-            // 窗口变高了，在顶部添加新行（模拟内容向上滚动）
-            const diff = newRows - oldRows;
-            const newLines = Array(diff).fill(' '.repeat(newCols));
-            this.buffer.splice(0, 0, ...newLines); // 在 buffer 顶部插入
-        } else if (newRows < oldRows) {
-            // 窗口变矮了，从顶部删除行（模拟内容滚出屏幕）
-            const diff = oldRows - newRows;
-            this.buffer.splice(0, diff); // 从 buffer 顶部删除
-        }
+        // if (newRows > oldRows) {
+        //     // 窗口变高了，在顶部添加新行（模拟内容向上滚动）
+        //     const diff = newRows - oldRows;
+        //     const newLines = Array(diff).fill(' '.repeat(newCols));
+        //     this.buffer.splice(0, 0, ...newLines); // 在 buffer 顶部插入
+        // } else if (newRows < oldRows) {
+        //     // 窗口变矮了，从顶部删除行（模拟内容滚出屏幕）
+        //     const diff = oldRows - newRows;
+        //     this.buffer.splice(0, diff); // 从 buffer 顶部删除
+        // }
         
         // 4. 调整 buffer 中*每行*的宽度 (天真的重排：截断或填充)
         //    用户接受这种 "被打乱" 的布局
@@ -1119,7 +1151,7 @@ class Terminal {
         // 5. 确保光标在调整后的最后一行
         //    (在我们的设计中，光标总是在缓冲区之外的“当前行”)
         //    我们只需要确保 cursorY 是最后一行，_render 会处理的
-        this.cursorY = this.rows - 1;
+        // this.cursorY = this.rows - 1;
 
         // 6. 重新渲染 (将显示 reflowed 缓冲区和新提示符)
         //    setPrompt 会被 _render 隐式调用
