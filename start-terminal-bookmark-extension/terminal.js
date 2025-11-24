@@ -620,7 +620,7 @@ class Terminal {
         }
 
         if (this.cursorX > 0) {
-            // this._handleNewline();
+            this._handleNewline();
             this.cursorX = 0;
             
         }
