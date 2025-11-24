@@ -564,7 +564,7 @@ class Terminal {
         const textContent = this._stripHtml(htmlFragment);
         const visibleLength = textContent.length;
 
-        if (visibleLength === 0) return; // 如果片段为空，则无需处理
+        // if (visibleLength === 0) return; // 优化，但是出现 buffer 未覆盖错误
 
         if (this.cursorX + visibleLength > this.cols) {
             // --- 需要自动换行 ---
@@ -607,7 +607,7 @@ class Terminal {
     }
 
     /**
-     * [公共] 打印一行文本（这是你的新 "print" 函数）
+     * [公共] 打印一行文本
      * @param {string} text
      */
     writeLine(text) {
