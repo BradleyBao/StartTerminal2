@@ -3684,6 +3684,11 @@ const globalCommands = {
             return;
         }
 
+        if (!hasPermission(result.node, 'r')) {
+            term.writeHtml(`<span class="term-error">cat: ${path}: ${t('permissionDenied')}</span>`);
+            return;
+        }
+
         const url = result.node.url;
         if (!url) {
             term.writeLine(""); // 空文件
@@ -3731,6 +3736,13 @@ const globalCommands = {
             if (result && result.node) {
                 node = result.node;
                 resolvedPath = "/" + result.newPathArray.slice(1).map(p => p.title).join("/");
+
+                // 检查权限
+                if (!hasPermission(node, 'r')) {
+                    term.writeHtml(`<span class="term-error">nano: ${resolvedPath}: ${t('permissionDenied')}</span>`);
+                    resolve();
+                    return;
+                }
 
                 if (!hasPermission(node, 'w')) {
                     isReadOnly = true;
