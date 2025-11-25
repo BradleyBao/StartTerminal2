@@ -2946,6 +2946,27 @@ function deleteVfsScript(name) {
     }
 }
 
+/**
+ * 语义化版本比较
+ * @param {string} v1 - 远程版本 (e.g., "2.1.0")
+ * @param {string} v2 - 本地版本 (e.g., "2.0.0")
+ * @returns {number} 1 if v1 > v2, -1 if v1 < v2, 0 if equal
+ */
+function compareVersions(v1, v2) {
+    if (!v1 || !v2) return 0;
+    const p1 = v1.split('.').map(Number);
+    const p2 = v2.split('.').map(Number);
+    const len = Math.max(p1.length, p2.length);
+
+    for (let i = 0; i < len; i++) {
+        const num1 = p1[i] || 0;
+        const num2 = p2[i] || 0;
+        if (num1 > num2) return 1;
+        if (num1 < num2) return -1;
+    }
+    return 0;
+}
+
 
 // ===============================================
 // =           初始化和使用 Terminal         =
@@ -3302,14 +3323,22 @@ const globalCommands = {
     },
 
     'welcome': async (args, options) => {
+        // 获取当前安装的版本 (Local)
+        let installedVersion = '2.0.0'; // 默认回退版本
+        if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.getManifest) {
+            installedVersion = chrome.runtime.getManifest().version;
+        }
+
+        // 获取远程最新版本 (Remote - 从 updateSystemVersion 缓存中读取)
+        const remoteVersion = localStorage.getItem('st2_system_version');
+
         // 系统版本 
-        const version = localStorage.getItem('st2_system_version') || '2.0.0';
-        term.writeLine(t('welcomeTitle').replace('{0}', version));
+        term.writeLine(t('welcomeTitle').replace('{0}', installedVersion));
         term.writeLine("");
         
         // 链接 (使用 VFS 文件夹样式)
         // (你可以用 CSS 在 .term-folder 中定义一个亮色)
-        term.writeHtml(`${t('welcomeDoc')} <span class='term-folder'>https://doc.tianyibrad.com/en/documentation/start-terminal-2-0</span>`);
+        term.writeHtml(`${t('welcomeDoc')} <span class='term-folder'>https://aka.bradleyproject.eu.org/st20_doc</span>`);
         term.writeHtml(`${t('welcomeMgmt')} <span class='term-folder'>chrome://extensions</span>`);
         term.writeHtml(`${t('welcomeSupport')} <span class='term-folder'>https://www.tianyibrad.com</span>`);
         term.writeLine("");
@@ -3360,8 +3389,20 @@ const globalCommands = {
         if (lastLogin) {
             const lastLoginDate = new Date(lastLogin).toLocaleString(lang);
             term.writeLine(`${t('welcomeLastLogin')} ${lastLoginDate}`);
-            term.writeLine(""); // 最后的空行
+            // term.writeLine(""); // 最后的空行
         }
+
+        if (remoteVersion && compareVersions(remoteVersion, installedVersion) > 0) {
+            term.writeLine(""); // 空一行
+            // term.writeLine("---------------------------------------------------");
+            // i18n 提示: "发现新版本: 2.1.0"
+            // 使用 CSS 变量或硬编码颜色使其醒目
+            term.writeHtml(`<span style="color: var(--color-accent-green, #4CAF50); font-weight: bold;">[!] ${t('updateAvailable').replace('{0}', remoteVersion)}</span>`);
+            // i18n 链接提示
+            term.writeHtml(`${t('updateLink')} <span class='term-folder'>https://aka.bradleyproject.eu.org/st20_releases</span>`);
+            // term.writeLine("---------------------------------------------------");
+        }
+        term.writeLine("");
     },
 
     'logout': (args, options) => {

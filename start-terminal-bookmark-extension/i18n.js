@@ -7,6 +7,10 @@ var messages = {
         'sandboxExec': "[Executing sandboxed script: {0}]",
         'scriptError': "Script Error: {0}",
 
+        // --- Update ---
+        "updateAvailable": "New version available: {0}",
+        "updateLink": "Update now: ",
+
         // --- VFS & Errors ---
         'notADir': "Not a directory",
         'noSuchFileOrDir': "No such file or directory",
@@ -239,6 +243,10 @@ var messages = {
         'cmdNotFound': "未找到命令",
         'sandboxExec': "[正在执行沙盒脚本: {0}]",
         'scriptError': "脚本错误: {0}",
+
+        // --- Update ---
+        "updateAvailable": "发现新版本: {0}",
+        "updateLink": "立即更新: ",
 
         // --- VFS & Errors ---
         'notADir': "不是一个目录",
