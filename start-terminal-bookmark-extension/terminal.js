@@ -351,6 +351,25 @@ class Terminal {
     }
 
     _masterKeydownHandler(e) {
+        // 获取当前选区
+        const selection = window.getSelection();
+        
+        // 定义修饰键（单独按下这些键不应取消划词）
+        const isModifier = ['Control', 'Shift', 'Alt', 'Meta', 'CapsLock'].includes(e.key);
+
+        // 如果屏幕上有选中文本 (isCollapsed 为 false 表示有选区)
+        // 并且用户按下的不是修饰键
+        if (!selection.isCollapsed && !isModifier) {
+            
+            // 特殊例外：如果是复制操作 (Ctrl+C, Cmd+C, Ctrl+Insert)，不要取消选中，否则无法复制
+            // 注意：原本的 Ctrl+Shift+C 逻辑在后面，但这里我们要防止"普通复制"操作意外清除选区
+            const isCopy = (e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'c' || e.key === 'Insert');
+            
+            if (!isCopy) {
+                selection.removeAllRanges(); // 1. 清除视觉上的高亮
+                this.focus();                // 2. 强制聚焦回隐藏输入框，确保字符能被捕获
+            }
+        }
         if (this.fullScreenApp) {
             // 如果全屏应用正在运行，将按键交给它处理
             this.fullScreenApp.handleKeydown(e);
