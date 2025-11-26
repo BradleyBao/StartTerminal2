@@ -164,6 +164,16 @@ class Terminal {
         this.historyIndex = 0;
         this.tempLine = "";
 
+        // Zsh 风格菜单状态
+        this.tabMenu = {
+            active: false,    // 是否处于菜单选择模式
+            items: [],        // 候选项列表
+            selected: -1,     // 当前选中的索引 (-1 表示未选中)
+            originalLine: "", // 进入菜单前的原始命令行内容
+            originalPos: 0,   // 进入菜单前的光标位置
+            renderedLines: 0  // 菜单占用了多少行 (用于清除)
+        };
+
         // 沙盒支持
         this.sandboxFrame = null;
         this.sandboxResolve = null;
@@ -174,6 +184,15 @@ class Terminal {
         this._initBuffer();
         this._attachListeners();
         this.focus();
+    }
+
+    clearLastLines(count) {
+        if (count <= 0) return;
+        // 从 buffer 末尾移除 count 行
+        this.buffer.splice(this.buffer.length - count, count);
+        // 修正光标 Y
+        this.cursorY = Math.max(0, this.cursorY - count);
+        this._render();
     }
 
     _createSandbox() {
@@ -370,6 +389,46 @@ class Terminal {
                 this.focus();                // 2. 强制聚焦回隐藏输入框，确保字符能被捕获
             }
         }
+
+        // --- Zsh 菜单模式拦截逻辑 ---
+        if (this.tabMenu.active) {
+            if (e.key === 'Tab') {
+                e.preventDefault();
+                // 循环切换选项
+                if (e.shiftKey) {
+                    this._cycleMenu(-1); // Shift+Tab 上一个
+                } else {
+                    this._cycleMenu(1);  // Tab 下一个
+                }
+                return;
+            } else if (e.key === 'Enter') {
+                e.preventDefault();
+                // 确认选择
+                this._closeMenu(true); // true = 保留当前选择
+                // this._handleNewline(); // 执行命令
+                // if (this.onCommand) this.onCommand(this.currentLine);
+                this.cursorX = this.prompt.length + this.currentLine.length;
+                this._render();
+                return;
+            } else if (e.key === 'Escape' || (e.ctrlKey && e.key === 'c')) {
+                e.preventDefault();
+                // 取消选择，恢复原始输入
+                this._closeMenu(false); // false = 还原
+                return;
+            } else if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
+                // 方向键也可以用来导航菜单 (可选，这里为了简单先关闭菜单)
+                // 或者你可以实现 grid 导航。这里我们选择：方向键确认当前选择，并执行方向键原义
+                this._closeMenu(true); 
+                // 继续向下执行，让 _handleKeydown 处理方向键
+            } else {
+                // 输入其他字符 (例如 'a')，意味着确认当前选择，并追加字符
+                if (!isModifier) {
+                    this._closeMenu(true);
+                }
+                // 继续向下执行
+            }
+        }
+
         if (this.fullScreenApp) {
             // 如果全屏应用正在运行，将按键交给它处理
             this.fullScreenApp.handleKeydown(e);
@@ -413,6 +472,171 @@ class Terminal {
             this._handleKeydown(e);
         }
     }
+
+    // 菜单循环辅助方法
+    _cycleMenu(direction) {
+        const total = this.tabMenu.items.length;
+        if (total === 0) return;
+
+        // 更新索引
+        this.tabMenu.selected += direction;
+        
+        // [核心修改] 循环逻辑包含 -1 (原始输入)
+        // 范围: -1 到 total - 1
+        if (this.tabMenu.selected >= total) this.tabMenu.selected = -1; // 超过最后一个 -> 回到原始
+        if (this.tabMenu.selected < -1) this.tabMenu.selected = total - 1; // 小于原始 -> 去到最后一个
+
+        if (this.tabMenu.selected === -1) {
+            // --- 回到原始输入状态 ---
+            this.currentLine = this.tabMenu.originalLine;
+            this.cursorX = this.prompt.length + this.tabMenu.originalLine.length;
+        } else {
+            // --- 选中某个选项 ---
+            const item = this.tabMenu.items[this.tabMenu.selected];
+            
+            const originalText = this.tabMenu.originalLine;
+            const tokenStart = this.tabMenu.tokenStart;
+            
+            // 获取新值 (URL 或 Title)
+            let newValue = item.value || item.title;
+            // 如果是路径且包含空格，转义之；如果是 URL (通常无空格)，不转义或根据需要转义
+            if (newValue.includes(' ')) newValue = this.escapePath(newValue);
+
+            // 拼接： 原文本前半部分 + 补全前缀 + 新值
+            const prefix = this.tabMenu.completionPrefix || "";
+            
+            // 此时不仅替换 token，还要注意如果 originalLine 后半部分还有内容（光标不在行尾），
+            // Zsh 通常是替换光标处的词。为了简化，我们假设是在补全当前的词。
+            const newLine = originalText.substring(0, tokenStart) + prefix + newValue;
+            
+            this.currentLine = newLine;
+            this.cursorX = this.prompt.length + newLine.length;
+        }
+
+        // 重绘菜单
+        this._renderMenu();
+    }
+
+    // [修复版] 关闭菜单
+    _closeMenu(saveSelection) {
+        // 1. 核心修复：确保只在有渲染行时才清理
+        if (this.tabMenu.renderedLines > 0) {
+            // 保护性检查：防止删除超过 buffer 范围
+            const removeIndex = this.cursorY + 1;
+            if (removeIndex < this.buffer.length) {
+                 // 仅仅删除我们之前插入的那几行
+                 this.buffer.splice(removeIndex, this.tabMenu.renderedLines);
+            }
+            this.tabMenu.renderedLines = 0;
+        }
+
+        if (!saveSelection) {
+            // 如果取消，恢复原始输入
+            this.currentLine = this.tabMenu.originalLine;
+            this.cursorX = this.prompt.length + this.tabMenu.originalLine.length;
+        }
+
+        // 2. 重置状态
+        this.tabMenu.active = false;
+        this.tabMenu.items = [];
+        this.tabMenu.selected = -1;
+        
+        this._render(); // 强制重绘
+    }
+
+    // [修复版] 渲染菜单
+    _renderMenu() {
+        // Step 1: 先彻底清除旧菜单 (防止叠加)
+        if (this.tabMenu.renderedLines > 0) {
+            const removeIndex = this.cursorY + 1;
+            // 只有当 buffer 足够长时才删除，防止报错
+            if (this.buffer.length > removeIndex) {
+                 this.buffer.splice(removeIndex, this.tabMenu.renderedLines);
+            }
+            this.tabMenu.renderedLines = 0;
+        }
+
+        const matches = this.tabMenu.items;
+        const selectedIdx = this.tabMenu.selected;
+        
+        // 如果没有匹配项，直接返回
+        if (!matches || matches.length === 0) return;
+
+        // Step 2: Grid 计算 (保持你原有的逻辑，稍作优化)
+        const displayItems = matches.map((m, idx) => {
+            let title = m.title.trim();
+            // 截断过长的标题，防止破坏布局
+            if (title.length > 30) title = title.substring(0, 27) + "..."; 
+            
+            const isDir = !!m.children;
+            let displayText = title;
+            if (isDir) displayText += '/';
+            
+            return {
+                text: displayText,
+                isDir: isDir,
+                isHistory: m.type === 'history',
+                isBookmark: m.type === 'bookmark',
+                isSelected: (idx === selectedIdx),
+                visualLen: getVisualLength(displayText) // 依赖你全局的 getVisualLength
+            };
+        });
+
+        let maxNameWidth = 0;
+        displayItems.forEach(item => { if (item.visualLen > maxNameWidth) maxNameWidth = item.visualLen; });
+        
+        const colPadding = 2;
+        const colWidth = maxNameWidth + colPadding;
+        
+        // 修复：防止除以 0
+        const termWidth = this.cols > 0 ? this.cols : 80;
+        let numCols = Math.floor(termWidth / colWidth);
+        if (numCols < 1) numCols = 1;
+        
+        const numRows = Math.ceil(displayItems.length / numCols);
+
+        // Step 3: 生成 HTML 行
+        const menuLines = [];
+        for (let y = 0; y < numRows; y++) {
+            let currentLineStr = "";
+            for (let x = 0; x < numCols; x++) {
+                const index = y + (x * numRows);
+                if (index < displayItems.length) {
+                    const item = displayItems[index];
+                    // 计算填充空格
+                    const paddingLen = Math.max(0, colWidth - item.visualLen);
+                    const padding = ' '.repeat(paddingLen);
+
+                    let html = this.escapeHtml(item.text);
+
+                    // 样式应用
+                    if (item.isSelected) {
+                        // 高亮选中的背景
+                        html = `<span style="background-color: #ddd; color: #000;">${html}</span>`;
+                    } else {
+                        if (item.isDir) html = `<span class="term-folder">${html}</span>`;
+                        else if (item.isBookmark) html = `<span style="color: #FFD700;">${html}</span>`; // 金色
+                        else if (item.isHistory) html = `<span style="color: #87CEEB;">${html}</span>`;  // 天蓝色
+                    }
+                    currentLineStr += html + padding;
+                }
+            }
+            menuLines.push(currentLineStr);
+        }
+
+        // Step 4: 插入 Buffer
+        if (menuLines.length > 0) {
+            // 始终插入在当前光标行的下一行
+            this.buffer.splice(this.cursorY + 1, 0, ...menuLines);
+            this.tabMenu.renderedLines = menuLines.length;
+        }
+        
+        this._render();
+        this.scrollToBottom(); // 确保如果菜单很长，能自动滚动看到
+    }
+
+    // 辅助: 在 Class 内部访问 helper
+    escapePath(str) { return escapePath(str); }
 
     enterFullScreenApp(app) {
         this.fullScreenApp = app;
@@ -2445,7 +2669,7 @@ async function parseStartrc(content) {
 }
 
 /**
- * [新增] 查找一组匹配项的最长公共前缀 (LCP)
+ * 查找一组匹配项的最长公共前缀 (LCP)
  */
 function findLCP(matches) {
     let lcp = matches[0].title.trim();
@@ -2460,7 +2684,7 @@ function findLCP(matches) {
 }
 
 /**
- * [新增] 比较两个匹配数组是否相同
+ * 比较两个匹配数组是否相同
  */
 function arraysAreEqual(arr1, arr2) {
     if (arr1.length !== arr2.length) return false;
@@ -2471,27 +2695,79 @@ function arraysAreEqual(arr1, arr2) {
 }
 
 /**
- * [重构] Tab 补全核心逻辑 - 修复版
- * - 列表显示：不带转义符，整齐的网格布局
- * - 补全操作：自动转义空格
+ * 获取搜索建议 (历史记录 + 书签)
+ * @param {string} query - 用户输入的片段
  */
-function handleTabCompletion(line, pos) {
+async function getSearchSuggestions(query) {
+    if (!query || query.length < 1) return [];
+    
+    // 如果没有 Chrome API，返回空
+    if (typeof chrome === 'undefined' || !chrome.history) return [];
+
+    const suggestions = [];
+
+    // 1. 搜索历史记录 (限制 10 条，按相关性排序)
+    // text: query 会自动进行模糊搜索
+    const historyItems = await new Promise(resolve => {
+        chrome.history.search({ text: query, maxResults: 10 }, resolve);
+    });
+
+    // 2. 搜索书签 (限制 5 条)
+    const bookmarkItems = await new Promise(resolve => {
+        chrome.bookmarks.search(query, resolve);
+    });
+
+    // 3. 格式化并合并
+    // 我们需要 title 用于显示，url 用于补全
+    historyItems.forEach(item => {
+        if (item.url && item.title) {
+            suggestions.push({
+                title: item.title, // 显示在 Grid 里
+                value: item.url,   // 补全到命令行里
+                type: 'history'
+            });
+        }
+    });
+
+    bookmarkItems.forEach(item => {
+        if (item.url && item.title) {
+            suggestions.push({
+                title: `★ ${item.title}`, // 书签加个星号区分
+                value: item.url,
+                type: 'bookmark'
+            });
+        }
+    });
+
+    return suggestions;
+}
+
+/**
+ * [重构] Tab 补全 - Zsh 风格菜单启动器
+ */
+/**
+ * [重构] Tab 补全 - 修复 Bash 显示、优化 Zsh 单项循环
+ */
+async function handleTabCompletion(line, pos) {
+    if (term.tabMenu.active) return;
+
+    const style = (Environment['COMPLETION_STYLE'] || 'bash').toLowerCase();
+    const isZshStyle = (style === 'zsh');
+
     const currentTime = Date.now();
 
-    // 1. 找出光标前的 token
+    // 1. 解析 Token
     const lineUpToCursor = line.substring(0, pos);
-    // 正则：匹配 引号内容 或 非空白/非引号序列
     const tokens = lineUpToCursor.match(/(?:"[^"]*"|'[^']*'|(?:\\ |[^\s"'])+)/g) || [];
     const tokenCount = tokens.length;
 
     let isCompletingFirstWord = false;
     let isCompletingSubCommand = false;
     let isCompletingPath = false;
-
+    let isCompletingSearch = false;
     let tokenToComplete = "";
     let tokenStartIndex = 0;
 
-    // 确定正在补全哪个 token
     if (line.endsWith(' ')) {
         tokenToComplete = "";
         tokenStartIndex = pos;
@@ -2508,190 +2784,191 @@ function handleTabCompletion(line, pos) {
     // 2. 决定补全类型
     if (tokenCount === 0 || (tokenCount === 1 && !line.endsWith(' '))) {
         isCompletingFirstWord = true;
+    } else if (command === 'search') { 
+        isCompletingSearch = true;
+    } else if (command === 'open') {
+        isCompletingPath = true;
     } else if (subCommandCompletions.hasOwnProperty(command) && (tokenCount === 1 || (tokenCount === 2 && !line.endsWith(' ')))) {
-        if (subCommandCompletions[command].length > 0) {
-            isCompletingSubCommand = true;
-        } else {
-            isCompletingPath = true;
-        }
+        if (subCommandCompletions[command].length > 0) isCompletingSubCommand = true;
+        else isCompletingPath = true;
     } else {
         isCompletingPath = true;
     }
 
-    // 3. 查找匹配项
+    // 3. 获取匹配项
     let matches = [];
-    let completionPrefix = ''; // 用于补全时拼接目录前缀
-    let partial = ""; // 用户输入的部分 (unescaped)
+    let completionPrefix = ''; 
+    let searchToken = unescapePath(tokenToComplete);
 
     if (isCompletingFirstWord) {
         const allCommands = getAllCommandNames();
-        matches = allCommands.filter(cmd => cmd.startsWith(tokenToComplete)).map(cmd => ({
-            title: cmd
-        }));
-        partial = tokenToComplete;
-
+        matches = allCommands.filter(cmd => cmd.startsWith(tokenToComplete)).map(cmd => ({ title: cmd, value: cmd }));
+    } else if (isCompletingSearch) {
+        if (searchToken.trim().length > 0) {
+            matches = await getSearchSuggestions(searchToken);
+        }
     } else if (isCompletingSubCommand) {
-        matches = subCommandCompletions[command].filter(cmd => cmd.startsWith(tokenToComplete)).map(cmd => ({
-            title: cmd
-        }));
-        partial = tokenToComplete;
-
+        matches = subCommandCompletions[command].filter(cmd => cmd.startsWith(tokenToComplete)).map(cmd => ({ title: cmd, value: cmd }));
     } else if (isCompletingPath) {
-        // 1. Unescape token (e.g., "Hello\ Wor" -> "Hello Wor")
-        let searchToken = unescapePath(tokenToComplete);
-
-        // 2. 处理目录路径
         const lastSlash = searchToken.lastIndexOf('/');
         if (lastSlash > -1) {
-            completionPrefix = searchToken.substring(0, lastSlash + 1); // e.g., "Hello World/"
-            partial = searchToken.substring(lastSlash + 1); // e.g., "H"
-
-            // 查找父节点
-            const result = bookmarkSystem._findNodeByPath(completionPrefix);
+            completionPrefix = searchToken.substring(0, lastSlash + 1); 
+            const partial = searchToken.substring(lastSlash + 1); 
+            const result = bookmarkSystem._findNodeByPath(completionPrefix); 
             if (result && result.node && result.node.children) {
-                matches = result.node.children.filter(child => child.title.trim().startsWith(partial));
+                matches = result.node.children
+                    .filter(child => child.title.trim().startsWith(partial))
+                    .map(child => ({ ...child, value: child.title }));
             }
         } else {
-            partial = searchToken;
+            const partial = searchToken; 
             if (bookmarkSystem.current && bookmarkSystem.current.children) {
-                matches = bookmarkSystem.current.children.filter(child => child.title.trim().startsWith(partial));
+                matches = bookmarkSystem.current.children
+                    .filter(child => child.title.trim().startsWith(partial))
+                    .map(child => ({ ...child, value: child.title }));
             }
         }
     }
 
+    if (matches.length === 0) return;
+
     // --- 4. 补全逻辑 ---
-    if (matches.length === 0) {
-        lastTabMatches = [];
+
+    // 如果是 Zsh 风格
+    if (isZshStyle) {
+        // [Zsh 逻辑优化]
+        // 无论匹配数量多少，都进入菜单模式。
+        // 如果只有一个匹配项，我们设置 selected = 0，直接应用，
+        // 这样用户再次按 Tab 就会触发 _cycleMenu，进入 selected = -1 (原始输入)。
+        
+        term.tabMenu.active = true;
+        term.tabMenu.items = matches;
+        
+        // 单个匹配 -> 默认选中第0个 (直接补全)
+        // 多个匹配 -> 默认不选中 (-1)，只显示列表
+        term.tabMenu.selected = (matches.length === 1) ? 0 : -1;
+        
+        term.tabMenu.originalLine = line;
+        term.tabMenu.tokenStart = tokenStartIndex;
+        term.tabMenu.completionPrefix = isCompletingSearch ? "" : completionPrefix;
+
+        // 如果默认选中了 (单匹配)，我们需要手动更新一次 currentLine，
+        // 因为 _renderMenu 只负责画菜单，不负责改 Input。
+        // 我们复用 _cycleMenu 的逻辑，或者手动设置一次。
+        if (term.tabMenu.selected === 0) {
+             const item = matches[0];
+             let newValue = item.value || item.title;
+             if (newValue.includes(' ')) newValue = term.escapePath(newValue);
+             const prefix = term.tabMenu.completionPrefix || "";
+             const newLine = line.substring(0, tokenStartIndex) + prefix + newValue;
+             term.currentLine = newLine;
+             term.cursorX = term.prompt.length + newLine.length;
+        }
+
+        term._renderMenu();
+        return;
+    } 
+
+    // --- 以下是 Bash 风格 (默认) ---
+
+    // 1. 单个匹配直接补全 (经典行为)
+    if (matches.length === 1) {
+        const match = matches[0];
+        let matchValue = match.value || match.title; 
+        matchValue = matchValue.trim();
+        let completion = isCompletingSearch ? matchValue : (completionPrefix + matchValue);
+        let trailingChar = ' ';
+        if (match.children) { completion += '/'; trailingChar = ''; }
+        if (completion.includes(' ')) completion = escapePath(completion);
+        
+        const textBeforeToken = line.substring(0, tokenStartIndex);
+        const textAfterCursor = line.substring(pos);
+        const newLine = textBeforeToken + completion + trailingChar + textAfterCursor;
+        term.setCommand(newLine, (textBeforeToken + completion + trailingChar).length);
         return;
     }
 
-    const textBeforeToken = line.substring(0, tokenStartIndex);
-    const textAfterCursor = line.substring(pos);
+    // 2. 多个匹配: LCP + 列表
+    let lcp = "";
+    if (!isCompletingSearch) {
+        lcp = findLCP(matches.map(m => ({ title: m.value || m.title })));
+    }
+    const partial = isCompletingSearch ? searchToken : searchToken.substring(searchToken.lastIndexOf('/') + 1);
 
-    if (matches.length === 1) {
-        // --- 4a. 只有一个匹配项 (直接补全) ---
+    if (!isCompletingSearch && lcp.length > partial.length) {
+        // 补全公共前缀
         lastTabMatches = [];
-        const match = matches[0];
-        let matchName = match.title.trim();
-
-        let completion = completionPrefix + matchName;
-        let trailingChar = ' ';
-
-        if (match.children) {
-            completion += '/';
-            trailingChar = '';
-        }
-
-        // [补全时] 进行转义，保证命令行正确
-        if (completion.includes(' ')) {
-            completion = escapePath(completion);
-        }
-
-        completion += trailingChar;
-
-        const newLine = textBeforeToken + completion + textAfterCursor;
-        const newCursorPos = (textBeforeToken + completion).length;
-        term.setCommand(newLine, newCursorPos);
-
+        let completion = completionPrefix + lcp;
+        if (completion.includes(' ')) completion = escapePath(completion);
+        const newLine = line.substring(0, tokenStartIndex) + completion + line.substring(pos);
+        term.setCommand(newLine, (line.substring(0, tokenStartIndex) + completion).length);
     } else {
-        // --- 4b. 多个匹配项 ---
-        // 寻找最长公共前缀 (LCP)
-        const lcp = findLCP(matches); 
+        // [修复] 列表显示逻辑
+        const isDoubleTap = (currentTime - lastTabTime < 500);
+        const currentMatchIds = matches.map(m => m.id || m.title);
+        const lastMatchIds = lastTabMatches.map(m => m.id || m.title);
+        
+        if ((isDoubleTap && arraysAreEqual(currentMatchIds, lastMatchIds)) || isCompletingSearch) {
+            // A. 固化当前行
+            const fullLineText = term.prompt + line;
+            const escapedLine = term.escapeHtml(fullLineText);
+            const padding = ' '.repeat(Math.max(0, term.cols - fullLineText.length));
+            term.buffer[term.cursorY] = escapedLine + padding;
+            
+            // B. 换行
+            term._handleNewline(); 
+            
+            // C. [修复] 打印列表 (Grid Layout)
+            // ----------------------------------------------------
+            const displayItems = matches.map(m => {
+                let title = m.title.trim();
+                if (title.length > 30) title = title.substring(0, 27) + "...";
+                const isDir = !!m.children;
+                let displayText = title;
+                if (isDir) displayText += '/';
+                return { 
+                    text: displayText, isDir: isDir, 
+                    isHistory: m.type === 'history', isBookmark: m.type === 'bookmark',
+                    visualLen: getVisualLength(displayText) 
+                };
+            });
 
-        if (lcp.length > partial.length) {
-            // 可以补全一部分公共前缀
-            lastTabMatches = [];
-            let completion = completionPrefix + lcp;
+            let maxNameWidth = 0;
+            displayItems.forEach(item => { if (item.visualLen > maxNameWidth) maxNameWidth = item.visualLen; });
+            const colPadding = 2;
+            const colWidth = maxNameWidth + colPadding;
+            const termWidth = term.cols;
+            let numCols = Math.floor(termWidth / colWidth);
+            if (numCols === 0) numCols = 1;
+            const numRows = Math.ceil(displayItems.length / numCols);
 
-            if (completion.includes(' ')) {
-                completion = escapePath(completion);
-            }
-
-            const newLine = textBeforeToken + completion + textAfterCursor;
-            const newCursorPos = (textBeforeToken + completion).length;
-            term.setCommand(newLine, newCursorPos);
-
-        } else {
-            // 无法进一步补全，检查双击 Tab 以列出选项
-            const isDoubleTap = (currentTime - lastTabTime < 500);
-
-            // 比较这次匹配的 ID 列表和上次是否一致
-            const currentMatchIds = matches.map(m => m.id || m.title);
-            const lastMatchIds = lastTabMatches.map(m => m.id || m.title);
-
-            if (isDoubleTap && arraysAreEqual(currentMatchIds, lastMatchIds)) {
-                // 列出选项 
-
-                const fullLineText = term.prompt + line;
-                const escapedLine = term.escapeHtml(fullLineText);
-                const padding = ' '.repeat(Math.max(0, term.cols - fullLineText.length)); // 填充满整行
-                term.buffer[term.cursorY] = escapedLine + padding;
-                
-                term._handleNewline(); // 换行开始打印列表
-
-                // 1. 准备显示数据 (不转义，保持人类可读)
-                const displayItems = matches.map(m => {
-                    const title = m.title.trim();
-                    const isDir = !!m.children;
-                    // 在列表中不转义空格，但在目录后加 /
-                    const displayText = isDir ? `${title}/` : title;
-                    return { 
-                        raw: title,
-                        text: displayText,
-                        isDir: isDir,
-                        visualLen: getVisualLength(displayText) 
-                    };
-                });
-
-                // 2. 计算最大宽度 (仿照 ls 逻辑)
-                let maxNameWidth = 0;
-                displayItems.forEach(item => {
-                    if (item.visualLen > maxNameWidth) maxNameWidth = item.visualLen;
-                });
-
-                // 3. 计算布局
-                const colPadding = 2;
-                const colWidth = maxNameWidth + colPadding;
-                const termWidth = term.cols;
-                let numCols = Math.floor(termWidth / colWidth);
-                if (numCols === 0) numCols = 1;
-                const numRows = Math.ceil(displayItems.length / numCols);
-
-                // 4. 按列优先打印 (Column-major order)
-                for (let y = 0; y < numRows; y++) {
-                    let currentLineStr = "";
-                    for (let x = 0; x < numCols; x++) {
-                        const index = y + (x * numRows); // 列优先索引算法
-                        
-                        if (index < displayItems.length) {
-                            const item = displayItems[index];
-                            const padding = ' '.repeat(colWidth - item.visualLen);
-                            
-                            // 样式化：目录显示为彩色
-                            let html = term.escapeHtml(item.text);
-                            if (item.isDir) {
-                                html = `<span class="term-folder">${html}</span>`;
-                            }
-                            
-                            currentLineStr += html + padding;
-                        }
+            for (let y = 0; y < numRows; y++) {
+                let currentLineStr = "";
+                for (let x = 0; x < numCols; x++) {
+                    const index = y + (x * numRows);
+                    if (index < displayItems.length) {
+                        const item = displayItems[index];
+                        const paddingLen = colWidth - item.visualLen;
+                        const padding = ' '.repeat(Math.max(0, paddingLen));
+                        let html = term.escapeHtml(item.text);
+                        if (item.isDir) html = `<span class="term-folder">${html}</span>`;
+                        else if (item.isBookmark) html = `<span style="color: #FFD700;">${html}</span>`;
+                        else if (item.isHistory) html = `<span style="color: #87CEEB;">${html}</span>`;
+                        currentLineStr += html + padding;
                     }
-                    term.writeHtml(currentLineStr);
                 }
-
-                // 5. 恢复提示符和当前输入行
-                // update_user_path() 会重置 prompt 字符串
-                bookmarkSystem.update_user_path(); 
-                // setCommand 会重绘当前行 (prompt + currentLine)
-                term.setCommand(line, pos);
-
-                lastTabMatches = [];
-            } else {
-                lastTabMatches = matches;
+                term.writeHtml(currentLineStr);
             }
+            // ----------------------------------------------------
+            
+            // D. 恢复状态
+            bookmarkSystem.update_user_path(); 
+            term.setCommand(line, pos);
+            lastTabMatches = [];
+        } else {
+            lastTabMatches = matches; 
         }
     }
-
     lastTabTime = currentTime;
 }
 
@@ -4121,20 +4398,37 @@ const globalCommands = {
 
     'search': (args, options) => {
         if (args.length === 0) {
-            term.writeHtml(`<span class="term-error">Usage: search [-n] <query...></span>`);
+            term.writeHtml(`<span class="term-error">Usage: search [-n] <query|url...></span>`);
             return;
         }
-        const queryText = args.join(' ');
+        let queryText = args.join(' ');
 
-        if (typeof chrome !== 'undefined' && chrome.search) {
-            // 默认在当前标签页打开。
-            // options.n (new tab) 会在新标签页中打开。
+        // [新增] URL 检测正则
+        // 匹配 http://, https://, 或者 www. 开头，或者包含 .com/.net/.org 等常见域名的字符串
+        const isUrl = /^(https?:\/\/)|(www\.)|([a-zA-Z0-9-]+\.(com|org|net|io|edu|gov|jp|cn))/i.test(queryText);
+
+        if (typeof chrome !== 'undefined' && chrome.search && chrome.tabs) {
             const disposition = options.n ? "NEW_TAB" : "CURRENT_TAB";
 
-            chrome.search.query({ 
-                text: queryText,
-                disposition: disposition
-            });
+            if (isUrl) {
+                // 如果没有协议头，补全 https://
+                if (!/^https?:\/\//i.test(queryText)) {
+                    queryText = 'https://' + queryText;
+                }
+                
+                // 直接打开 URL
+                if (disposition === "NEW_TAB") {
+                    chrome.tabs.create({ url: queryText });
+                } else {
+                    chrome.tabs.update({ url: queryText });
+                }
+            } else {
+                // 普通搜索
+                chrome.search.query({ 
+                    text: queryText,
+                    disposition: disposition
+                });
+            }
         } else {
             term.writeHtml(`<span class="term-error">search: API not available.</span>`);
         }
