@@ -544,12 +544,11 @@ class Terminal {
         this._render(); // 强制重绘
     }
 
-    // [修复版] 渲染菜单
+    // 渲染菜单
     _renderMenu() {
-        // Step 1: 先彻底清除旧菜单 (防止叠加)
+        // 1. 清理旧菜单 (保持不变)
         if (this.tabMenu.renderedLines > 0) {
             const removeIndex = this.cursorY + 1;
-            // 只有当 buffer 足够长时才删除，防止报错
             if (this.buffer.length > removeIndex) {
                  this.buffer.splice(removeIndex, this.tabMenu.renderedLines);
             }
@@ -558,81 +557,106 @@ class Terminal {
 
         const matches = this.tabMenu.items;
         const selectedIdx = this.tabMenu.selected;
-        
-        // 如果没有匹配项，直接返回
         if (!matches || matches.length === 0) return;
 
-        // Step 2: Grid 计算 (保持你原有的逻辑，稍作优化)
+        // 2. 预计算布局 (保持不变)
         const displayItems = matches.map((m, idx) => {
             let title = m.title.trim();
-            // 截断过长的标题，防止破坏布局
             if (title.length > 30) title = title.substring(0, 27) + "..."; 
-            
             const isDir = !!m.children;
             let displayText = title;
             if (isDir) displayText += '/';
-            
             return {
                 text: displayText,
                 isDir: isDir,
                 isHistory: m.type === 'history',
                 isBookmark: m.type === 'bookmark',
                 isSelected: (idx === selectedIdx),
-                visualLen: getVisualLength(displayText) // 依赖你全局的 getVisualLength
+                visualLen: getVisualLength(displayText)
             };
         });
 
         let maxNameWidth = 0;
         displayItems.forEach(item => { if (item.visualLen > maxNameWidth) maxNameWidth = item.visualLen; });
         
+        // 每个单元格的总宽 (文字 + 间距)
         const colPadding = 2;
         const colWidth = maxNameWidth + colPadding;
         
-        // 修复：防止除以 0
         const termWidth = this.cols > 0 ? this.cols : 80;
         let numCols = Math.floor(termWidth / colWidth);
         if (numCols < 1) numCols = 1;
-        
         const numRows = Math.ceil(displayItems.length / numCols);
 
-        // Step 3: 生成 HTML 行
+        // 3. 生成 Buffer 行 (核心修改)
         const menuLines = [];
+        
         for (let y = 0; y < numRows; y++) {
             let currentLineStr = "";
+            let currentVisualPos = 0; // 追踪当前行光标的逻辑位置
+
             for (let x = 0; x < numCols; x++) {
                 const index = y + (x * numRows);
+                
+                // 计算这一列结束时的目标位置
+                // 如果是最后一列，强制目标位置为行尾 (termWidth)，以确保填满
+                const isLastCol = (x === numCols - 1);
+                const targetPos = isLastCol ? termWidth : (x + 1) * colWidth;
+
                 if (index < displayItems.length) {
                     const item = displayItems[index];
-                    // 计算填充空格
-                    const paddingLen = Math.max(0, colWidth - item.visualLen);
+                    
+                    // 计算需要填充的空格数： 目标位置 - (当前位置 + 文字长度)
+                    let paddingLen = Math.max(0, targetPos - (currentVisualPos + item.visualLen));
+                    
+                    // 如果不是最后一列，保留一部分 padding 给下一列的起始（为了视觉美观，通常留1-2格空隙）
+                    // 但在这里为了严格对齐，我们把所有剩余空间都算作这个单元格的 padding
                     const padding = ' '.repeat(paddingLen);
 
-                    let html = this.escapeHtml(item.text);
+                    let contentHtml = this.escapeHtml(item.text);
 
-                    // 样式应用
+                    // --- 关键修改：将 padding 包含在样式 span 内部 ---
+                    // 这样选中时，背景色会铺满整个单元格，而不仅仅是文字下方
                     if (item.isSelected) {
-                        // 高亮选中的背景
-                        html = `<span style="background-color: #ddd; color: #000;">${html}</span>`;
+                        currentLineStr += `<span style="background-color: #ddd; color: #000;">${contentHtml}${padding}</span>`;
                     } else {
-                        if (item.isDir) html = `<span class="term-folder">${html}</span>`;
-                        else if (item.isBookmark) html = `<span style="color: #FFD700;">${html}</span>`; // 金色
-                        else if (item.isHistory) html = `<span style="color: #87CEEB;">${html}</span>`;  // 天蓝色
+                        // 未选中项：分别着色
+                        if (item.isDir) {
+                            currentLineStr += `<span class="term-folder">${contentHtml}</span>${padding}`;
+                        } else if (item.isBookmark) {
+                            currentLineStr += `<span style="color: #FFD700;">${contentHtml}</span>${padding}`;
+                        } else if (item.isHistory) {
+                            currentLineStr += `<span style="color: #87CEEB;">${contentHtml}</span>${padding}`;
+                        } else {
+                            currentLineStr += contentHtml + padding;
+                        }
                     }
-                    currentLineStr += html + padding;
+                } else {
+                    // 这一列没有项目 (比如最后一行的空白处)，直接填充空格
+                    const paddingLen = Math.max(0, targetPos - currentVisualPos);
+                    currentLineStr += ' '.repeat(paddingLen);
                 }
+
+                // 更新位置
+                currentVisualPos = targetPos;
             }
+
+            // 再次确保：如果因为计算误差导致没填满，补齐剩余部分
+            if (currentVisualPos < termWidth) {
+                currentLineStr += ' '.repeat(termWidth - currentVisualPos);
+            }
+
             menuLines.push(currentLineStr);
         }
 
-        // Step 4: 插入 Buffer
+        // 4. 插入 Buffer
         if (menuLines.length > 0) {
-            // 始终插入在当前光标行的下一行
             this.buffer.splice(this.cursorY + 1, 0, ...menuLines);
             this.tabMenu.renderedLines = menuLines.length;
         }
         
         this._render();
-        this.scrollToBottom(); // 确保如果菜单很长，能自动滚动看到
+        this.scrollToBottom(); 
     }
 
     // 辅助: 在 Class 内部访问 helper
@@ -1771,20 +1795,17 @@ class BookmarkSystem {
                 let targetNode = this.current;
                 let targetPath = ".";
                 
-                if (args[0]) {
+                // 简单的参数处理
+                if (args[0] && !args[0].startsWith('-')) {
                     targetPath = args[0];
-                }
-                // (如果 -l 在 args[0]，则 targetPath 还是 '.')
-                if (targetPath.startsWith('-')) {
-                    targetPath = "."; // 'ls -l' 意味着 ls '.'
                 }
 
                 const result = this._findNodeByPath(targetPath);
                 if (result && result.node && result.node.children) {
                     targetNode = result.node;
                 } else if (result && result.node) {
-                        this.term.writeHtml(`<span class="term-error">ls: ${targetPath}: Not a directory</span>`);
-                        return;
+                    this.term.writeHtml(`<span class="term-error">ls: ${targetPath}: Not a directory</span>`);
+                    return;
                 } else {
                     this.term.writeHtml(`<span class="term-error">ls: ${targetPath}: No such directory</span>`);
                     return;
@@ -1795,85 +1816,103 @@ class BookmarkSystem {
                     children = children.filter(child => !child.title.startsWith('.'));
                 }
                 
-                // 'ls -l' 长列表格式化函数
                 if (options.l) {
-                    // 长列表格式
+                    // (ls -l 逻辑保持不变，或者你也想应用双引号逻辑？通常 ls -l 不需要双引号，这里略过)
                     for (const child of children) {
                         const meta = getMetadata(child);
-                        
                         const isDir = !!child.children;
                         const modeStr = formatMode(meta.mode, isDir);
-                        const links = 1;
-                        const owner = meta.owner || "user";
-                        const group = meta.group || "user";
-                        const size = 0; // (大小对书签没有意义)
                         const date = new Date(child.dateAdded || Date.now()).toLocaleDateString('en-US', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+                        
+                        let name = child.title.trim();
+                        // 逻辑：如果有空格，ls -l 也加上双引号
+                        if (name.includes(' ')) name = `"${name}"`; 
 
-                        let name = child.title.trim(); //
-                        // const isDir = !!child.children;
-                        
-                        if (name.includes(' ')) {
-                            name = escapePath(name); // e.g., Hello\ World
-                        }
-                        
                         const nameHtml = isDir ? `<span class="term-folder">${this.term.escapeHtml(name)}/</span>` : this.term.escapeHtml(name);
-                        
-                        this.term.writeHtml(`${modeStr} ${links} ${owner} ${group} ${String(size).padStart(6)} ${date} ${nameHtml}`);
+                        this.term.writeHtml(`${modeStr} 1 user user 0 ${date} ${nameHtml}`);
                     }
                 } else {
                     if (children.length === 0) return;
 
-                    // 1. 格式化所有名称并找到最大宽度 (保持不变)
-                    let maxNameWidth = 0;
-                    const formattedNames = children.map(child => {
-                        const title = child.title.trim(); // 1. 获取 RAW title
+                    // --- [LS Grid 逻辑升级] ---
+
+                    // 1. 数据准备：计算显示名称和视觉长度
+                    const formattedItems = children.map(child => {
+                        let rawTitle = child.title.trim();
                         const isDir = !!child.children;
                         
-                        // 2. 创建用于输出和计算的转义标题
-                        let outputTitle = title;
-                        if (title.includes(' ')) {
-                            outputTitle = escapePath(title);
+                        // [核心修改]：如果有空格，用双引号包裹，而不是 escapePath
+                        let textToShow = rawTitle;
+                        if (textToShow.includes(' ')) {
+                            textToShow = `"${textToShow}"`;
                         }
                         
-                        // 3. 基于 *转义后* 的标题计算 visualLen
-                        const visualLen = getVisualLength(outputTitle) + (isDir ? 1 : 0);
-                        let html;
+                        // 拼接后缀用于计算长度 (Dir 加 /)
+                        // 注意：通常引号不包裹 /，即 "My Folder"/
+                        let fullDisplayText = textToShow + (isDir ? '/' : '');
+
+                        // 计算视觉长度
+                        const visualLen = getVisualLength(fullDisplayText);
+
+                        // 生成 HTML
+                        let html = this.term.escapeHtml(textToShow);
+                        
                         if (isDir) {
-                            html = `<span class="term-folder">${this.term.escapeHtml(title)}/</span>`;
-                        } else {
-                            html = this.term.escapeHtml(title);
+                            html = `<span class="term-folder">${html}/</span>`;
                         }
-                        if (visualLen > maxNameWidth) {
-                            maxNameWidth = visualLen;
-                        }
-                        return { html: html, visualLen: visualLen }; 
+                        
+                        return { html, visualLen };
                     });
 
-                    // 2. 计算列 (保持不变)
+                    // 2. 计算列宽 (Grid Calculation)
+                    let maxNameWidth = 0;
+                    formattedItems.forEach(item => { 
+                        if (item.visualLen > maxNameWidth) maxNameWidth = item.visualLen; 
+                    });
+
                     const colPadding = 2; 
                     const colWidth = maxNameWidth + colPadding;
                     const termWidth = this.term.cols;
+                    
                     let numCols = Math.floor(termWidth / colWidth);
-                    if (numCols === 0) numCols = 1;
+                    if (numCols < 1) numCols = 1;
 
-                    // 3. [!!] 计算行数 (新)
-                    const numRows = Math.ceil(formattedNames.length / numCols);
+                    const numRows = Math.ceil(formattedItems.length / numCols);
 
-                    // 4. [!!] 按“列优先”顺序构建和打印 (新)
+                    // 3. 渲染行 (Grid Rendering)
                     for (let y = 0; y < numRows; y++) {
-                        let currentLine = "";
+                        let currentLineStr = "";
+                        let currentVisualPos = 0;
+
                         for (let x = 0; x < numCols; x++) {
-                            // (y, x) -> (0,0), (0,1), (0,2)
-                            // (1,0), (1,1), (1,2)
-                            const index = y + (x * numRows); // 列优先索引
+                            const index = y + (x * numRows); // 列优先排序 (ls 默认习惯)
                             
-                            if (index < formattedNames.length) {
-                                const name = formattedNames[index];
-                                const padding = ' '.repeat(Math.max(0, colWidth - name.visualLen));
-                                currentLine += name.html + padding;
+                            // 计算当前单元格的目标结束位置
+                            const isLastCol = (x === numCols - 1);
+                            const targetPos = isLastCol ? termWidth : (x + 1) * colWidth;
+
+                            if (index < formattedItems.length) {
+                                const item = formattedItems[index];
+                                
+                                // 计算填充
+                                const paddingLen = Math.max(0, targetPos - (currentVisualPos + item.visualLen));
+                                const padding = ' '.repeat(paddingLen);
+                                
+                                currentLineStr += item.html + padding;
+                            } else {
+                                // 空白单元格
+                                const paddingLen = Math.max(0, targetPos - currentVisualPos);
+                                currentLineStr += ' '.repeat(paddingLen);
                             }
+                            currentVisualPos = targetPos;
                         }
-                        this.term.writeHtml(currentLine); // 打印一行
+                        
+                        // 强制填满行尾，防止背景断裂 (如果有背景色的话)
+                        if (currentVisualPos < termWidth) {
+                            currentLineStr += ' '.repeat(termWidth - currentVisualPos);
+                        }
+
+                        this.term.writeHtml(currentLineStr);
                     }
                 }
             },
