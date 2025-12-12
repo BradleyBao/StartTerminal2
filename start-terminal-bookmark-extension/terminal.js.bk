@@ -164,6 +164,16 @@ class Terminal {
         this.historyIndex = 0;
         this.tempLine = "";
 
+        // Zsh 风格菜单状态
+        this.tabMenu = {
+            active: false,    // 是否处于菜单选择模式
+            items: [],        // 候选项列表
+            selected: -1,     // 当前选中的索引 (-1 表示未选中)
+            originalLine: "", // 进入菜单前的原始命令行内容
+            originalPos: 0,   // 进入菜单前的光标位置
+            renderedLines: 0  // 菜单占用了多少行 (用于清除)
+        };
+
         // 沙盒支持
         this.sandboxFrame = null;
         this.sandboxResolve = null;
@@ -174,6 +184,15 @@ class Terminal {
         this._initBuffer();
         this._attachListeners();
         this.focus();
+    }
+
+    clearLastLines(count) {
+        if (count <= 0) return;
+        // 从 buffer 末尾移除 count 行
+        this.buffer.splice(this.buffer.length - count, count);
+        // 修正光标 Y
+        this.cursorY = Math.max(0, this.cursorY - count);
+        this._render();
     }
 
     _createSandbox() {
@@ -213,13 +232,14 @@ class Terminal {
     /**
      * 在沙盒中执行一个脚本字符串
      */
-    executeInSandbox(scriptString, args, pipeInput) {
+    executeInSandbox(scriptString, args, options, pipeInput) {
         return new Promise((resolve) => {
-            this.sandboxResolve = resolve; // 存储 resolve
+            this.sandboxResolve = resolve;
             // 向 sandbox.js 发送消息
             this.sandboxFrame.contentWindow.postMessage({
                 scriptString,
                 args,
+                options,
                 pipeInput
             }, `*`);
         });
@@ -305,6 +325,7 @@ class Terminal {
         }
         this.cursorX = 0;
         this.cursorY = 0;
+        this.maxLines = 2000;
     }
 
     /**
@@ -349,15 +370,75 @@ class Terminal {
     }
 
     _masterKeydownHandler(e) {
+        // 获取当前选区
+        const selection = window.getSelection();
+        
+        // 定义修饰键（单独按下这些键不应取消划词）
+        const isModifier = ['Control', 'Shift', 'Alt', 'Meta', 'CapsLock'].includes(e.key);
+
+        // 如果屏幕上有选中文本 (isCollapsed 为 false 表示有选区)
+        // 并且用户按下的不是修饰键
+        if (!selection.isCollapsed && !isModifier) {
+            
+            // 特殊例外：如果是复制操作 (Ctrl+C, Cmd+C, Ctrl+Insert)，不要取消选中，否则无法复制
+            // 注意：原本的 Ctrl+Shift+C 逻辑在后面，但这里我们要防止"普通复制"操作意外清除选区
+            const isCopy = (e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'c' || e.key === 'Insert');
+            
+            if (!isCopy) {
+                selection.removeAllRanges(); // 1. 清除视觉上的高亮
+                this.focus();                // 2. 强制聚焦回隐藏输入框，确保字符能被捕获
+            }
+        }
+
+        // --- Zsh 菜单模式拦截逻辑 ---
+        if (this.tabMenu.active) {
+            if (e.key === 'Tab') {
+                e.preventDefault();
+                // 循环切换选项
+                if (e.shiftKey) {
+                    this._cycleMenu(-1); // Shift+Tab 上一个
+                } else {
+                    this._cycleMenu(1);  // Tab 下一个
+                }
+                return;
+            } else if (e.key === 'Enter') {
+                e.preventDefault();
+                // 确认选择
+                this._closeMenu(true); // true = 保留当前选择
+                // this._handleNewline(); // 执行命令
+                // if (this.onCommand) this.onCommand(this.currentLine);
+                this.cursorX = this.prompt.length + this.currentLine.length;
+                this._render();
+                return;
+            } else if (e.key === 'Escape' || (e.ctrlKey && e.key === 'c')) {
+                e.preventDefault();
+                // 取消选择，恢复原始输入
+                this._closeMenu(false); // false = 还原
+                return;
+            } else if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
+                // 方向键也可以用来导航菜单 (可选，这里为了简单先关闭菜单)
+                // 或者你可以实现 grid 导航。这里我们选择：方向键确认当前选择，并执行方向键原义
+                this._closeMenu(true); 
+                // 继续向下执行，让 _handleKeydown 处理方向键
+            } else {
+                // 输入其他字符 (例如 'a')，意味着确认当前选择，并追加字符
+                if (!isModifier) {
+                    this._closeMenu(true);
+                }
+                // 继续向下执行
+            }
+        }
+
         if (this.fullScreenApp) {
             // 如果全屏应用正在运行，将按键交给它处理
             this.fullScreenApp.handleKeydown(e);
         } else if (this.isReading) {
             // 如果在 [Y/n] 模式下
-            e.preventDefault();
+            // e.preventDefault(); // 非禁止所有按键
             // console.log(this.cursorX);
 
             if (e.key === 'Enter') {
+                e.preventDefault();
                 const answer = this.currentLine;
                 this.isReading = false;
                 this._handleNewline(); // 换行
@@ -365,14 +446,14 @@ class Terminal {
                 this.readResolve = null;
                 this.disableInput(); // 交还控制权
 
-            // (从 _handleKeydown 复制 Backspace 逻辑)
             } else if (e.key === 'Backspace') {
+                e.preventDefault();
                 const pos = this.cursorX - this.prompt.length;
                 if (pos > 0) {
                     this.currentLine = this.currentLine.substring(0, pos - 1) + this.currentLine.substring(pos);
                     this.cursorX--;
                 }
-            // (从 _handleKeydown 复制字符输入逻辑)
+                this._render();
             } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
                 e.preventDefault();
                 const pos = this.cursorX - this.prompt.length;
@@ -380,16 +461,206 @@ class Terminal {
                 this.currentLine = this.currentLine.substring(0, pos) + char + this.currentLine.substring(pos);
                 this.cursorX++;
                 this.focus();
+                this._render();
                 return;
             }
             
-            this._render(); // 渲染 Y/n 的输入
+            // this._render(); // 渲染 Y/n 的输入
         
         } else {
             // 否则，使用我们常规的命令行处理器
             this._handleKeydown(e);
         }
     }
+
+    // 菜单循环辅助方法
+    _cycleMenu(direction) {
+        const total = this.tabMenu.items.length;
+        if (total === 0) return;
+
+        // 更新索引
+        this.tabMenu.selected += direction;
+        
+        // [核心修改] 循环逻辑包含 -1 (原始输入)
+        // 范围: -1 到 total - 1
+        if (this.tabMenu.selected >= total) this.tabMenu.selected = -1; // 超过最后一个 -> 回到原始
+        if (this.tabMenu.selected < -1) this.tabMenu.selected = total - 1; // 小于原始 -> 去到最后一个
+
+        if (this.tabMenu.selected === -1) {
+            // --- 回到原始输入状态 ---
+            this.currentLine = this.tabMenu.originalLine;
+            this.cursorX = this.prompt.length + this.tabMenu.originalLine.length;
+        } else {
+            // --- 选中某个选项 ---
+            const item = this.tabMenu.items[this.tabMenu.selected];
+            
+            const originalText = this.tabMenu.originalLine;
+            const tokenStart = this.tabMenu.tokenStart;
+            
+            // 获取新值 (URL 或 Title)
+            let newValue = item.value || item.title;
+            // 如果是路径且包含空格，转义之；如果是 URL (通常无空格)，不转义或根据需要转义
+            if (newValue.includes(' ')) newValue = this.escapePath(newValue);
+
+            // 拼接： 原文本前半部分 + 补全前缀 + 新值
+            const prefix = this.tabMenu.completionPrefix || "";
+            
+            // 此时不仅替换 token，还要注意如果 originalLine 后半部分还有内容（光标不在行尾），
+            // Zsh 通常是替换光标处的词。为了简化，我们假设是在补全当前的词。
+            const newLine = originalText.substring(0, tokenStart) + prefix + newValue;
+            
+            this.currentLine = newLine;
+            this.cursorX = this.prompt.length + newLine.length;
+        }
+
+        // 重绘菜单
+        this._renderMenu();
+    }
+
+    // [修复版] 关闭菜单
+    _closeMenu(saveSelection) {
+        // 1. 核心修复：确保只在有渲染行时才清理
+        if (this.tabMenu.renderedLines > 0) {
+            // 保护性检查：防止删除超过 buffer 范围
+            const removeIndex = this.cursorY + 1;
+            if (removeIndex < this.buffer.length) {
+                 // 仅仅删除我们之前插入的那几行
+                 this.buffer.splice(removeIndex, this.tabMenu.renderedLines);
+            }
+            this.tabMenu.renderedLines = 0;
+        }
+
+        if (!saveSelection) {
+            // 如果取消，恢复原始输入
+            this.currentLine = this.tabMenu.originalLine;
+            this.cursorX = this.prompt.length + this.tabMenu.originalLine.length;
+        }
+
+        // 2. 重置状态
+        this.tabMenu.active = false;
+        this.tabMenu.items = [];
+        this.tabMenu.selected = -1;
+        
+        this._render(); // 强制重绘
+    }
+
+    // 渲染菜单
+    _renderMenu() {
+        // 1. 清理旧菜单 (保持不变)
+        if (this.tabMenu.renderedLines > 0) {
+            const removeIndex = this.cursorY + 1;
+            if (this.buffer.length > removeIndex) {
+                 this.buffer.splice(removeIndex, this.tabMenu.renderedLines);
+            }
+            this.tabMenu.renderedLines = 0;
+        }
+
+        const matches = this.tabMenu.items;
+        const selectedIdx = this.tabMenu.selected;
+        if (!matches || matches.length === 0) return;
+
+        // 2. 预计算布局 (保持不变)
+        const displayItems = matches.map((m, idx) => {
+            let title = m.title.trim();
+            if (title.length > 30) title = title.substring(0, 27) + "..."; 
+            const isDir = !!m.children;
+            let displayText = title;
+            if (isDir) displayText += '/';
+            return {
+                text: displayText,
+                isDir: isDir,
+                isHistory: m.type === 'history',
+                isBookmark: m.type === 'bookmark',
+                isSelected: (idx === selectedIdx),
+                visualLen: getVisualLength(displayText)
+            };
+        });
+
+        let maxNameWidth = 0;
+        displayItems.forEach(item => { if (item.visualLen > maxNameWidth) maxNameWidth = item.visualLen; });
+        
+        // 每个单元格的总宽 (文字 + 间距)
+        const colPadding = 2;
+        const colWidth = maxNameWidth + colPadding;
+        
+        const termWidth = this.cols > 0 ? this.cols : 80;
+        let numCols = Math.floor(termWidth / colWidth);
+        if (numCols < 1) numCols = 1;
+        const numRows = Math.ceil(displayItems.length / numCols);
+
+        // 3. 生成 Buffer 行 (核心修改)
+        const menuLines = [];
+        
+        for (let y = 0; y < numRows; y++) {
+            let currentLineStr = "";
+            let currentVisualPos = 0; // 追踪当前行光标的逻辑位置
+
+            for (let x = 0; x < numCols; x++) {
+                const index = y + (x * numRows);
+                
+                // 计算这一列结束时的目标位置
+                // 如果是最后一列，强制目标位置为行尾 (termWidth)，以确保填满
+                const isLastCol = (x === numCols - 1);
+                const targetPos = isLastCol ? termWidth : (x + 1) * colWidth;
+
+                if (index < displayItems.length) {
+                    const item = displayItems[index];
+                    
+                    // 计算需要填充的空格数： 目标位置 - (当前位置 + 文字长度)
+                    let paddingLen = Math.max(0, targetPos - (currentVisualPos + item.visualLen));
+                    
+                    // 如果不是最后一列，保留一部分 padding 给下一列的起始（为了视觉美观，通常留1-2格空隙）
+                    // 但在这里为了严格对齐，我们把所有剩余空间都算作这个单元格的 padding
+                    const padding = ' '.repeat(paddingLen);
+
+                    let contentHtml = this.escapeHtml(item.text);
+
+                    // --- 关键修改：将 padding 包含在样式 span 内部 ---
+                    // 这样选中时，背景色会铺满整个单元格，而不仅仅是文字下方
+                    if (item.isSelected) {
+                        currentLineStr += `<span style="background-color: #ddd; color: #000;">${contentHtml}${padding}</span>`;
+                    } else {
+                        // 未选中项：分别着色
+                        if (item.isDir) {
+                            currentLineStr += `<span class="term-folder">${contentHtml}</span>${padding}`;
+                        } else if (item.isBookmark) {
+                            currentLineStr += `<span style="color: #FFD700;">${contentHtml}</span>${padding}`;
+                        } else if (item.isHistory) {
+                            currentLineStr += `<span style="color: #87CEEB;">${contentHtml}</span>${padding}`;
+                        } else {
+                            currentLineStr += contentHtml + padding;
+                        }
+                    }
+                } else {
+                    // 这一列没有项目 (比如最后一行的空白处)，直接填充空格
+                    const paddingLen = Math.max(0, targetPos - currentVisualPos);
+                    currentLineStr += ' '.repeat(paddingLen);
+                }
+
+                // 更新位置
+                currentVisualPos = targetPos;
+            }
+
+            // 再次确保：如果因为计算误差导致没填满，补齐剩余部分
+            if (currentVisualPos < termWidth) {
+                currentLineStr += ' '.repeat(termWidth - currentVisualPos);
+            }
+
+            menuLines.push(currentLineStr);
+        }
+
+        // 4. 插入 Buffer
+        if (menuLines.length > 0) {
+            this.buffer.splice(this.cursorY + 1, 0, ...menuLines);
+            this.tabMenu.renderedLines = menuLines.length;
+        }
+        
+        this._render();
+        this.scrollToBottom(); 
+    }
+
+    // 辅助: 在 Class 内部访问 helper
+    escapePath(str) { return escapePath(str); }
 
     enterFullScreenApp(app) {
         this.fullScreenApp = app;
@@ -441,44 +712,56 @@ class Terminal {
      */
     _render() {
         let html = '';
-        for (let y = 0; y < this.rows; y++) {
+        const renderRows = this.buffer.length;
+        for (let y = 0; y < renderRows; y++) {
             let line = this.buffer[y]; // Line from buffer (might contain HTML)
             
             if (y === this.cursorY && !this.inputDisabled) {
-                // --- [重写] 输入/光标渲染逻辑 ---
+                // --- 输入/光标渲染逻辑 ---
                 const fullLineText = this.prompt + this.currentLine;
 
-                // 1. [新] 先将行用空格填充到正确的总宽度
+                // 先将行用空格填充到正确的总宽度
                 const paddedLine = fullLineText + ' '.repeat(Math.max(0, this.cols - fullLineText.length));
 
-                // 2. [新] 从已填充的行中获取光标下的字符
+                // 从已填充的行中获取光标下的字符
                 //    (这确保了光标在行尾时，我们能正确获取到一个空格)
                 const charAtCursor = paddedLine[this.cursorX] || ' '; 
                 
-                // 3. [新] 替换光标位置的字符，而不是在行尾添加
+                // 替换光标位置的字符，而不是在行尾添加
                 line = this.escapeHtml(paddedLine.substring(0, this.cursorX)) +
                         `<span class="term-cursor">${this.escapeHtml(charAtCursor)}</span>` +
                         this.escapeHtml(paddedLine.substring(this.cursorX + 1));
-                // --- [结束重写] ---
                         
                 html += line + '\n';
             
             } else {
-                html += line + '\n'; 
+                // 如果行是空的，渲染一个空格（或不间断空格）以保持高度
+                if (line === '') {
+                    html += ' \n'; 
+                } else {
+                    html += line + '\n'; 
+                }
             }
         }
         this.domBuffer.innerHTML = html;
+        this.scrollToBottom();
+    }
+
+    scrollToBottom() {
+        requestAnimationFrame(() => {
+            this.container.scrollTop = this.container.scrollHeight;
+        });
     }
 
     /**
-     * [新增] 处理输入法开始
+     * 处理输入法开始
      */
     _handleCompositionStart(e) {
         this.isComposing = true;
     }
 
     /**
-     * [新增] 处理输入法结束 (选择或确认)
+     * 处理输入法结束 (选择或确认)
      */
     _handleCompositionEnd(e) {
         this.isComposing = false;
@@ -514,13 +797,32 @@ class Terminal {
     /**
      * 处理换行符（光标移到下一行开头）
      */
+    // _handleNewline() {
+    //     this.cursorY++;
+    //     this.cursorX = 0;
+    //     if (this.cursorY >= this.rows) {
+    //         this._scrollUp();
+    //         this.cursorY = this.rows - 1; // 光标保持在最后一行
+    //     }
+    // }
+
     _handleNewline() {
         this.cursorY++;
-        this.cursorX = 0;
-        if (this.cursorY >= this.rows) {
-            this._scrollUp();
-            this.cursorY = this.rows - 1; // 光标保持在最后一行
+        
+        // 如果光标超出了当前缓冲区长度，添加新行
+        if (this.cursorY >= this.buffer.length) {
+            this.buffer.push(' ');
         }
+        
+        this.cursorX = 0;
+
+        // 限制缓冲区大小 (History Limit)
+        if (this.buffer.length > this.maxLines) {
+            this.buffer.shift(); // 移除最上面的一行
+            this.cursorY--;      // 光标上移
+        }
+
+        this.scrollToBottom(); // 自动滚动到底部
     }
 
     /**
@@ -532,7 +834,7 @@ class Terminal {
         const textContent = this._stripHtml(htmlFragment);
         const visibleLength = textContent.length;
 
-        if (visibleLength === 0) return; // 如果片段为空，则无需处理
+        // if (visibleLength === 0) return; // 优化，但是出现 buffer 未覆盖错误
 
         if (this.cursorX + visibleLength > this.cols) {
             // --- 需要自动换行 ---
@@ -575,7 +877,7 @@ class Terminal {
     }
 
     /**
-     * [公共] 打印一行文本（这是你的新 "print" 函数）
+     * [公共] 打印一行文本
      * @param {string} text
      */
     writeLine(text) {
@@ -587,13 +889,36 @@ class Terminal {
             return;
         }
 
-        if (this.cursorX > 0) {
-            // this._handleNewline();
-            this.cursorX = 0;
+        // const currentBufferLine = this.buffer[this.cursorY] || "";
+        // const hasContent = this._stripHtml(currentBufferLine).trim().length > 0;
+
+        // if (this.cursorX > 0 || hasContent) {
+        //     this._handleNewline();
+        //     this.cursorX = 0;
             
-        }
+        // }
+        this._prepareOutput();
 
         this.writeHtml(this.escapeHtml(textString));
+    }
+
+    /**
+     * 准备输出：确保当前行是干净的
+     * 如果光标不在行首，或者当前行已经有内容，则强制换行
+     */
+    _prepareOutput() {
+        // 1. 获取当前行的缓冲内容
+        const currentBufferLine = this.buffer[this.cursorY] || "";
+        
+        // 2. 检查是否有内容 (忽略 HTML 标签后的纯文本是否为空)
+        //    注意：trim() 是为了忽略纯空格的行，防止无限换行
+        const hasContent = this._stripHtml(currentBufferLine).trim().length > 0;
+
+        // 3. 核心判断：如果光标不在 0，或者行内已有内容 -> 换行
+        if (this.cursorX > 0 || hasContent) {
+            this._handleNewline();
+            this.cursorX = 0;
+        }
     }
 
     /**
@@ -781,6 +1106,8 @@ class Terminal {
             pipeBuffer.push(this._stripHtml(html)); // 管道中只应传递纯文本
             return;
         }
+
+        this._prepareOutput();
         
         const lines = html.split('\n');
         for (let i = 0; i < lines.length; i++) {
@@ -794,7 +1121,7 @@ class Terminal {
             }
         }
         this._handleNewline(); // 默认在每次打印后换行
-        // this._render();
+        this._render();
     }
 
     _writeLogLine(text) {
@@ -808,7 +1135,7 @@ class Terminal {
             const oldPiping = isPiping;
             isPiping = false; // 暂时禁用管道
             this.writeHtml(html); // 调用常规的 writeHtml (L602)
-            this._handleNewline(); // writeHtml (L602) 不再自动换行，我们补上
+            // this._handleNewline(); // writeHtml (L602) 不再自动换行，我们补上
             isPiping = oldPiping; // 恢复管道状态
     }
 
@@ -1092,16 +1419,16 @@ class Terminal {
         const newCols = this.cols;
 
         // 3. 调整 buffer 数组以匹配 newRows (在顶部添加/删除行)
-        if (newRows > oldRows) {
-            // 窗口变高了，在顶部添加新行（模拟内容向上滚动）
-            const diff = newRows - oldRows;
-            const newLines = Array(diff).fill(' '.repeat(newCols));
-            this.buffer.splice(0, 0, ...newLines); // 在 buffer 顶部插入
-        } else if (newRows < oldRows) {
-            // 窗口变矮了，从顶部删除行（模拟内容滚出屏幕）
-            const diff = oldRows - newRows;
-            this.buffer.splice(0, diff); // 从 buffer 顶部删除
-        }
+        // if (newRows > oldRows) {
+        //     // 窗口变高了，在顶部添加新行（模拟内容向上滚动）
+        //     const diff = newRows - oldRows;
+        //     const newLines = Array(diff).fill(' '.repeat(newCols));
+        //     this.buffer.splice(0, 0, ...newLines); // 在 buffer 顶部插入
+        // } else if (newRows < oldRows) {
+        //     // 窗口变矮了，从顶部删除行（模拟内容滚出屏幕）
+        //     const diff = oldRows - newRows;
+        //     this.buffer.splice(0, diff); // 从 buffer 顶部删除
+        // }
         
         // 4. 调整 buffer 中*每行*的宽度 (天真的重排：截断或填充)
         //    用户接受这种 "被打乱" 的布局
@@ -1119,7 +1446,7 @@ class Terminal {
         // 5. 确保光标在调整后的最后一行
         //    (在我们的设计中，光标总是在缓冲区之外的“当前行”)
         //    我们只需要确保 cursorY 是最后一行，_render 会处理的
-        this.cursorY = this.rows - 1;
+        // this.cursorY = this.rows - 1;
 
         // 6. 重新渲染 (将显示 reflowed 缓冲区和新提示符)
         //    setPrompt 会被 _render 隐式调用
@@ -1468,20 +1795,17 @@ class BookmarkSystem {
                 let targetNode = this.current;
                 let targetPath = ".";
                 
-                if (args[0]) {
+                // 简单的参数处理
+                if (args[0] && !args[0].startsWith('-')) {
                     targetPath = args[0];
-                }
-                // (如果 -l 在 args[0]，则 targetPath 还是 '.')
-                if (targetPath.startsWith('-')) {
-                    targetPath = "."; // 'ls -l' 意味着 ls '.'
                 }
 
                 const result = this._findNodeByPath(targetPath);
                 if (result && result.node && result.node.children) {
                     targetNode = result.node;
                 } else if (result && result.node) {
-                        this.term.writeHtml(`<span class="term-error">ls: ${targetPath}: Not a directory</span>`);
-                        return;
+                    this.term.writeHtml(`<span class="term-error">ls: ${targetPath}: Not a directory</span>`);
+                    return;
                 } else {
                     this.term.writeHtml(`<span class="term-error">ls: ${targetPath}: No such directory</span>`);
                     return;
@@ -1492,85 +1816,130 @@ class BookmarkSystem {
                     children = children.filter(child => !child.title.startsWith('.'));
                 }
                 
-                // 'ls -l' 长列表格式化函数
                 if (options.l) {
-                    // 长列表格式
-                    for (const child of children) {
-                        const meta = getMetadata(child);
-                        
-                        const isDir = !!child.children;
-                        const modeStr = formatMode(meta.mode, isDir);
-                        const links = 1;
-                        const owner = meta.owner || "user";
-                        const group = meta.group || "user";
-                        const size = 0; // (大小对书签没有意义)
-                        const date = new Date(child.dateAdded || Date.now()).toLocaleDateString('en-US', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+                    // 准备数据并计算列宽
+                    let maxLinkLen = 0;
+                    let maxOwnerLen = 0;
+                    let maxGroupLen = 0;
+                    let maxSizeLen = 0;
 
-                        let name = child.title.trim(); //
-                        // const isDir = !!child.children;
+                    const rows = children.map(child => {
+                        const meta = getMetadata(child); // 现在 getMetadata 会直接读到我们注入的 owner
+                        const isDir = !!child.children;
                         
-                        if (name.includes(' ')) {
-                            name = escapePath(name); // e.g., Hello\ World
-                        }
+                        const modeStr = formatMode(meta.mode, isDir);
+                        const links = "1"; // 硬编码
+                        const owner = meta.owner || 'user'; // 如果注入失败，回退到 user
+                        const group = meta.group || 'user';
+                        const size = "0"; // 书签没有大小
+                        const date = new Date(child.dateAdded || Date.now()).toLocaleDateString('en-US', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' });
                         
+                        // 名字处理
+                        let name = child.title.trim();
+                        if (name.includes(' ')) name = `"${name}"`; 
                         const nameHtml = isDir ? `<span class="term-folder">${this.term.escapeHtml(name)}/</span>` : this.term.escapeHtml(name);
-                        
-                        this.term.writeHtml(`${modeStr} ${links} ${owner} ${group} ${String(size).padStart(6)} ${date} ${nameHtml}`);
+
+                        // 更新最大宽度
+                        if (links.length > maxLinkLen) maxLinkLen = links.length;
+                        if (owner.length > maxOwnerLen) maxOwnerLen = owner.length;
+                        if (group.length > maxGroupLen) maxGroupLen = group.length;
+                        if (size.length > maxSizeLen) maxSizeLen = size.length;
+
+                        return { modeStr, links, owner, group, size, date, nameHtml };
+                    });
+
+                    // 输出对齐后的行
+                    for (const row of rows) {
+                        const linksPad = row.links.padStart(maxLinkLen);
+                        const ownerPad = row.owner.padEnd(maxOwnerLen);
+                        const groupPad = row.group.padEnd(maxGroupLen);
+                        const sizePad  = row.size.padStart(maxSizeLen);
+
+                        // 格式: mode links owner group size date name
+                        this.term.writeHtml(`${row.modeStr} ${linksPad} ${ownerPad} ${groupPad} ${sizePad} ${row.date} ${row.nameHtml}`);
                     }
                 } else {
                     if (children.length === 0) return;
 
-                    // 1. 格式化所有名称并找到最大宽度 (保持不变)
-                    let maxNameWidth = 0;
-                    const formattedNames = children.map(child => {
-                        const title = child.title.trim(); // 1. 获取 RAW title
+                    // --- [LS Grid 逻辑升级] ---
+
+                    // 1. 数据准备：计算显示名称和视觉长度
+                    const formattedItems = children.map(child => {
+                        let rawTitle = child.title.trim();
                         const isDir = !!child.children;
                         
-                        // 2. 创建用于输出和计算的转义标题
-                        let outputTitle = title;
-                        if (title.includes(' ')) {
-                            outputTitle = escapePath(title);
+                        // [核心修改]：如果有空格，用双引号包裹，而不是 escapePath
+                        let textToShow = rawTitle;
+                        if (textToShow.includes(' ')) {
+                            textToShow = `"${textToShow}"`;
                         }
                         
-                        // 3. 基于 *转义后* 的标题计算 visualLen
-                        const visualLen = getVisualLength(outputTitle) + (isDir ? 1 : 0);
-                        let html;
+                        // 拼接后缀用于计算长度 (Dir 加 /)
+                        // 注意：通常引号不包裹 /，即 "My Folder"/
+                        let fullDisplayText = textToShow + (isDir ? '/' : '');
+
+                        // 计算视觉长度
+                        const visualLen = getVisualLength(fullDisplayText);
+
+                        // 生成 HTML
+                        let html = this.term.escapeHtml(textToShow);
+                        
                         if (isDir) {
-                            html = `<span class="term-folder">${this.term.escapeHtml(title)}/</span>`;
-                        } else {
-                            html = this.term.escapeHtml(title);
+                            html = `<span class="term-folder">${html}/</span>`;
                         }
-                        if (visualLen > maxNameWidth) {
-                            maxNameWidth = visualLen;
-                        }
-                        return { html: html, visualLen: visualLen }; 
+                        
+                        return { html, visualLen };
                     });
 
-                    // 2. 计算列 (保持不变)
+                    // 2. 计算列宽 (Grid Calculation)
+                    let maxNameWidth = 0;
+                    formattedItems.forEach(item => { 
+                        if (item.visualLen > maxNameWidth) maxNameWidth = item.visualLen; 
+                    });
+
                     const colPadding = 2; 
                     const colWidth = maxNameWidth + colPadding;
                     const termWidth = this.term.cols;
+                    
                     let numCols = Math.floor(termWidth / colWidth);
-                    if (numCols === 0) numCols = 1;
+                    if (numCols < 1) numCols = 1;
 
-                    // 3. [!!] 计算行数 (新)
-                    const numRows = Math.ceil(formattedNames.length / numCols);
+                    const numRows = Math.ceil(formattedItems.length / numCols);
 
-                    // 4. [!!] 按“列优先”顺序构建和打印 (新)
+                    // 3. 渲染行 (Grid Rendering)
                     for (let y = 0; y < numRows; y++) {
-                        let currentLine = "";
+                        let currentLineStr = "";
+                        let currentVisualPos = 0;
+
                         for (let x = 0; x < numCols; x++) {
-                            // (y, x) -> (0,0), (0,1), (0,2)
-                            // (1,0), (1,1), (1,2)
-                            const index = y + (x * numRows); // 列优先索引
+                            const index = y + (x * numRows); // 列优先排序 (ls 默认习惯)
                             
-                            if (index < formattedNames.length) {
-                                const name = formattedNames[index];
-                                const padding = ' '.repeat(Math.max(0, colWidth - name.visualLen));
-                                currentLine += name.html + padding;
+                            // 计算当前单元格的目标结束位置
+                            const isLastCol = (x === numCols - 1);
+                            const targetPos = isLastCol ? termWidth : (x + 1) * colWidth;
+
+                            if (index < formattedItems.length) {
+                                const item = formattedItems[index];
+                                
+                                // 计算填充
+                                const paddingLen = Math.max(0, targetPos - (currentVisualPos + item.visualLen));
+                                const padding = ' '.repeat(paddingLen);
+                                
+                                currentLineStr += item.html + padding;
+                            } else {
+                                // 空白单元格
+                                const paddingLen = Math.max(0, targetPos - currentVisualPos);
+                                currentLineStr += ' '.repeat(paddingLen);
                             }
+                            currentVisualPos = targetPos;
                         }
-                        this.term.writeHtml(currentLine); // 打印一行
+                        
+                        // 强制填满行尾，防止背景断裂 (如果有背景色的话)
+                        if (currentVisualPos < termWidth) {
+                            currentLineStr += ' '.repeat(termWidth - currentVisualPos);
+                        }
+
+                        this.term.writeHtml(currentLineStr);
                     }
                 }
             },
@@ -1765,7 +2134,9 @@ class BookmarkSystem {
                 // --- Case A: VFS 脚本重命名 (仅 /bin) ---
                 if (sourceNode.id.startsWith('vfs-bin-')) {
                     const newName = destPath.split('/').pop();
-                    if (destPath.startsWith('/bin/') && !destNode) {
+                    const isAbsolutePath = destPath.startsWith('/bin/');
+                    const isRelativeRename = (!destPath.includes('/') && this.current.id === 'vfs-bin');
+                    if ((isAbsolutePath || isRelativeRename) && !destNode) {
                         // VFS 重命名
                         let scripts = JSON.parse(localStorage.getItem('vfs_bin_scripts') || '{}');
                         const scriptData = scripts[sourceNode.title];
@@ -2083,6 +2454,10 @@ class BookmarkSystem {
                 this.root = tree[0];
             }
 
+            // 预加载数据，注入到书签节点中
+            const metadataStore = JSON.parse(localStorage.getItem('vfs_metadata') || '{}');
+            this._injectMetadata(this.root, metadataStore);
+
             // --- 核心 VFS ---
             // 1. 设置 homeDirNode (可能为 null)
             this.homeDirNode = (this.root.children && this.root.children.length > 0) ? this.root.children[0] : null;
@@ -2132,6 +2507,22 @@ class BookmarkSystem {
                     this.path = this.homeDirNode ? [this.virtualRoot, this.homeDirNode] : [this.virtualRoot];
                 }
             }
+    }
+
+    _injectMetadata(node, metadataStore) {
+        if (!node) return;
+
+        // 如果该节点在 metadataStore 中有记录，直接覆盖属性
+        if (metadataStore[node.id]) {
+            const meta = metadataStore[node.id];
+            node.mode = meta.mode;
+            node.owner = meta.owner;
+            node.group = meta.group;
+        }
+
+        if (node.children) {
+            node.children.forEach(child => this._injectMetadata(child, metadataStore));
+        }
     }
 
     update_user_path() {
@@ -2366,7 +2757,7 @@ async function parseStartrc(content) {
 }
 
 /**
- * [新增] 查找一组匹配项的最长公共前缀 (LCP)
+ * 查找一组匹配项的最长公共前缀 (LCP)
  */
 function findLCP(matches) {
     let lcp = matches[0].title.trim();
@@ -2381,7 +2772,7 @@ function findLCP(matches) {
 }
 
 /**
- * [新增] 比较两个匹配数组是否相同
+ * 比较两个匹配数组是否相同
  */
 function arraysAreEqual(arr1, arr2) {
     if (arr1.length !== arr2.length) return false;
@@ -2392,29 +2783,79 @@ function arraysAreEqual(arr1, arr2) {
 }
 
 /**
- * [新增] Tab 补全的核心逻辑
- * (需要全局的 term 和 bookmarkSystem 实例)
+ * 获取搜索建议 (历史记录 + 书签)
+ * @param {string} query - 用户输入的片段
+ */
+async function getSearchSuggestions(query) {
+    if (!query || query.length < 1) return [];
+    
+    // 如果没有 Chrome API，返回空
+    if (typeof chrome === 'undefined' || !chrome.history) return [];
+
+    const suggestions = [];
+
+    // 1. 搜索历史记录 (限制 10 条，按相关性排序)
+    // text: query 会自动进行模糊搜索
+    const historyItems = await new Promise(resolve => {
+        chrome.history.search({ text: query, maxResults: 10 }, resolve);
+    });
+
+    // 2. 搜索书签 (限制 5 条)
+    const bookmarkItems = await new Promise(resolve => {
+        chrome.bookmarks.search(query, resolve);
+    });
+
+    // 3. 格式化并合并
+    // 我们需要 title 用于显示，url 用于补全
+    historyItems.forEach(item => {
+        if (item.url && item.title) {
+            suggestions.push({
+                title: item.title, // 显示在 Grid 里
+                value: item.url,   // 补全到命令行里
+                type: 'history'
+            });
+        }
+    });
+
+    bookmarkItems.forEach(item => {
+        if (item.url && item.title) {
+            suggestions.push({
+                title: `★ ${item.title}`, // 书签加个星号区分
+                value: item.url,
+                type: 'bookmark'
+            });
+        }
+    });
+
+    return suggestions;
+}
+
+/**
+ * [重构] Tab 补全 - Zsh 风格菜单启动器
  */
 /**
- * [重构] Tab 补全核心逻辑
- * - 支持双击列出选项
- * - 支持带空格的文件名（自动加引号）
+ * [重构] Tab 补全 - 修复 Bash 显示、优化 Zsh 单项循环
  */
-function handleTabCompletion(line, pos) {
+async function handleTabCompletion(line, pos) {
+    if (term.tabMenu.active) return;
+
+    const style = (Environment['COMPLETION_STYLE'] || 'bash').toLowerCase();
+    const isZshStyle = (style === 'zsh');
+
     const currentTime = Date.now();
-    
-    // 1. 找出 token
+
+    // 1. 解析 Token
     const lineUpToCursor = line.substring(0, pos);
     const tokens = lineUpToCursor.match(/(?:"[^"]*"|'[^']*'|(?:\\ |[^\s"'])+)/g) || [];
     const tokenCount = tokens.length;
-    
+
     let isCompletingFirstWord = false;
     let isCompletingSubCommand = false;
     let isCompletingPath = false;
-
+    let isCompletingSearch = false;
     let tokenToComplete = "";
     let tokenStartIndex = 0;
-    
+
     if (line.endsWith(' ')) {
         tokenToComplete = "";
         tokenStartIndex = pos;
@@ -2426,142 +2867,196 @@ function handleTabCompletion(line, pos) {
         tokenStartIndex = 0;
     }
 
-    const command = (tokens[0] ? unescapePath(tokens[0]) : ""); // [!!] Unescape (L1751) command
+    const command = (tokens[0] ? unescapePath(tokens[0]) : "");
 
-    // 2. 决定要补全什么
+    // 2. 决定补全类型
     if (tokenCount === 0 || (tokenCount === 1 && !line.endsWith(' '))) {
         isCompletingFirstWord = true;
+    } else if (command === 'search') { 
+        isCompletingSearch = true;
+    } else if (command === 'open') {
+        isCompletingPath = true;
     } else if (subCommandCompletions.hasOwnProperty(command) && (tokenCount === 1 || (tokenCount === 2 && !line.endsWith(' ')))) {
-        if (subCommandCompletions[command].length > 0) {
-            isCompletingSubCommand = true;
-        } else {
-            isCompletingPath = true; 
-        }
+        if (subCommandCompletions[command].length > 0) isCompletingSubCommand = true;
+        else isCompletingPath = true;
     } else {
         isCompletingPath = true;
     }
 
-    // 3. 查找匹配项
+    // 3. 获取匹配项
     let matches = [];
     let completionPrefix = ''; 
-    let partial = "";
-    
+    let searchToken = unescapePath(tokenToComplete);
+
     if (isCompletingFirstWord) {
         const allCommands = getAllCommandNames();
-        matches = allCommands.filter(cmd => cmd.startsWith(tokenToComplete)).map(cmd => ({ title: cmd }));
-        partial = tokenToComplete;
-        
+        matches = allCommands.filter(cmd => cmd.startsWith(tokenToComplete)).map(cmd => ({ title: cmd, value: cmd }));
+    } else if (isCompletingSearch) {
+        if (searchToken.trim().length > 0) {
+            matches = await getSearchSuggestions(searchToken);
+        }
     } else if (isCompletingSubCommand) {
-        matches = subCommandCompletions[command].filter(cmd => cmd.startsWith(tokenToComplete)).map(cmd => ({ title: cmd }));
-        partial = tokenToComplete;
-    
+        matches = subCommandCompletions[command].filter(cmd => cmd.startsWith(tokenToComplete)).map(cmd => ({ title: cmd, value: cmd }));
     } else if (isCompletingPath) {
-        // [!! 核心修复：移除所有 'isQuoted' (L1352) 逻辑 !!]
-        
-        // 1. Unescape (L1751) 整个 token
-        let searchToken = unescapePath(tokenToComplete); // e.g., "Hello\ Wor" -> "Hello Wor"
-        
-        // 2. 查找 /
         const lastSlash = searchToken.lastIndexOf('/');
         if (lastSlash > -1) {
-            completionPrefix = searchToken.substring(0, lastSlash + 1); // e.g., "Hello World/"
-            partial = searchToken.substring(lastSlash + 1); // e.g., "H"
-            
-            // 3. 查找父节点 (L1195)
+            completionPrefix = searchToken.substring(0, lastSlash + 1); 
+            const partial = searchToken.substring(lastSlash + 1); 
             const result = bookmarkSystem._findNodeByPath(completionPrefix); 
             if (result && result.node && result.node.children) {
-                matches = result.node.children.filter(child => child.title.trim().startsWith(partial));
+                matches = result.node.children
+                    .filter(child => child.title.trim().startsWith(partial))
+                    .map(child => ({ ...child, value: child.title }));
             }
         } else {
-            partial = searchToken; // e.g., "Hello Wor"
+            const partial = searchToken; 
             if (bookmarkSystem.current && bookmarkSystem.current.children) {
-                matches = bookmarkSystem.current.children.filter(child => child.title.trim().startsWith(partial));
+                matches = bookmarkSystem.current.children
+                    .filter(child => child.title.trim().startsWith(partial))
+                    .map(child => ({ ...child, value: child.title }));
             }
         }
     }
 
-    // --- 4. 补全逻辑 (使用 escapePath) ---
-    if (matches.length === 0) {
-        lastTabMatches = []; return;
-    }
+    if (matches.length === 0) return;
 
-    const textBeforeToken = line.substring(0, tokenStartIndex);
-    const textAfterCursor = line.substring(pos);
-    
+    // --- 4. 补全逻辑 ---
+
+    // 如果是 Zsh 风格
+    if (isZshStyle) {
+        // [Zsh 逻辑优化]
+        // 无论匹配数量多少，都进入菜单模式。
+        // 如果只有一个匹配项，我们设置 selected = 0，直接应用，
+        // 这样用户再次按 Tab 就会触发 _cycleMenu，进入 selected = -1 (原始输入)。
+        
+        term.tabMenu.active = true;
+        term.tabMenu.items = matches;
+        
+        // 单个匹配 -> 默认选中第0个 (直接补全)
+        // 多个匹配 -> 默认不选中 (-1)，只显示列表
+        term.tabMenu.selected = (matches.length === 1) ? 0 : -1;
+        
+        term.tabMenu.originalLine = line;
+        term.tabMenu.tokenStart = tokenStartIndex;
+        term.tabMenu.completionPrefix = isCompletingSearch ? "" : completionPrefix;
+
+        // 如果默认选中了 (单匹配)，我们需要手动更新一次 currentLine，
+        // 因为 _renderMenu 只负责画菜单，不负责改 Input。
+        // 我们复用 _cycleMenu 的逻辑，或者手动设置一次。
+        if (term.tabMenu.selected === 0) {
+             const item = matches[0];
+             let newValue = item.value || item.title;
+             if (newValue.includes(' ')) newValue = term.escapePath(newValue);
+             const prefix = term.tabMenu.completionPrefix || "";
+             const newLine = line.substring(0, tokenStartIndex) + prefix + newValue;
+             term.currentLine = newLine;
+             term.cursorX = term.prompt.length + newLine.length;
+        }
+
+        term._renderMenu();
+        return;
+    } 
+
+    // --- 以下是 Bash 风格 (默认) ---
+
+    // 1. 单个匹配直接补全 (经典行为)
     if (matches.length === 1) {
-        // 4a. 只有一个匹配项
-        lastTabMatches = [];
         const match = matches[0];
-        let matchName = match.title.trim();
-        
-        let completion = completionPrefix + matchName; // e.g., Hello World/Hello World 2
+        let matchValue = match.value || match.title; 
+        matchValue = matchValue.trim();
+        let completion = isCompletingSearch ? matchValue : (completionPrefix + matchValue);
         let trailingChar = ' ';
-
-        if (match.children) {
-            completion += '/'; // e.g., Hello World/Hello World 2/
-            trailingChar = ''; 
-        }
-
-        // [!!] 在补全时 Escape [!!]
-        if (completion.includes(' ')) {
-            completion = escapePath(completion);
-        }
+        if (match.children) { completion += '/'; trailingChar = ''; }
+        if (completion.includes(' ')) completion = escapePath(completion);
         
-        completion += trailingChar;
-        
-        const newLine = textBeforeToken + completion + textAfterCursor;
-        const newCursorPos = (textBeforeToken + completion).length;
-        term.setCommand(newLine, newCursorPos);
+        const textBeforeToken = line.substring(0, tokenStartIndex);
+        const textAfterCursor = line.substring(pos);
+        const newLine = textBeforeToken + completion + trailingChar + textAfterCursor;
+        term.setCommand(newLine, (textBeforeToken + completion + trailingChar).length);
+        return;
+    }
 
+    // 2. 多个匹配: LCP + 列表
+    let lcp = "";
+    if (!isCompletingSearch) {
+        lcp = findLCP(matches.map(m => ({ title: m.value || m.title })));
+    }
+    const partial = isCompletingSearch ? searchToken : searchToken.substring(searchToken.lastIndexOf('/') + 1);
+
+    if (!isCompletingSearch && lcp.length > partial.length) {
+        // 补全公共前缀
+        lastTabMatches = [];
+        let completion = completionPrefix + lcp;
+        if (completion.includes(' ')) completion = escapePath(completion);
+        const newLine = line.substring(0, tokenStartIndex) + completion + line.substring(pos);
+        term.setCommand(newLine, (line.substring(0, tokenStartIndex) + completion).length);
     } else {
-        // 4b. 多个匹配项：
-        const lcp = findLCP(matches); // (L1284) (LCP (L1284) 是 raw text, e.g., "Hello World")
+        // [修复] 列表显示逻辑
+        const isDoubleTap = (currentTime - lastTabTime < 500);
+        const currentMatchIds = matches.map(m => m.id || m.title);
+        const lastMatchIds = lastTabMatches.map(m => m.id || m.title);
+        
+        if ((isDoubleTap && arraysAreEqual(currentMatchIds, lastMatchIds)) || isCompletingSearch) {
+            // A. 固化当前行
+            const fullLineText = term.prompt + line;
+            const escapedLine = term.escapeHtml(fullLineText);
+            const padding = ' '.repeat(Math.max(0, term.cols - fullLineText.length));
+            term.buffer[term.cursorY] = escapedLine + padding;
+            
+            // B. 换行
+            term._handleNewline(); 
+            
+            // C. [修复] 打印列表 (Grid Layout)
+            // ----------------------------------------------------
+            const displayItems = matches.map(m => {
+                let title = m.title.trim();
+                if (title.length > 30) title = title.substring(0, 27) + "...";
+                const isDir = !!m.children;
+                let displayText = title;
+                if (isDir) displayText += '/';
+                return { 
+                    text: displayText, isDir: isDir, 
+                    isHistory: m.type === 'history', isBookmark: m.type === 'bookmark',
+                    visualLen: getVisualLength(displayText) 
+                };
+            });
 
-        if (lcp.length > partial.length) {
-            // 我们可以补全更多 (LCP)
-            lastTabMatches = [];
-            let completion = completionPrefix + lcp;
-            
-            // [!!] 在补全时 Escape [!!]
-            if (completion.includes(' ')) {
-                completion = escapePath(completion);
-            }
-            
-            const newLine = textBeforeToken + completion + textAfterCursor;
-            const newCursorPos = (textBeforeToken + completion).length;
-            term.setCommand(newLine, newCursorPos);
+            let maxNameWidth = 0;
+            displayItems.forEach(item => { if (item.visualLen > maxNameWidth) maxNameWidth = item.visualLen; });
+            const colPadding = 2;
+            const colWidth = maxNameWidth + colPadding;
+            const termWidth = term.cols;
+            let numCols = Math.floor(termWidth / colWidth);
+            if (numCols === 0) numCols = 1;
+            const numRows = Math.ceil(displayItems.length / numCols);
 
-        } else {
-            // 4c. 无法进一步补全 (LCP (L1284) === partial)。检查双击。
-            const isDoubleTap = (currentTime - lastTabTime < 500);
-            
-            // [!!] 修复 'arraysAreEqual' (L1291)
-            const currentMatchIds = matches.map(m => m.id || m.title);
-            const lastMatchIds = lastTabMatches.map(m => m.id || m.title);
-            
-            if (isDoubleTap && arraysAreEqual(currentMatchIds, lastMatchIds)) {
-                // 列出所有选项
-                term._handleNewline(); 
-                const output = matches.map(m => {
-                    let title = m.title.trim();
-                    if (title.includes(' ')) {
-                        title = escapePath(title); // [!!] 使用 Escape
+            for (let y = 0; y < numRows; y++) {
+                let currentLineStr = "";
+                for (let x = 0; x < numCols; x++) {
+                    const index = y + (x * numRows);
+                    if (index < displayItems.length) {
+                        const item = displayItems[index];
+                        const paddingLen = colWidth - item.visualLen;
+                        const padding = ' '.repeat(Math.max(0, paddingLen));
+                        let html = term.escapeHtml(item.text);
+                        if (item.isDir) html = `<span class="term-folder">${html}</span>`;
+                        else if (item.isBookmark) html = `<span style="color: #FFD700;">${html}</span>`;
+                        else if (item.isHistory) html = `<span style="color: #87CEEB;">${html}</span>`;
+                        currentLineStr += html + padding;
                     }
-                    return m.children ? `${title}/` : title;
-                }).join('   ');
-                
-                term.writeHtml(output); 
-                
-                bookmarkSystem.update_user_path(); 
-                term.setCommand(line, pos);
-                
-                lastTabMatches = [];
-            } else {
-                lastTabMatches = matches; 
+                }
+                term.writeHtml(currentLineStr);
             }
+            // ----------------------------------------------------
+            
+            // D. 恢复状态
+            bookmarkSystem.update_user_path(); 
+            term.setCommand(line, pos);
+            lastTabMatches = [];
+        } else {
+            lastTabMatches = matches; 
         }
     }
-    
     lastTabTime = currentTime;
 }
 
@@ -2814,6 +3309,27 @@ function deleteVfsScript(name) {
         delete scripts[name];
         localStorage.setItem('vfs_bin_scripts', JSON.stringify(scripts));
     }
+}
+
+/**
+ * 语义化版本比较
+ * @param {string} v1 - 远程版本 (e.g., "2.1.0")
+ * @param {string} v2 - 本地版本 (e.g., "2.0.0")
+ * @returns {number} 1 if v1 > v2, -1 if v1 < v2, 0 if equal
+ */
+function compareVersions(v1, v2) {
+    if (!v1 || !v2) return 0;
+    const p1 = v1.split('.').map(Number);
+    const p2 = v2.split('.').map(Number);
+    const len = Math.max(p1.length, p2.length);
+
+    for (let i = 0; i < len; i++) {
+        const num1 = p1[i] || 0;
+        const num2 = p2[i] || 0;
+        if (num1 > num2) return 1;
+        if (num1 < num2) return -1;
+    }
+    return 0;
 }
 
 
@@ -3172,24 +3688,33 @@ const globalCommands = {
     },
 
     'welcome': async (args, options) => {
-        // --- 1. 系统版本 ---
-        term.writeLine(t('welcomeTitle'));
+        // 获取当前安装的版本 (Local)
+        let installedVersion = '2.0.0'; // 默认回退版本
+        if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.getManifest) {
+            installedVersion = chrome.runtime.getManifest().version;
+        }
+
+        // 获取远程最新版本 (Remote - 从 updateSystemVersion 缓存中读取)
+        const remoteVersion = localStorage.getItem('st2_system_version');
+
+        // 系统版本 
+        term.writeLine(t('welcomeTitle').replace('{0}', installedVersion));
         term.writeLine("");
         
-        // --- 2. 链接 (使用 VFS 文件夹样式) ---
+        // 链接 (使用 VFS 文件夹样式)
         // (你可以用 CSS 在 .term-folder 中定义一个亮色)
-        term.writeHtml(`${t('welcomeDoc')} <span class='term-folder'>https://github.com/BradleyBao/StartTerminal2</span>`);
+        term.writeHtml(`${t('welcomeDoc')} <span class='term-folder'>https://aka.bradleyproject.eu.org/st20_doc</span>`);
         term.writeHtml(`${t('welcomeMgmt')} <span class='term-folder'>chrome://extensions</span>`);
         term.writeHtml(`${t('welcomeSupport')} <span class='term-folder'>https://www.tianyibrad.com</span>`);
         term.writeLine("");
 
-        // --- 3. 系统信息 (真实 + 模拟) ---
+        // 系统信息 (真实 + 模拟)
         const lang = Environment.LANG || 'en';
         const now = new Date().toLocaleString(lang, { dateStyle: 'long', timeStyle: 'medium' });
         term.writeLine(`  ${t('welcomeSysInfo')} ${now}`);
         term.writeLine("");
 
-        // --- 4. 获取动态数据 ---
+        // 获取动态数据
         const tabs = await new Promise(r => chrome.tabs.query({}, r));
         const tabCount = tabs.length;
         const storageSize = JSON.stringify(localStorage).length;
@@ -3197,7 +3722,7 @@ const globalCommands = {
         const activeUser = Environment.USER || 'user';
         
 
-        // --- 5. 格式化并打印统计数据 ---
+        // 格式化并打印统计数据
         const stat_tabs = `  ${t('welcomeTabCount')}`;
         const val_tabs = `${tabCount}`;
         const stat_user = `${t('welcomeUser')}`;
@@ -3229,8 +3754,20 @@ const globalCommands = {
         if (lastLogin) {
             const lastLoginDate = new Date(lastLogin).toLocaleString(lang);
             term.writeLine(`${t('welcomeLastLogin')} ${lastLoginDate}`);
-            term.writeLine(""); // 最后的空行
+            // term.writeLine(""); // 最后的空行
         }
+
+        if (remoteVersion && compareVersions(remoteVersion, installedVersion) > 0) {
+            term.writeLine(""); // 空一行
+            // term.writeLine("---------------------------------------------------");
+            // i18n 提示: "发现新版本: 2.1.0"
+            // 使用 CSS 变量或硬编码颜色使其醒目
+            term.writeHtml(`<span style="color: var(--color-accent-green, #4CAF50); font-weight: bold;">[!] ${t('updateAvailable').replace('{0}', remoteVersion)}</span>`);
+            // i18n 链接提示
+            term.writeHtml(`${t('updateLink')} <span class='term-folder'>https://aka.bradleyproject.eu.org/st20_releases</span>`);
+            // term.writeLine("---------------------------------------------------");
+        }
+        term.writeLine("");
     },
 
     'logout': (args, options) => {
@@ -3652,6 +4189,11 @@ const globalCommands = {
             return;
         }
 
+        if (!hasPermission(result.node, 'r')) {
+            term.writeHtml(`<span class="term-error">cat: ${path}: ${t('permissionDenied')}</span>`);
+            return;
+        }
+
         const url = result.node.url;
         if (!url) {
             term.writeLine(""); // 空文件
@@ -3699,6 +4241,13 @@ const globalCommands = {
             if (result && result.node) {
                 node = result.node;
                 resolvedPath = "/" + result.newPathArray.slice(1).map(p => p.title).join("/");
+
+                // 检查权限
+                if (!hasPermission(node, 'r')) {
+                    term.writeHtml(`<span class="term-error">nano: ${resolvedPath}: ${t('permissionDenied')}</span>`);
+                    resolve();
+                    return;
+                }
 
                 if (!hasPermission(node, 'w')) {
                     isReadOnly = true;
@@ -3937,20 +4486,37 @@ const globalCommands = {
 
     'search': (args, options) => {
         if (args.length === 0) {
-            term.writeHtml(`<span class="term-error">Usage: search [-n] <query...></span>`);
+            term.writeHtml(`<span class="term-error">Usage: search [-n] <query|url...></span>`);
             return;
         }
-        const queryText = args.join(' ');
+        let queryText = args.join(' ');
 
-        if (typeof chrome !== 'undefined' && chrome.search) {
-            // 默认在当前标签页打开。
-            // options.n (new tab) 会在新标签页中打开。
+        // [新增] URL 检测正则
+        // 匹配 http://, https://, 或者 www. 开头，或者包含 .com/.net/.org 等常见域名的字符串
+        const isUrl = /^(https?:\/\/)|(www\.)|([a-zA-Z0-9-]+\.(com|org|net|io|edu|gov|jp|cn))/i.test(queryText);
+
+        if (typeof chrome !== 'undefined' && chrome.search && chrome.tabs) {
             const disposition = options.n ? "NEW_TAB" : "CURRENT_TAB";
 
-            chrome.search.query({ 
-                text: queryText,
-                disposition: disposition
-            });
+            if (isUrl) {
+                // 如果没有协议头，补全 https://
+                if (!/^https?:\/\//i.test(queryText)) {
+                    queryText = 'https://' + queryText;
+                }
+                
+                // 直接打开 URL
+                if (disposition === "NEW_TAB") {
+                    chrome.tabs.create({ url: queryText });
+                } else {
+                    chrome.tabs.update({ url: queryText });
+                }
+            } else {
+                // 普通搜索
+                chrome.search.query({ 
+                    text: queryText,
+                    disposition: disposition
+                });
+            }
         } else {
             term.writeHtml(`<span class="term-error">search: API not available.</span>`);
         }
@@ -4376,6 +4942,24 @@ function done() {
      // 使用 BookmarkSystem 的方法
 }
 
+async function updateSystemVersion() {
+    const API_URL = "https://api.tianyibrad.com/api/collections/ST2_0/records?sort=-created&perPage=1";
+    try {
+        const response = await fetch(API_URL);
+        if (response.ok) {
+            const data = await response.json();
+            if (data.items && data.items.length > 0) {
+                const latestVersion = data.items[0].version;
+                // 将版本号存入缓存
+                localStorage.setItem('st2_system_version', latestVersion);
+                // console.log(`[System] Version updated to ${latestVersion}`);
+            }
+        }
+    } catch (e) {
+        console.warn("[System] Failed to check for updates:", e);
+    }
+}
+
 /**
  * 命令执行引擎
  * - 正确处理分号 (;) [顺序执行]
@@ -4400,7 +4984,7 @@ async function executeLine(line) {
     // 依次执行每个顺序命令
     for (const commandSequence of sequentialCommands) {
         
-        // 2. 按管道 (|) 拆分，得到管道命令
+        // 按管道 (|) 拆分，得到管道命令
         const pipelineStrings = commandSequence.split('|').map(cmd => cmd.trim()).filter(cmd => cmd.length > 0);
         
         let lastOutput = null; // 用于存储上一个命令的输出
@@ -4552,7 +5136,7 @@ async function executeLine(line) {
                 term._writeLogHtml(`<span style="color:gray;">${t('sandboxExec').replace('{0}', command)}</span>`);
                 
                 // lastOutput (pipedInput) 会被传递
-                const result = await term.executeInSandbox(sandboxPkg.code, args, lastOutput);
+                const result = await term.executeInSandbox(sandboxPkg.code, args, options, lastOutput);
                 lastOutput = result; // "result" 是从 sandbox.js 返回的输出数组
             
             } else if (command.trim() !== '') {
@@ -4584,14 +5168,14 @@ async function main() {
 
     term.writeLine(t('bootProgress'));
 
-    // 2. [!!] 初始化终端 (清空缓冲区) [!!]
+    // 2. 初始化终端 (清空缓冲区) [!!]
     // 必须在任何 .startrc 打印之前运行
     await term.initialize();
 
-    // 3. [!!] 初始化文件系统 (现在不运行 .startrc) [!!]
+    // 3. 初始化文件系统 (现在不运行 .startrc) [!!]
     await bookmarkSystem.initialize();
 
-    // 4. [!!] 加载用户环境 (这将运行 .startrc 并打印 'welcome' 命令) [!!]
+    // 4. 加载用户环境 (这将运行 .startrc 并打印 'welcome' 命令) [!!]
     const activeUser = localStorage.getItem('st2_active_user') || 'user';
     await loadEnvironment(activeUser); // 'welcome' 在这里被打印
 
@@ -4604,12 +5188,14 @@ async function main() {
     // term.writeLine(t('features'));
     localStorage.setItem('st2_last_login', new Date().toISOString());
 
-    // 7. [!!] 启用输入 [!!]
+    // 7. 启用输入 
     // 我们不需要 update_user_path()，因为 loadEnvironment() (L77) 已经调用了它。
     term.enableInput(); 
+
+    updateSystemVersion();
 }
 
-// --- 修改：使用 load 事件 ---
+// 使用 load 事件 
 window.addEventListener('load', main);
 
 // main();

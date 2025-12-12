@@ -1817,19 +1817,46 @@ class BookmarkSystem {
                 }
                 
                 if (options.l) {
-                    // (ls -l 逻辑保持不变，或者你也想应用双引号逻辑？通常 ls -l 不需要双引号，这里略过)
-                    for (const child of children) {
-                        const meta = getMetadata(child);
+                    // 准备数据并计算列宽
+                    let maxLinkLen = 0;
+                    let maxOwnerLen = 0;
+                    let maxGroupLen = 0;
+                    let maxSizeLen = 0;
+
+                    const rows = children.map(child => {
+                        const meta = getMetadata(child); // 现在 getMetadata 会直接读到我们注入的 owner
                         const isDir = !!child.children;
+                        
                         const modeStr = formatMode(meta.mode, isDir);
+                        const links = "1"; // 硬编码
+                        const owner = meta.owner || 'user'; // 如果注入失败，回退到 user
+                        const group = meta.group || 'user';
+                        const size = "0"; // 书签没有大小
                         const date = new Date(child.dateAdded || Date.now()).toLocaleDateString('en-US', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' });
                         
+                        // 名字处理
                         let name = child.title.trim();
-                        // 逻辑：如果有空格，ls -l 也加上双引号
                         if (name.includes(' ')) name = `"${name}"`; 
-
                         const nameHtml = isDir ? `<span class="term-folder">${this.term.escapeHtml(name)}/</span>` : this.term.escapeHtml(name);
-                        this.term.writeHtml(`${modeStr} 1 user user 0 ${date} ${nameHtml}`);
+
+                        // 更新最大宽度
+                        if (links.length > maxLinkLen) maxLinkLen = links.length;
+                        if (owner.length > maxOwnerLen) maxOwnerLen = owner.length;
+                        if (group.length > maxGroupLen) maxGroupLen = group.length;
+                        if (size.length > maxSizeLen) maxSizeLen = size.length;
+
+                        return { modeStr, links, owner, group, size, date, nameHtml };
+                    });
+
+                    // 输出对齐后的行
+                    for (const row of rows) {
+                        const linksPad = row.links.padStart(maxLinkLen);
+                        const ownerPad = row.owner.padEnd(maxOwnerLen);
+                        const groupPad = row.group.padEnd(maxGroupLen);
+                        const sizePad  = row.size.padStart(maxSizeLen);
+
+                        // 格式: mode links owner group size date name
+                        this.term.writeHtml(`${row.modeStr} ${linksPad} ${ownerPad} ${groupPad} ${sizePad} ${row.date} ${row.nameHtml}`);
                     }
                 } else {
                     if (children.length === 0) return;
@@ -2107,7 +2134,9 @@ class BookmarkSystem {
                 // --- Case A: VFS 脚本重命名 (仅 /bin) ---
                 if (sourceNode.id.startsWith('vfs-bin-')) {
                     const newName = destPath.split('/').pop();
-                    if (destPath.startsWith('/bin/') && !destNode) {
+                    const isAbsolutePath = destPath.startsWith('/bin/');
+                    const isRelativeRename = (!destPath.includes('/') && this.current.id === 'vfs-bin');
+                    if ((isAbsolutePath || isRelativeRename) && !destNode) {
                         // VFS 重命名
                         let scripts = JSON.parse(localStorage.getItem('vfs_bin_scripts') || '{}');
                         const scriptData = scripts[sourceNode.title];
@@ -2425,6 +2454,10 @@ class BookmarkSystem {
                 this.root = tree[0];
             }
 
+            // 预加载数据，注入到书签节点中
+            const metadataStore = JSON.parse(localStorage.getItem('vfs_metadata') || '{}');
+            this._injectMetadata(this.root, metadataStore);
+
             // --- 核心 VFS ---
             // 1. 设置 homeDirNode (可能为 null)
             this.homeDirNode = (this.root.children && this.root.children.length > 0) ? this.root.children[0] : null;
@@ -2474,6 +2507,22 @@ class BookmarkSystem {
                     this.path = this.homeDirNode ? [this.virtualRoot, this.homeDirNode] : [this.virtualRoot];
                 }
             }
+    }
+
+    _injectMetadata(node, metadataStore) {
+        if (!node) return;
+
+        // 如果该节点在 metadataStore 中有记录，直接覆盖属性
+        if (metadataStore[node.id]) {
+            const meta = metadataStore[node.id];
+            node.mode = meta.mode;
+            node.owner = meta.owner;
+            node.group = meta.group;
+        }
+
+        if (node.children) {
+            node.children.forEach(child => this._injectMetadata(child, metadataStore));
+        }
     }
 
     update_user_path() {
