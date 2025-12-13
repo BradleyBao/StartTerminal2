@@ -44,8 +44,8 @@
     }
   ],
   "oauth2": {
-    "client_id_test": "627153522315-au7c8jn9annotousnh12bdfnv3ilcgur.apps.googleusercontent.com",
-    "client_id": "627153522315-8fdkqcf86hq1fkjmg10q1dj2afv6s1gk.apps.googleusercontent.com",
+    "client_id": "627153522315-au7c8jn9annotousnh12bdfnv3ilcgur.apps.googleusercontent.com",
+    "client_id_test": "627153522315-8fdkqcf86hq1fkjmg10q1dj2afv6s1gk.apps.googleusercontent.com",
     "scopes": [
       "https://www.googleapis.com/auth/userinfo.email",
       "https://www.googleapis.com/auth/userinfo.profile"
