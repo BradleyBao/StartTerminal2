@@ -1662,16 +1662,54 @@ class NanoEditor {
                         const text = await navigator.clipboard.readText();
                         if (text) {
                             this.dirty = true;
-                            // 将剪贴板内容插入当前位置
-                            const line = this.lines[this.cursorY];
-                            this.lines[this.cursorY] = line.substring(0, this.cursorX) + text + line.substring(this.cursorX);
-                            this.cursorX += text.length;
                             
-                            // (可选) 如果粘贴包含换行符，需要更复杂的拆分逻辑，
-                            // 这里简单处理：暂只支持单行粘贴，或者你需要写一个 insertText 函数处理多行
+                            // 1. 规范化换行符 (CRLF -> LF)
+                            const cleanText = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+                            const parts = cleanText.split('\n');
+                            
+                            // 获取光标当前所在行，并拆分为 光标前(pre) 和 光标后(post)
+                            const currentLine = this.lines[this.cursorY];
+                            const pre = currentLine.substring(0, this.cursorX);
+                            const post = currentLine.substring(this.cursorX);
+                            
+                            if (parts.length === 1) {
+                                // --- 单行粘贴 ---
+                                this.lines[this.cursorY] = pre + parts[0] + post;
+                                this.cursorX += parts[0].length;
+                            } else {
+                                // --- 多行粘贴 ---
+                                // 1. 当前行变成：pre + 第一段
+                                this.lines[this.cursorY] = pre + parts[0];
+                                
+                                // 2. 中间部分直接插入新行
+                                // parts.slice(1, -1) 获取中间的所有行
+                                // 如果只有2行，中间就是空的，逻辑依然成立
+                                const middleLines = parts.slice(1, -1);
+                                if (middleLines.length > 0) {
+                                    this.lines.splice(this.cursorY + 1, 0, ...middleLines);
+                                }
+                                
+                                // 3. 最后一行：最后一段 + post
+                                // 注意：需要计算最后一行插入的位置
+                                const lastPart = parts[parts.length - 1];
+                                const insertionIndex = this.cursorY + parts.length - 1;
+                                
+                                // 在正确位置插入最后一行
+                                this.lines.splice(insertionIndex, 0, lastPart + post);
+                                
+                                // 4. 更新光标位置
+                                this.cursorY = insertionIndex;
+                                this.cursorX = lastPart.length; 
+                            }
+                            
+                            // [关键] 强制检查光标位置并滚动视图
+                            this._validateCursor();
+                            this._handleScrolling();
+                            this._render();
                         }
                     } catch (err) {
-                        this.status = "Paste failed: Permissions?";
+                        this.status = "Paste failed: " + err.message;
+                        this._render();
                     }
                     break;
             }
@@ -2929,6 +2967,8 @@ async function handleTabCompletion(line, pos) {
 
     const rawCommand = (tokens[0] ? unescapePath(tokens[0]) : "");
 
+    let onlyExecutables = false;
+
     // --- Sudo 穿透逻辑 ---
     let targetCommand = rawCommand;
     let targetTokenCount = tokenCount;
@@ -2953,9 +2993,15 @@ async function handleTabCompletion(line, pos) {
     let subCommandCandidates = [];
 
     // 注意：这里优先检查 isCompletingFirstWord (可能被 sudo 逻辑置为 true)
-    if (isCompletingFirstWord || (tokenCount === 0 || (tokenCount === 1 && !line.endsWith(' ')))) {
+    if ((tokenCount === 0 || (tokenCount === 1 && !line.endsWith(' '))) && 
+        (tokenToComplete.startsWith('./') || tokenToComplete.startsWith('/') || tokenToComplete.startsWith('~/'))) {
+        
+        isCompletingPath = true;
+        isCompletingFirstWord = false; // [!] 覆盖默认判断，不再查命令列表
+        onlyExecutables = true;        // [!] 开启只显示可执行文件的过滤器
+
+    } else if (tokenCount === 0 || (tokenCount === 1 && !line.endsWith(' '))) {
         isCompletingFirstWord = true;
-    
     } else if (targetCommand === 'search') { 
         isCompletingSearch = true;
     
