@@ -1418,38 +1418,54 @@ class Terminal {
         const newRows = this.rows;
         const newCols = this.cols;
 
-        // 3. 调整 buffer 数组以匹配 newRows (在顶部添加/删除行)
-        // if (newRows > oldRows) {
-        //     // 窗口变高了，在顶部添加新行（模拟内容向上滚动）
-        //     const diff = newRows - oldRows;
-        //     const newLines = Array(diff).fill(' '.repeat(newCols));
-        //     this.buffer.splice(0, 0, ...newLines); // 在 buffer 顶部插入
-        // } else if (newRows < oldRows) {
-        //     // 窗口变矮了，从顶部删除行（模拟内容滚出屏幕）
-        //     const diff = oldRows - newRows;
-        //     this.buffer.splice(0, diff); // 从 buffer 顶部删除
-        // }
+        // 3. 调整 buffer 数组 (保持原有逻辑)
+        if (newRows > oldRows) {
+            // 窗口变高了，可选：在顶部填充空行
+        } else if (newRows < oldRows) {
+            // 窗口变矮了，不做处理，_render 会自动截取
+        }
         
-        // 4. 调整 buffer 中*每行*的宽度 (天真的重排：截断或填充)
-        //    用户接受这种 "被打乱" 的布局
+        // 4. [核心修复] 智能调整每行宽度
         this.buffer = this.buffer.map(line => {
-            const textContent = this._stripHtml(line); // 获取纯文本
-            if (textContent.length > newCols) {
-                // 截断
-                return this.escapeHtml(textContent.substring(0, newCols)); 
+            // A. 获取去除 HTML 标签后的纯文本
+            const plainText = this._stripHtml(line);
+            
+            // B. 获取去除尾部空格后的“实际内容”
+            //    (用于判断这些内容是否真的比新窗口宽)
+            const trimmedPlainText = plainText.trimEnd();
+            const contentLen = getVisualLength(trimmedPlainText);
+            
+            if (contentLen > newCols) {
+                // [情况 1]: 实际内容（不含空格）比新窗口还宽
+                // 必须截断。为了防止切断 HTML 标签导致渲染崩溃，只能忍痛剥离颜色。
+                // 这是唯一会丢失颜色的情况（通常只在窗口缩得非常小时发生）。
+                return this.escapeHtml(plainText.substring(0, newCols)); 
+                
             } else {
-                // 填充
-                return this.escapeHtml(textContent) + ' '.repeat(newCols - textContent.length);
+                // [情况 2]: 实际内容能放得下 (即使之前有很长的填充空格)
+                // 这是一个能够保留颜色的安全操作。
+                
+                // 1. 移除旧的 HTML 字符串末尾的空格
+                //    (注意：这可能会移除一部分带有背景色的空格，但在 Resize 场景下通常是可以接受的)
+                const trimmedLine = line.trimEnd();
+                
+                // 2. 计算剩余部分的视觉长度
+                //    (注意：必须重新 stripHtml 计算，因为 trimEnd 后长度变了)
+                const currentVisualLen = getVisualLength(this._stripHtml(trimmedLine));
+                
+                // 3. 计算需要补多少空格才能填满新窗口
+                const paddingNeeded = Math.max(0, newCols - currentVisualLen);
+                
+                // 4. 返回：原始带色内容 + 新的填充空格
+                return trimmedLine + ' '.repeat(paddingNeeded);
             }
         });
 
-        // 5. 确保光标在调整后的最后一行
-        //    (在我们的设计中，光标总是在缓冲区之外的“当前行”)
-        //    我们只需要确保 cursorY 是最后一行，_render 会处理的
-        // this.cursorY = this.rows - 1;
+        // 5. 确保光标位置合法
+        if (this.cursorX >= newCols) this.cursorX = newCols - 1;
+        if (this.cursorY >= newRows) this.cursorY = newRows - 1;
 
-        // 6. 重新渲染 (将显示 reflowed 缓冲区和新提示符)
-        //    setPrompt 会被 _render 隐式调用
+        // 6. 重新渲染
         this._render();
     }
 
@@ -3378,6 +3394,187 @@ const bookmarkSystem = new BookmarkSystem(term); // 将 term 传给 BookmarkSyst
 // --- 将非书签命令移到这里 ---
 // (替换) 你现有的 globalCommands 对象
 const globalCommands = {
+    'ext': async (args, options) => {
+        // 1. 动态权限检查与请求
+        const hasPerm = await new Promise(r => chrome.permissions.contains({ permissions: ['management'] }, r));
+
+        if (!hasPerm) {
+            term.writeLine("This command requires 'management' permission to manage extensions.");
+            
+            // 必须在用户操作（如按回车）的上下文中调用 request
+            try {
+                const granted = await new Promise(r => chrome.permissions.request({ permissions: ['management'] }, r));
+                if (!granted) {
+                    term.writeHtml(`<span class="term-error">Permission denied. Cannot execute 'ext'.</span>`);
+                    return;
+                }
+                term.writeLine("Permission granted! Re-running command...");
+            } catch (e) {
+                // 如果在非用户手势下调用，Chrome 会报错
+                term.writeHtml(`<span class="term-error">Error requesting permission: ${e.message}</span>`);
+                return;
+            }
+        }
+
+        // --- 以下是原有的逻辑 (没有任何变化，只是被包裹在了权限检查之后) ---
+        
+        const subCommand = args[0] || 'ls';
+
+        try {
+            if (subCommand === 'ls') {
+                const list = await new Promise(r => chrome.management.getAll(r));
+                
+                list.sort((a, b) => {
+                    if (a.enabled === b.enabled) return a.name.localeCompare(b.name);
+                    return a.enabled ? -1 : 1;
+                });
+
+                const total = list.length;
+                const enabledCount = list.filter(i => i.enabled).length;
+                term.writeLine(`Found ${total} items (${enabledCount} enabled).`);
+                term.writeLine("ID                                   State  Name");
+                term.writeLine("---------------------------------------------------------------");
+
+                list.forEach(item => {
+                    if ((options.e || options.enabled) && !item.enabled) return;
+                    if (item.id === chrome.runtime.id) return;
+
+                    const checkMark = item.enabled ? "[x]" : "[ ]";
+                    const statusColor = item.enabled ? "var(--color-accent-green, #4CAF50)" : "gray";
+                    const nameColor = item.enabled ? "var(--terminal-foreground-color)" : "gray";
+                    
+                    let typeLabel = "";
+                    if (item.type === 'theme') typeLabel = " (theme)";
+                    else if (item.type !== 'extension') typeLabel = " (app)";
+
+                    const idHtml = `<span style="color:gray">${item.id}</span>`;
+                    const stateHtml = `<span style="color:${statusColor}">${checkMark}</span>`;
+                    const nameHtml = `<span style="color:${nameColor}">${term.escapeHtml(item.name)}${typeLabel}</span>`;
+                    
+                    term.writeHtml(`${idHtml}  ${stateHtml}    ${nameHtml}`);
+                });
+
+            } else if (subCommand === 'toggle' || subCommand === 'enable' || subCommand === 'disable') {
+                const id = args[1];
+                if (!id) { term.writeHtml(`<span class="term-error">Usage: ext ${subCommand} <extension-id></span>`); return; }
+
+                const ext = await new Promise(resolve => {
+                    chrome.management.get(id, (info) => resolve(chrome.runtime.lastError ? null : info));
+                });
+
+                if (!ext) {
+                    term.writeHtml(`<span class="term-error">Error: Extension ${id} not found.</span>`);
+                    return;
+                }
+
+                let newState;
+                if (subCommand === 'toggle') newState = !ext.enabled;
+                else if (subCommand === 'enable') newState = true;
+                else newState = false;
+
+                await new Promise(r => chrome.management.setEnabled(id, newState, r));
+                
+                const statusStr = newState ? "ENABLED" : "DISABLED";
+                const color = newState ? "var(--color-accent-green, #4CAF50)" : "gray";
+                
+                term.writeHtml(`Extension '${term.escapeHtml(ext.name)}' is now <span style="color:${color}; font-weight:bold">${statusStr}</span>.`);
+
+            } else if (subCommand === 'uninstall' || subCommand === 'rm') {
+                const id = args[1];
+                if (!id) { term.writeHtml(`<span class="term-error">Usage: ext uninstall <extension-id></span>`); return; }
+                
+                chrome.management.uninstall(id, { showConfirmDialog: true }, () => {
+                    if (chrome.runtime.lastError) {
+                        term.writeHtml(`<span class="term-error">Error: ${chrome.runtime.lastError.message}</span>`);
+                    } else {
+                        term.writeLine(`Uninstall request initiated.`);
+                    }
+                });
+
+            } else {
+                term.writeHtml(`<span class="term-error">Usage: ext [ls|toggle|enable|disable|uninstall]</span>`);
+            }
+        } catch (e) {
+            term.writeHtml(`<span class="term-error">Error: ${e.message}</span>`);
+        }
+    },
+    'sysinfo': async (args, options) => {
+        // 1. 获取系统数据
+        const manifest = chrome.runtime.getManifest();
+        const storageUsed = (JSON.stringify(localStorage).length / 1024).toFixed(2);
+        
+        // 解析 User Agent 获取 Chrome 版本和 OS
+        const ua = navigator.userAgent;
+        const chromeVer = ua.match(/Chrome\/([\d.]+)/)?.[1] || "Unknown";
+        const osMatch = ua.match(/\(([^)]+)\)/)?.[1] || "Web OS";
+        
+        // 获取屏幕和窗口信息
+        const screenRes = `${window.screen.width}x${window.screen.height}`;
+        const termSize = `${term.cols}x${term.rows}`;
+        
+        // 计算 Uptime
+        const startTime = window.st2_startTime || Date.now();
+        const uptimeMin = Math.floor((Date.now() - startTime) / 60000);
+        const uptimeStr = uptimeMin > 60 ? `${Math.floor(uptimeMin/60)}h ${uptimeMin%60}m` : `${uptimeMin}m`;
+
+        // 2. 定义 Logo (HTML 格式以支持特定颜色)
+        // 提取自 icon128.png 的配色
+        const cBlue = "#4285F4";  // Google Blue
+        const cRed  = "#EA4335";  // Google Red
+        const cWht  = "var(--terminal-foreground-color, #fff)"; // 跟随主题文字色
+        const cGry  = "#5f6368";  // 边框灰
+
+        const logoLines = [
+            `<span style="color:${cGry}">╭──────────────────────╮</span>`,
+            `<span style="color:${cGry}">│</span> <span style="color:${cBlue}">\\</span>         <span style="color:${cWht}">_.(##)._</span>   <span style="color:${cGry}">│</span>`,
+            `<span style="color:${cGry}">│</span>  <span style="color:${cBlue}">\\</span>        <span style="color:${cWht}">(_####_)</span>   <span style="color:${cGry}">│</span>`,
+            `<span style="color:${cGry}">│</span>  <span style="color:${cRed}">/</span>         <span style="color:${cWht}">'(__)'</span>    <span style="color:${cGry}">│</span>`,
+            `<span style="color:${cGry}">│</span> <span style="color:${cRed}">/</span>          <span style="color:${cWht}">______</span>    <span style="color:${cGry}">│</span>`,
+            `<span style="color:${cGry}">╰──────────────────────╯</span>`
+        ];
+
+        // 3. 定义信息行
+        // 使用 CSS 变量 var(--color-accent-green) 以便未来可以通过 style/theme 命令调节高亮色
+        const accent = "var(--color-accent-green, #4CAF50)";
+        
+        const infoLines = [
+            `<span style="color:${accent}; font-weight:bold;">${Environment.USER}</span>@<span style="color:${accent}; font-weight:bold;">${Environment.HOST}</span>`,
+            `-------------------------`,
+            `<span style="color:${accent}">OS</span>: Chrome OS / Browser`,
+            `<span style="color:${accent}">Kernel</span>: ${osMatch}`,
+            `<span style="color:${accent}">Browser</span>: Chrome ${chromeVer}`,
+            `<span style="color:${accent}">Extension</span>: v${manifest.version}`,
+            `<span style="color:${accent}">Resolution</span>: ${screenRes}`,
+            `<span style="color:${accent}">Terminal</span>: StartTerminal 2.0`,
+            `<span style="color:${accent}">Uptime</span>: ${uptimeStr}`,
+            `<span style="color:${accent}">Memory (VFS)</span>: ${storageUsed} KB`
+        ];
+
+        // 4. 渲染 (左右布局)
+        term.writeLine(""); // 顶部分隔
+        const maxLines = Math.max(logoLines.length, infoLines.length);
+        
+        for (let i = 0; i < maxLines; i++) {
+            // 获取 Logo 行 (如果没有则用空字符串填充，保持对齐)
+            // 注意：因为 Logo 包含 HTML 标签，我们需要一个固定的视觉宽度来做 padding
+            // 简单起见，我们假设 Logo 在视觉上大概占用 26 个字符宽度
+            const logoLine = logoLines[i] || "                        "; 
+            const infoLine = infoLines[i] || "";
+            
+            // 如果 logo 这一行是空的（比如 info 比 logo 长），我们需要补齐空格
+            // 这里用稍微取巧的方式：如果 i >= logoLines.length，我们手动写空格
+            const leftCol = (i < logoLines.length) ? logoLines[i] : "                        ";
+            
+            // 打印： Logo + 间距 + Info
+            term.writeHtml(`${leftCol}   ${infoLine}`);
+        }
+        term.writeLine(""); // 底部分隔
+    },
+
+    // 添加别名 neofetch
+    'neofetch': (args, options) => {
+        return globalCommands.sysinfo(args, options);
+    },
     'sh': async (args, options, pipedInput) => {
         if (!args[0]) {
             term.writeHtml(`<span class="term-error">sh: missing file operand</span>`);
@@ -3926,14 +4123,28 @@ const globalCommands = {
         const url = args[0];
         if (!url) { term.writeHtml('<span class="term-error">Usage: wget <url></span>'); return; }
         
-        if (typeof chrome === 'undefined' || !chrome.downloads) {
-            term.writeHtml(`<span class="term-error">'chrome.downloads' API not available.</span>`);
-            // 'downloads' 权限是默认安装的
-            return;
+        // 1. 动态权限检查 (Downloads Permission)
+        const hasPerm = await new Promise(r => chrome.permissions.contains({ permissions: ['downloads'] }, r));
+
+        if (!hasPerm) {
+            term.writeLine("wget: Requires 'downloads' permission to save files.");
+            try {
+                const granted = await new Promise(r => chrome.permissions.request({ permissions: ['downloads'] }, r));
+                if (!granted) {
+                    term.writeHtml(`<span class="term-error">Permission denied. Cannot execute wget.</span>`);
+                    return;
+                }
+            } catch (e) {
+                term.writeHtml(`<span class="term-error">Error requesting permission: ${e.message}</span>`);
+                return;
+            }
         }
 
+        // 2. 执行下载
         try {
             term.writeLine(`Starting download: ${url}`);
+            
+            // 此时 chrome.downloads 肯定可用
             const downloadId = await new Promise((resolve, reject) => {
                 chrome.downloads.download({ url: url }, (id) => {
                     if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
@@ -3952,22 +4163,31 @@ const globalCommands = {
             return;
         }
 
-        // 权限检查
-        const hasPermission = await new Promise(resolve => {
-            chrome.permissions.contains({ origins: ["<all_urls>"] }, resolve);
-        });
+        // 1. 动态权限检查 (Host Permissions)
+        const origin = "<all_urls>"; // 或者更精确地解析 url 获取 origin
+        const hasPerm = await new Promise(r => chrome.permissions.contains({ origins: [origin] }, r));
 
-        if (!hasPermission) {
-            // 使用 _writeLogHtml
-            term._writeLogHtml(`<span class="term-error">${t('curlPermDenied')}</span>`);
-            term._writeLogHtml(`<span class="term-error">${t('curlPermTry')}</span>`);
-            return;
+        if (!hasPerm) {
+            term.writeLine("curl: Requires permission to access external websites.");
+            try {
+                // 动态请求 Host 权限
+                const granted = await new Promise(r => chrome.permissions.request({ origins: [origin] }, r));
+                if (!granted) {
+                    term.writeHtml(`<span class="term-error">Permission denied. Cannot execute curl.</span>`);
+                    return;
+                }
+                term.writeLine("Permission granted! Continuing...");
+            } catch (e) {
+                term.writeHtml(`<span class="term-error">Error requesting permission: ${e.message}</span>`);
+                return;
+            }
         }
 
+        // 2. 执行 Fetch
         try {
-            // 使用 _writeLogLine
-            term._writeLogLine(t('curlProgress').replace('{0}', url)); // 写入 stderr
+            term._writeLogLine(t('curlProgress').replace('{0}', url)); 
             
+            // mode: 'cors' 是关键
             const response = await fetch(url, { cache: 'no-store', mode: 'cors' });
             
             if (!response.ok) {
@@ -3978,11 +4198,13 @@ const globalCommands = {
             
             // 写入 stdout / 管道
             term.writeLine(text); 
-            return text.split('\n'); //
+            return text.split('\n'); 
             
         } catch(e) {
-            // [!! 核心修复：使用 _writeLogHtml (L629) !!]
-            term._writeLogHtml(`<span class="term-error">${e.message}</span>`); // 写入 stderr
+            term._writeLogHtml(`<span class="term-error">curl error: ${e.message}</span>`);
+            if (e.message.includes("Failed to fetch")) {
+                term._writeLogHtml(`<span class="term-error">Tip: The target server might not allow CORS requests from extensions.</span>`);
+            }
         }
     },
 

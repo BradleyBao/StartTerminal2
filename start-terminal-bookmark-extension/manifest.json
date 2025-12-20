@@ -17,8 +17,6 @@
     "identity", 
     "storage", 
     "tabs",
-    "downloads",
-    "downloads.open",
     "search"],
   "host_permissions": [
     "https://login.microsoftonline.com/*",
@@ -28,7 +26,10 @@
     "https://raw.githubusercontent.com/BradleyBao/StartTerminal2/main/start-terminal-bookmark-extension/repo/*"
   ],
   "optional_permissions": [
-    "history"
+    "history",
+    "downloads",
+    "downloads.open",
+    "management"
   ],
   
   "optional_host_permissions": [
