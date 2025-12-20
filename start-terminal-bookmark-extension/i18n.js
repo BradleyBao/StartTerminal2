@@ -56,6 +56,19 @@ var messages = {
         'cpWritePermDenied': "cp: cannot write to '{0}': Permission denied",
         'cpVfsBin': "cp: VFS scripts can only be copied to /bin.",
         'cpVfsCore': "cp: cannot copy core VFS files.",
+
+        // Syntax Help Keys
+        'helpSyntax': "Syntax & Operators",
+        'help_pipe': "|  Pipe output to the next command.",
+        'help_redirect': ">  Redirect output to file (>> to append).",
+        'help_subcmd': "$() Command substitution (e.g., echo $(date)).",
+        'help_var': "=  Variable assignment (e.g., NAME=Brad).",
+
+        // Command Help Keys
+        'help_ext': "Manage Chrome extensions (ls, toggle, uninstall).",
+        'help_theme': "Switch themes (e.g., theme matrix) or list them.",
+        'help_jq': "Process JSON input from pipes (e.g., curl ... | jq .data).",
+        'help_neofetch': "Show system information (alias for sysinfo).",
         
         // --- Permissions ---
         'chmodReadOnly': "chmod: {0}: Read-only file system.",
@@ -349,6 +362,19 @@ var messages = {
         'curlProgress': "正在抓取 {0}...",
         'curlHttpError': "HTTP 错误! 状态: {0}",
         'treeApiError': "'chrome.bookmarks' API 不可用。",
+
+        // Syntax Help Keys
+        'helpSyntax': "语法与操作符",
+        'help_pipe': "|  管道：将输出传递给下一个命令。",
+        'help_redirect': ">  重定向：输出到文件 (>> 追加，< 输入)。",
+        'help_subcmd': "$() 命令替换：将命令结果作为参数 (例如 echo $(date))。",
+        'help_var': "=  变量赋值 (例如 NAME=Brad)。",
+
+        // Command Help Keys
+        'help_ext': "管理 Chrome 扩展程序 (ls, toggle, uninstall)。",
+        'help_theme': "切换终端主题 (例如 theme matrix) 或列出主题。",
+        'help_jq': "处理来自管道的 JSON 数据 (例如 curl ... | jq .data)。",
+        'help_neofetch': "显示系统信息 (sysinfo 的别名)。",
 
         // --- Shell Commands ---
         'shUsage': "sh: 缺少文件操作数",

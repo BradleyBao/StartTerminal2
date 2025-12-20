@@ -43,6 +43,45 @@ const Environment = {
 }
 
 
+
+/**
+ * [全局工具] 将颜色转换为 RGBA 格式
+ * @param {string} color - Hex (#fff, #ffffff), rgb(), or rgba()
+ * @param {number} alpha - 透明度 (0.0 - 1.0)
+ * @returns {string} rgba(...) 字符串
+ */
+function toRgba(color, alpha) {
+    // 1. 处理 Hex (#FFF 或 #FFFFFF)
+    if (color.startsWith('#')) {
+        let hex = color.slice(1);
+        if (hex.length === 3) {
+            hex = hex.split('').map(c => c + c).join(''); // FFF -> FFFFFF
+        }
+        const r = parseInt(hex.substring(0, 2), 16);
+        const g = parseInt(hex.substring(2, 4), 16);
+        const b = parseInt(hex.substring(4, 6), 16);
+        return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    }
+    
+    // 2. 处理 rgb(r, g, b)
+    if (color.startsWith('rgb(')) {
+        const parts = color.match(/\d+/g);
+        if (parts && parts.length >= 3) {
+            return `rgba(${parts[0]}, ${parts[1]}, ${parts[2]}, ${alpha})`;
+        }
+    }
+    
+    // 3. 处理 rgba(r, g, b, a) -> 替换 a
+    if (color.startsWith('rgba(')) {
+        const parts = color.match(/[\d.]+/g);
+        if (parts && parts.length >= 3) {
+            return `rgba(${parts[0]}, ${parts[1]}, ${parts[2]}, ${alpha})`;
+        }
+    }
+    
+    return color; // 如果无法解析，返回原值
+}
+
 /**
  * 加载指定用户的环境
  * @param {string} username - "user" 或 "bradley" 等
@@ -127,6 +166,91 @@ function unescapePath(str) {
 }
 
 /**
+ * [工具] 写入文件 (处理重定向)
+ */
+async function writeFile(path, contentLines, append = false) {
+    if (path === '/dev/null') return; // 黑洞
+
+    const content = contentLines.join('\n');
+    
+    // 1. 查找文件节点
+    const result = bookmarkSystem._findNodeByPath(path);
+    let node = result ? result.node : null;
+
+    // 2. 如果文件不存在，创建它
+    if (!node) {
+        // 解析路径 (类似 touch)
+        const parentPath = path.substring(0, path.lastIndexOf('/')) || (path.includes('/') ? '/' : '.');
+        const fileName = path.split('/').pop();
+        
+        const parentResult = bookmarkSystem._findNodeByPath(parentPath);
+        if (!parentResult || !parentResult.node) throw new Error(`Directory not found: ${parentPath}`);
+        
+        // 创建逻辑 (区分 VFS /bin 和普通书签)
+        if (parentResult.node.id === 'vfs-bin') {
+             // VFS script
+             saveVfsScript(fileName, content, 0o644, Environment.USER);
+             await bookmarkSystem._refreshBookmarks(); // 刷新
+             return;
+        } else {
+             // 书签
+             await new Promise(r => chrome.bookmarks.create({
+                 parentId: parentResult.node.id,
+                 title: fileName,
+                 url: 'data:text/plain,' + encodeURIComponent(content)
+             }, r));
+             return;
+        }
+    }
+
+    // 3. 文件存在，执行覆盖或追加
+    let newContent = content;
+    if (append) {
+        // 读取旧内容
+        let oldContent = "";
+        if (node.id.startsWith('vfs-')) {
+             const b64 = (node.url||'').split(',')[1]||'';
+             oldContent = decodeURIComponent(atob(b64));
+        } else {
+             oldContent = decodeURIComponent(node.url.replace('data:text/plain,', ''));
+        }
+        newContent = oldContent + '\n' + content;
+    }
+
+    // 保存
+    if (node.id.startsWith('vfs-bin-')) {
+        saveVfsScript(node.title, newContent);
+    } else if (node.id === 'vfs-startrc') {
+        localStorage.setItem('.startrc', newContent);
+    } else {
+        chrome.bookmarks.update(node.id, { url: 'data:text/plain,' + encodeURIComponent(newContent) });
+    }
+}
+
+/**
+ * [工具] 读取文件 (用于 < 输入重定向)
+ */
+function readFileContent(path) {
+    const result = bookmarkSystem._findNodeByPath(path);
+    if (!result || !result.node) throw new Error(`No such file: ${path}`);
+    
+    const node = result.node;
+    if (node.children) throw new Error(`Is a directory: ${path}`);
+
+    if (node.id.startsWith('vfs-')) {
+        const b64 = (node.url||'').split(',')[1]||'';
+        return decodeURIComponent(atob(b64));
+    } else {
+        // 假设是 data:text/plain
+        const raw = node.url || "";
+        if (raw.startsWith('data:text/plain')) {
+             return decodeURIComponent(raw.substring(raw.indexOf(',') + 1));
+        }
+        return raw; // 普通 URL
+    }
+}
+
+/**
  * 核心终端模拟器类
  */
 class Terminal {
@@ -162,6 +286,9 @@ class Terminal {
         this.isReading = false;
         this.readResolve = null;
 
+        // 静默模式开关
+        this.isSilent = false;
+
         try {
             const savedHistory = localStorage.getItem('st2_cmd_history');
             this.history = savedHistory ? JSON.parse(savedHistory) : [];
@@ -192,6 +319,31 @@ class Terminal {
         this._initBuffer();
         this._attachListeners();
         this.focus();
+
+        // I/O 重定向状态
+        this.ioState = {
+            stdout: null, // null = 屏幕, { type: 'overwrite'|'append', path: '...' } = 文件
+            stderr: null,
+            buffer: { stdout: [], stderr: [] }
+        };
+    }
+
+    /**
+     * 重置重定向状态 (每次命令前调用)
+     */
+    resetIO() {
+        this.ioState = { stdout: null, stderr: null, buffer: { stdout: [], stderr: [] } };
+    }
+
+    /**
+     * 设置重定向
+     * @param {number} fd - 1 (stdout) or 2 (stderr)
+     * @param {string} type - '>' (overwrite) or '>>' (append)
+     * @param {string} path - 目标文件路径
+     */
+    setRedirect(fd, type, path) {
+        if (fd === 1) this.ioState.stdout = { type, path };
+        if (fd === 2) this.ioState.stderr = { type, path };
     }
 
     clearLastLines(count) {
@@ -752,12 +904,43 @@ class Terminal {
             }
         }
         this.domBuffer.innerHTML = html;
-        this.scrollToBottom();
+        this.scrollToCursor();
     }
 
+    // Deprecated 
     scrollToBottom() {
         requestAnimationFrame(() => {
             this.container.scrollTop = this.container.scrollHeight;
+        });
+    }
+
+    /**
+     * 智能滚动：始终确保光标在视口内可见
+     * 替代原来的 scrollToBottom，避免缩放时跳到大量空白处
+     */
+    scrollToCursor() {
+        requestAnimationFrame(() => {
+            if (!this.cellHeight) return;
+
+            // 1. 计算光标当前行的像素位置 (Top 和 Bottom)
+            const cursorTop = this.cursorY * this.cellHeight;
+            const cursorBottom = cursorTop + this.cellHeight;
+
+            // 2. 获取当前视口状态
+            const viewportHeight = this.container.clientHeight;
+            const currentScrollTop = this.container.scrollTop;
+
+            // 3. 判断与滚动
+            // 情况 A: 光标跑到了视口上方 -> 向上滚动，直到光标出现在顶部
+            if (cursorTop < currentScrollTop) {
+                this.container.scrollTop = cursorTop;
+            }
+            // 情况 B: 光标跑到了视口下方 -> 向下滚动，直到光标出现在底部
+            else if (cursorBottom > currentScrollTop + viewportHeight) {
+                this.container.scrollTop = cursorBottom - viewportHeight;
+            }
+            
+            // 情况 C: 光标在视口中间 -> 什么都不做 (这是防止画面抖动的关键)
         });
     }
 
@@ -830,7 +1013,7 @@ class Terminal {
             this.cursorY--;      // 光标上移
         }
 
-        this.scrollToBottom(); // 自动滚动到底部
+        this.scrollToCursor(); // 自动滚动到底部
     }
 
     /**
@@ -885,30 +1068,59 @@ class Terminal {
     }
 
     /**
-     * [公共] 打印一行文本
-     * @param {string} text
+     * 标准输出 (stdout)
      */
     writeLine(text) {
-        const textString = String(text);
-        
-        // 功能 1：管道支持
-        if (isPiping) {
-            pipeBuffer.push(textString);
-            return;
+        if (this.isSilent) return; // $(...) 静默模式优先级最高
+
+        // 检查是否重定向
+        if (this.ioState.stdout) {
+            // 如果是 /dev/null，直接丢弃
+            if (this.ioState.stdout.path === '/dev/null') return;
+            // 否则存入缓冲区
+            this.ioState.buffer.stdout.push(text);
+        } else {
+            // 正常写屏
+            if (isPiping) {
+                pipeBuffer.push(String(text));
+            } else {
+                this._prepareOutput();
+                this.writeHtml(this.escapeHtml(String(text)));
+            }
         }
-
-        // const currentBufferLine = this.buffer[this.cursorY] || "";
-        // const hasContent = this._stripHtml(currentBufferLine).trim().length > 0;
-
-        // if (this.cursorX > 0 || hasContent) {
-        //     this._handleNewline();
-        //     this.cursorX = 0;
-            
-        // }
-        this._prepareOutput();
-
-        this.writeHtml(this.escapeHtml(textString));
     }
+
+    /**
+     * 标准错误输出 (stderr)
+     * 所有之前的 term.writeHtml(`<span class="term-error">...</span>`) 都应该改用这个
+     */
+    writeError(text) {
+        if (this.ioState.stderr) {
+            if (this.ioState.stderr.path === '/dev/null') return;
+            this.ioState.buffer.stderr.push(text);
+        } else {
+            // 正常写屏 (红色)
+            this._prepareOutput();
+            // 注意：这里手动加 span，或者你也可以封装进去
+            const html = `<span class="term-error">${text}</span>`;
+            
+            // 为了复用 writeHtml 的逻辑 (自动换行等)，我们直接调用它
+            // 但 writeHtml 会受 ioState.stdout 影响吗？
+            // 这是一个设计点。为了简单，我们让 writeHtml 总是写屏(除非 isSilent)，
+            // 而 writeLine 负责 stdout。
+            // 更好的做法是直接操作 DOM 或调用底层 _writeSingleLine
+            
+            // 临时方案：直接写 buffer
+            const lines = html.split('\n');
+            for(let l of lines) {
+                this.buffer[this.cursorY] = this._overwriteHtml(this.buffer[this.cursorY], this.cursorX, l);
+                this._handleNewline();
+            }
+            this._render();
+        }
+    }
+
+    
 
     /**
      * 准备输出：确保当前行是干净的
@@ -1061,11 +1273,15 @@ class Terminal {
         return result;
     }
 
+    /**
+     * [修复版] 截取 HTML 字符串，感知 HTML 实体 (如 &quot;) 为单个字符
+     * 防止在实体中间截断导致显示乱码
+     */
     _truncateHtml(html, length, start = 0) {
         let visibleCount = 0;
         let captureCount = 0;
         let startIndex = 0;
-        let endIndex = 0;
+        let endIndex = html.length; // 默认为末尾
         let inTag = false;
         let foundStart = (start === 0);
 
@@ -1073,45 +1289,82 @@ class Terminal {
 
         for (let i = 0; i < html.length; i++) {
             const char = html[i];
-            if (char === '<') {
-                inTag = true;
-            } else if (char === '>') {
-                inTag = false;
+            
+            if (char === '<') inTag = true;
+
+            // --- 核心修复：检测 HTML 实体 ---
+            let isEntity = false;
+            let entityLen = 0;
+            // 如果不在标签内，且遇到 &，尝试向后查找 ;
+            if (!inTag && char === '&') {
+                const nextSemi = html.indexOf(';', i);
+                // 限制查找范围（比如 12 字符内），防止误判普通文本中的 &
+                if (nextSemi !== -1 && nextSemi - i < 12) {
+                     isEntity = true;
+                     entityLen = nextSemi - i + 1; // 实体总长度 (例如 &quot; 是 6)
+                }
             }
+            // -----------------------------
 
             if (!inTag) {
                 if (!foundStart) {
-                    // --- 1. 跳过阶段 ---
-                    visibleCount++;
+                    // --- 1. 跳过阶段 (Skipping) ---
+                    visibleCount++; // 实体算作 1 个可见宽度
+                    
+                    // 如果是实体，跳过整个实体长度
+                    if (isEntity) i += (entityLen - 1);
+                    
                     if (visibleCount >= start) {
                         foundStart = true;
-                        startIndex = i; // 从这个 HTML 索引开始捕获
+                        startIndex = i + 1; // 下一个字符开始捕获
                     }
-                }
-                
-                if (foundStart) {
-                    // --- 2. 捕获阶段 ---
+                } else {
+                    // --- 2. 捕获阶段 (Capturing) ---
                     captureCount++;
+                    
+                    // 如果是实体，跳过整个实体长度（保证不切断）
+                    if (isEntity) i += (entityLen - 1);
+                    
                     if (captureCount >= length) {
-                        // 我们已捕获足够的字符。
-                        endIndex = i + 1; // 结束索引是当前字符之后
-                        break;
+                        endIndex = i + 1;
+                        break; // 完成
                     }
                 }
+            } else if (char === '>') {
+                inTag = false;
             }
-
-            // 如果我们还没 break，则 endIndex 必须至少跟上 i
-            endIndex = i + 1;
         }
 
-        if (!foundStart) return ""; // 从未找到起始点
+        if (!foundStart) return "";
         return html.substring(startIndex, endIndex);
     }
 
     writeHtml(html) {
+        if (this.isSilent) return;
         // 功能 1：管道支持
         if (isPiping) {
             pipeBuffer.push(this._stripHtml(html)); // 管道中只应传递纯文本
+            return;
+        }
+
+        if (this.ioState.stderr && html.includes('class="term-error"')) {
+             if (this.ioState.stderr.path === '/dev/null') return; // 丢弃
+             // 剥离 HTML 标签，只存纯文本错误信息
+             this.ioState.buffer.stderr.push(this._stripHtml(html));
+             return;
+        }
+
+        // 标准输出流拦截 (Stdout Redirection >)
+        if (this.ioState.stdout) {
+            if (this.ioState.stdout.path === '/dev/null') return; // 丢弃
+            // 将 HTML 转换为纯文本保存 (文件通常只存纯文本)
+            this.ioState.buffer.stdout.push(this._stripHtml(html));
+            return;
+        }
+
+        // 管道支持 (Pipe |)
+        if (isPiping) {
+            pipeBuffer.push(this._stripHtml(html)); // 管道传递纯文本
             return;
         }
 
@@ -1335,6 +1588,17 @@ class Terminal {
                 this._render(); // [!] 移动到内部
             }
             return; // 结束
+
+        } else if (e.key === 'Delete') {
+            e.preventDefault();
+            const pos = this.cursorX - this.prompt.length;
+            // 只有当光标不在行尾时才删除
+            if (pos < this.currentLine.length) {
+                this.currentLine = this.currentLine.substring(0, pos) + this.currentLine.substring(pos + 1);
+                // 光标位置不变，但文字变短了
+                this._render();
+            }
+            return;
 
         } else if (e.key === 'ArrowLeft') {
             e.preventDefault();
@@ -1712,6 +1976,29 @@ class NanoEditor {
                         this._render();
                     }
                     break;
+
+                case 'k':
+                    this.dirty = true;
+                    if (this.lines.length > 0) {
+                        // 删除当前行
+                        this.lines.splice(this.cursorY, 1);
+                        
+                        // 如果删完了，至少保留一行空行
+                        if (this.lines.length === 0) {
+                            this.lines.push("");
+                        }
+                        
+                        // 如果光标在最后一行被删后，上移一行
+                        if (this.cursorY >= this.lines.length) {
+                            this.cursorY = this.lines.length - 1;
+                        }
+                        // 确保 X 不越界
+                        this.cursorX = Math.min(this.cursorX, this.lines[this.cursorY].length);
+                        
+                        this._handleScrolling();
+                        this._render();
+                    }
+                    break;
             }
         } else {
             const isEditKey = ['Backspace', 'Enter'].includes(e.key) || 
@@ -1902,10 +2189,12 @@ class BookmarkSystem {
                 if (result && result.node && result.node.children) {
                     targetNode = result.node;
                 } else if (result && result.node) {
-                    this.term.writeHtml(`<span class="term-error">ls: ${targetPath}: Not a directory</span>`);
+                    // [修改] 使用 writeError
+                    this.term.writeError(`ls: ${targetPath}: Not a directory`);
                     return;
                 } else {
-                    this.term.writeHtml(`<span class="term-error">ls: ${targetPath}: No such directory</span>`);
+                    // [修改] 使用 writeError
+                    this.term.writeError(`ls: ${targetPath}: No such directory`);
                     return;
                 }
 
@@ -3464,20 +3753,38 @@ function compareVersions(v1, v2) {
 
 // Helper Function 
 function loadStyleSettings() {
+    // 1. 加载 Theme (基准)
+    const currentTheme = ThemeManager.load(); 
+
+    // 2. 加载 Font (独立设置)
     const savedFont = localStorage.getItem('terminalFontFamily');
     const savedSize = localStorage.getItem('terminalFontSize');
+    
     const rootStyle = getComputedStyle(document.documentElement);
     const defaultFont = rootStyle.getPropertyValue('--terminal-font-family').trim() || "'Consolas', 'Courier New', monospace";
     const defaultSize = rootStyle.getPropertyValue('--terminal-font-size').trim() || '14px';
+
     const fontFamily = savedFont || defaultFont;
     const fontSize = savedSize || defaultSize;
+
     document.documentElement.style.setProperty('--terminal-font-family', fontFamily);
     document.documentElement.style.setProperty('--terminal-font-size', fontSize);
 
-    // Themes 
-    const currentTheme = ThemeManager.load(); // <--- 调用 theme.js
+    // 3. 加载 Override (覆盖层)
+    // 允许用户覆盖 theme 中的具体颜色，或设置壁纸
+    try {
+        const overrides = JSON.parse(localStorage.getItem('style_overrides') || '{}');
+        for (const [key, value] of Object.entries(overrides)) {
+            // key 应该是 css 变量名，例如 '--terminal-accent'
+            document.documentElement.style.setProperty(key, value);
+        }
+    } catch (e) {
+        console.warn("Failed to load style overrides", e);
+    }
+
     return { fontFamily, fontSize, theme: currentTheme };
 }
+
 function saveStyleSettings() {
     const currentFont = getComputedStyle(document.documentElement).getPropertyValue('--terminal-font-family').trim();
     const currentSize = getComputedStyle(document.documentElement).getPropertyValue('--terminal-font-size').trim();
@@ -3633,6 +3940,69 @@ const globalCommands = {
             term.writeLine(`Theme changed to '${themeName}'.`);
         } else {
             term.writeHtml(`<span class="term-error">Theme '${themeName}' not found. Try 'theme ls'.</span>`);
+        }
+    },
+    // --- JSON 处理器 ---
+    'jq': (args, options, pipedInput) => {
+        if (!pipedInput || pipedInput.length === 0) {
+            term.writeHtml(`<span class="term-error">jq: error: no input data (use pipe)</span>`);
+            return;
+        }
+
+        const path = args[0]; // e.g., ".url" or "[0].url" or "data.image"
+        
+        try {
+            // 1. 将管道输入的行合并回单个 JSON 字符串
+            const jsonString = pipedInput.join('');
+            let data = JSON.parse(jsonString);
+
+            // 2. 如果没有参数，直接格式化输出整个 JSON
+            if (!path || path === '.') {
+                const pretty = JSON.stringify(data, null, 2);
+                const lines = pretty.split('\n');
+                lines.forEach(l => term.writeLine(l));
+                return lines;
+            }
+
+            // 3. 解析路径 (非常简易的解析器: 支持 .key 和 [index])
+            // 将 "[0].url" 转换为 ["0", "url"]
+            const cleanPath = path.replace(/^\./, ''); // 去除开头的 .
+            // 使用正则拆分: 匹配点号或方括号
+            const keys = cleanPath.split(/[.\[\]]+/).filter(k => k !== '');
+
+            let current = data;
+            for (const key of keys) {
+                if (current === undefined || current === null) break;
+                
+                // 尝试作为数组索引
+                if (Array.isArray(current) && !isNaN(parseInt(key))) {
+                    current = current[parseInt(key)];
+                } else {
+                    // 作为对象键
+                    current = current[key];
+                }
+            }
+
+            // 4. 输出结果
+            if (current === undefined) {
+                term.writeHtml(`<span class="term-error">jq: value not found at path '${path}'</span>`);
+                return;
+            }
+
+            // 如果结果是字符串，直接输出（不带引号，方便作为命令参数）
+            // 如果是对象/数组，格式化输出
+            let output;
+            if (typeof current === 'string') {
+                output = current;
+            } else {
+                output = JSON.stringify(current);
+            }
+            
+            term.writeLine(output);
+            return [output]; // 返回给管道下一级
+
+        } catch (e) {
+            term.writeHtml(`<span class="term-error">jq: parse error: ${e.message}</span>`);
         }
     },
     'sysinfo': async (args, options) => {
@@ -4425,13 +4795,22 @@ const globalCommands = {
         term.writeLine(t('helpTitle'));
         term.writeLine("---");
         
-        term.writeHtml(`<b>${t('helpFS')}</b>`);
+        // 1. 核心与语法 (新增部分)
+        term.writeHtml(`<b>${t('helpSyntax')}</b>`);
+        term.writeHtml(formatHelp('|', 'help_pipe'));
+        term.writeHtml(formatHelp('> >> < 2>', 'help_redirect'));
+        term.writeHtml(formatHelp('$(...)', 'help_subcmd'));
+        term.writeHtml(formatHelp('VAR=VAL', 'help_var'));
+
+        term.writeHtml(`\n<b>${t('helpFS')}</b>`);
         term.writeHtml(formatHelp('ls', 'help_ls'));
         term.writeHtml(formatHelp('cd', 'help_cd'));
         term.writeHtml(formatHelp('cat', 'help_cat'));
         term.writeHtml(formatHelp('nano', 'help_nano'));
         term.writeHtml(formatHelp('mkdir', 'help_mkdir'));
         term.writeHtml(formatHelp('rm', 'help_rm'));
+        term.writeHtml(formatHelp('cp', 'cpUsage')); // 确保 i18n 有这个
+        term.writeHtml(formatHelp('mv', 'mvUsage')); // 确保 i18n 有这个
         term.writeHtml(formatHelp('sh, ./', 'help_sh'));
         term.writeHtml(formatHelp('chmod', 'help_chmod'));
         term.writeHtml(formatHelp('chown', 'help_chown'));
@@ -4445,18 +4824,21 @@ const globalCommands = {
         term.writeHtml(formatHelp('alias', 'help_alias'));
         term.writeHtml(formatHelp('unalias', 'help_unalias'));
         term.writeHtml(formatHelp('source, .', 'help_source'));
+        term.writeHtml(formatHelp('theme', 'help_theme')); // [新增]
+        term.writeHtml(formatHelp('ext', 'help_ext'));     // [新增]
         
         term.writeHtml(`\n<b>${t('helpUtil')}</b>`);
         term.writeHtml(formatHelp('apt', 'help_apt'));
         term.writeHtml(formatHelp('open', 'help_open'));
         term.writeHtml(formatHelp('search', 'help_search'));
+        term.writeHtml(formatHelp('curl', 'curlUsage'));
+        term.writeHtml(formatHelp('wget', 'wgetUsage'));
+        term.writeHtml(formatHelp('jq', 'help_jq'));       // [新增]
         term.writeHtml(formatHelp('style', 'help_style'));
         term.writeHtml(formatHelp('date', 'help_date'));
-        term.writeHtml(formatHelp('cal', 'help_cal'));
-        term.writeHtml(formatHelp('uptime', 'help_uptime'));
+        term.writeHtml(formatHelp('sysinfo', 'help_neofetch'));
         term.writeHtml(formatHelp('clear', 'help_clear'));
         term.writeHtml(formatHelp('whatsnew', 'help_whatsnew'));
-        term.writeHtml(formatHelp('help', 'help_help'));
         
         term.writeLine("\n" + t('helpMore'));
     },
@@ -4468,108 +4850,215 @@ const globalCommands = {
              if (options.v || options.verbose) { term.writeLine(" (Verbose mode enabled!)"); }
          } else { term.writeHtml(`<span class="term-error">${t('greetUsage')}</span>`); }
      },
-     'style': async (args, options) => {
+     'style': async (args, options, pipedInput) => {
         const subCommand = args[0];
-        const value = args.slice(1).join(' ');
-        const rootStyle = getComputedStyle(document.documentElement);
-        const currentFont = rootStyle.getPropertyValue('--terminal-font-family').trim();
-        const currentSize = rootStyle.getPropertyValue('--terminal-font-size').trim();
+        const value = args.slice(1).join(' '); 
+        if (pipedInput) options._pipedInput = pipedInput;
+
+        // 辅助：保存 Override
+        const setOverride = (cssVar, cssValue) => {
+            const overrides = JSON.parse(localStorage.getItem('style_overrides') || '{}');
+            if (cssValue === null) {
+                delete overrides[cssVar]; 
+            } else {
+                overrides[cssVar] = cssValue;
+            }
+            localStorage.setItem('style_overrides', JSON.stringify(overrides));
+            
+            if (cssValue === null) {
+                ThemeManager.load();
+                loadStyleSettings(); 
+            } else {
+                document.documentElement.style.setProperty(cssVar, cssValue);
+            }
+        };
+
         if (!subCommand) {
-            term.writeLine(`${t('styleCurrent')}:`);
-            term.writeLine(`  font: ${currentFont}`);
-            term.writeLine(`  size: ${currentSize}`);
+            term.writeLine("Usage: style <command> [value]");
+            term.writeLine("Commands:");
+            term.writeLine("  font <name>       Set font family");
+            term.writeLine("  size <size>       Set font size (e.g. 16px)");
+            term.writeLine("  bg <color>        Set background color");
+            term.writeLine("  fg <color>        Set foreground (text) color");
+            term.writeLine("  accent <color>    Set accent color");
+            term.writeLine("  cursor <color>    Set cursor color");
+            term.writeLine("  wall <url|none>   Set wallpaper");
+            term.writeLine("  opacity <0-1>     Set background opacity");
+            term.writeLine("  reset             Reset all styles");
             return;
         }
+
         let needsResize = false;
+
         switch (subCommand.toLowerCase()) {
             case 'font':
-                if (!value) { 
-                    // 如果用户只输入 "style font"，则显示帮助
-                    term.writeLine("Usage: style font \"<font-name>\"");
-                    term.writeLine("\nRecommended monospace fonts (must be installed on your system):");
-                    // (使用与 'help' (L1538) 命令相同的颜色 (L1453))
-                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>'Fira Code'</span> (Default, supports ligatures)");
-                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>'SF Mono'</span> (macOS, user favorite)");
-                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>'Menlo'</span> (macOS)");
-                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>'Consolas'</span> (Windows)");
-                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>'JetBrains Mono'</span> (Popular, free)");
-                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>'Courier New'</span> (Universal fallback)");
-                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>monospace</span> (Generic)");
-                    term.writeLine("\nExample: style font \"Fira Code\"");
-                    return; // 退出，不执行后续代码
+                if (!value) { term.writeHtml(`<span class="term-error">Usage: style font "Fira Code"</span>`); return; }
+                document.documentElement.style.setProperty('--terminal-font-family', value);
+                localStorage.setItem('terminalFontFamily', value);
+                term.writeLine(`Font set to: ${value}`);
+                needsResize = true;
+                break;
+
+            case 'size':
+                if (!value) { term.writeHtml(`<span class="term-error">Usage: style size 16px</span>`); return; }
+                document.documentElement.style.setProperty('--terminal-font-size', value);
+                localStorage.setItem('terminalFontSize', value);
+                term.writeLine(`Size set to: ${value}`);
+                needsResize = true;
+                break;
+
+            case 'bg':
+                if (!value) { term.writeHtml(`<span class="term-error">Usage: style bg #000000</span>`); return; }
+                setOverride('--terminal-background-color', value);
+                term.writeLine(`Background color set to: ${value}`);
+                break;
+
+            case 'fg':
+                if (!value) { term.writeHtml(`<span class="term-error">Usage: style fg #ffffff</span>`); return; }
+                setOverride('--terminal-foreground-color', value);
+                term.writeLine(`Foreground color set to: ${value}`);
+                break;
+
+            case 'accent':
+                if (!value) { term.writeHtml(`<span class="term-error">Usage: style accent #ff0000</span>`); return; }
+                setOverride('--terminal-accent', value);
+                setOverride('--color-accent-green', value); // 兼容旧变量
+                term.writeLine(`Accent color set to: ${value}`);
+                break;
+                
+            case 'cursor':
+                if (!value) { term.writeHtml(`<span class="term-error">Usage: style cursor #00ff00</span>`); return; }
+                setOverride('--cursor-bg-color', value);
+                term.writeLine(`Cursor color set to: ${value}`);
+                break;
+
+            // --- [新增] Opacity ---
+            case 'opacity':
+                const opacity = parseFloat(value);
+                if (isNaN(opacity) || opacity < 0 || opacity > 1) {
+                    term.writeHtml(`<span class="term-error">Usage: style opacity <0.0 - 1.0></span>`); 
+                    return; 
+                }
+                
+                // 1. 获取当前生效的背景色 (可能是 Override 的，也可能是 Theme 的)
+                const currentBg = getComputedStyle(document.documentElement).getPropertyValue('--terminal-background-color').trim();
+                
+                // 2. 转换为带透明度的 RGBA
+                const newRgba = toRgba(currentBg, opacity);
+                
+                // 3. 设置为 Override
+                setOverride('--terminal-background-color', newRgba);
+                term.writeLine(`Opacity set to ${opacity}. (Color: ${newRgba})`);
+                break;
+
+            case 'wall': 
+            case 'wallpaper':
+                // [修改] 优先使用参数，如果没有参数，检查管道输入
+                let targetUrl = value;
+                
+                // 如果用户没输 URL，且有管道输入 (例如: echo url | style wall)
+                if (!targetUrl && options._pipedInput && options._pipedInput.length > 0) {
+                    targetUrl = options._pipedInput[0].trim();
                 }
 
-                if (value.length < 3) { term.writeHtml(`<span class="term-error">${t('styleInvalidSize')} "${value}"</span>`); return; }
-                document.documentElement.style.setProperty('--terminal-font-family', value);
-                term.writeLine(`${t('fontSet')} ${value}`);
-                needsResize = true;
+                if (!targetUrl) { 
+                    term.writeHtml(`<span class="term-error">Usage: style wall <url> (or pipe a url)</span>`); 
+                    return; 
+                }
+                
+                if (targetUrl === 'none') {
+                    setOverride('--terminal-background-image', 'none');
+                    term.writeLine("Wallpaper removed. (Use 'style opacity 1' if needed)");
+                } else {
+                    const urlStr = `url('${targetUrl}')`;
+                    setOverride('--terminal-background-image', urlStr);
+                    
+                    // 智能透明度调整
+                    const currentBg = getComputedStyle(document.documentElement).getPropertyValue('--terminal-background-color').trim();
+                    // 检查是否不透明 (hex 或 rgba(.., 1))
+                    if (!currentBg.startsWith('rgba') || currentBg.endsWith(', 1)')) {
+                        const autoRgba = toRgba(currentBg, 0.7);
+                        setOverride('--terminal-background-color', autoRgba);
+                        term.writeLine(`Wallpaper set from pipe/url. Transparency adjusted to 0.7.`);
+                    } else {
+                        term.writeLine(`Wallpaper set.`);
+                    }
+                }
                 break;
-            case 'size':
-                if (!value) { term.writeHtml(`<span class="term-error">${t('styleUsageSize')}</span>`); return; }
-                if (!/^\d+(\.\d+)?(px|em|rem|pt)$/i.test(value)) { term.writeHtml(`<span class="term-error">${t('styleInvalidSize')} "${value}"</span>`); return; }
-                document.documentElement.style.setProperty('--terminal-font-size', value);
-                term.writeLine(`${t('sizeSet')} ${value}`);
-                needsResize = true;
-                break;
+
             case 'reset':
                  const defaultFont = "'Fira Code', 'Consolas', 'Courier New', monospace";
                  const defaultSize = "14px";
                  document.documentElement.style.setProperty('--terminal-font-family', defaultFont);
                  document.documentElement.style.setProperty('--terminal-font-size', defaultSize);
-                 term.writeLine(t('styleReset'));
+                 localStorage.setItem('terminalFontFamily', defaultFont);
+                 localStorage.setItem('terminalFontSize', defaultSize);
+                 
+                 localStorage.removeItem('style_overrides');
+                 ThemeManager.load();
+                 
+                 term.writeLine("Style reset to current theme defaults.");
                  needsResize = true;
                  break;
+
             default:
-                term.writeHtml(`<span class="term-error">${t('styleUnknownCmd')} ${subCommand}.</span>`);
+                term.writeHtml(`<span class="term-error">Unknown style command: ${subCommand}</span>`);
                 return;
         }
+
         if (needsResize) {
-            saveStyleSettings();
             await new Promise(resolve => setTimeout(resolve, 50));
             await term._handleResize();
         }
      },
 
      // --- cat 命令 ---
-     'cat': (args, options) => {
-        if (!args[0]) {
-            term.writeHtml(`<span class="term-error">${t('missingOperand')}</span>`);
+     'cat': (args, options, pipedInput) => {
+        // 1. 优先检查是否有输入流 (来自管道 | 或 输入重定向 <)
+        if (pipedInput && pipedInput.length > 0) {
+            pipedInput.forEach(line => term.writeLine(line));
             return;
         }
+
+        // 2. 如果没有输入流，检查参数
+        if (!args[0]) {
+            // 既没有参数也没有输入流 -> 报错
+            term.writeError(`${t('missingOperand')}`);
+            return;
+        }
+
         const path = args[0];
         const result = bookmarkSystem._findNodeByPath(path);
 
         if (!result || !result.node) {
-            term.writeHtml(`<span class="term-error">${t('noSuchFileOrDir')}: ${path}</span>`);
+            term.writeError(`${t('noSuchFileOrDir')}: ${path}`);
             return;
         }
         if (result.node.children) {
-            term.writeHtml(`<span class="term-error">${t('isADir')}: ${path}</span>`);
+            term.writeError(`${t('isADir')}: ${path}`);
             return;
         }
 
         if (!hasPermission(result.node, 'r')) {
-            term.writeHtml(`<span class="term-error">cat: ${path}: ${t('permissionDenied')}</span>`);
+            term.writeError(`cat: ${path}: ${t('permissionDenied')}`);
             return;
         }
 
         const url = result.node.url;
         if (!url) {
-            term.writeLine(""); // 空文件
+            term.writeLine(""); 
             return;
         }
 
-        // 检查是否是 VFS 文件 (startrc 或 bin 脚本)
         if (result.node.id.startsWith('vfs-')) {
             try {
                 const base64Content = url.split(',')[1] || '';
                 const content = decodeURIComponent(atob(base64Content));
-                term.writeLine(content); // 打印解码后的文件内容
+                term.writeLine(content); 
             } catch (e) {
-                term.writeHtml(`<span class="term-error">${path}: Error reading file: ${e.message}</span>`);
+                term.writeError(`${path}: Error reading file: ${e.message}`);
             }
         } else {
-            // 对于普通书签，只打印 URL
             term.writeLine(url);
         }
      },
@@ -5272,7 +5761,7 @@ const subCommandCompletions = {
     'downloads': ['ls', 'open'],
     'tabs': ['ls', 'switch', 'close'],
     'apt': ['update', 'list', 'install', 'remove'],
-    'style': ['font', 'size', 'reset'],
+    'style': ['font', 'size', 'bg', 'fg', 'accent', 'cursor', 'wall', 'opacity', 'reset'],
     'ext': ['ls', 'toggle', 'enable', 'disable', 'uninstall'],
     'theme': () => {
         if (typeof ThemeManager !== 'undefined' && ThemeManager.presets) {
@@ -5351,197 +5840,256 @@ async function updateSystemVersion() {
  * - 正确处理分号 (;) [顺序执行]
  * - 正确处理管道 (|) [流式执行]
  */
+/**
+ * 核心命令执行引擎
+ * 支持:
+ * 1. 变量赋值: VAR=value
+ * 2. 命令替换: $(command)
+ * 3. 顺序执行: cmd1; cmd2
+ * 4. 管道流: cmd1 | cmd2
+ */
 async function executeLine(line) {
+    if (executeNestLevel > 10) return;
     awaiting();
+
+    // --- 1. $(...) 命令替换 (保持不变) ---
+    const subCmdRegex = /\$\((.*?)\)/g;
+    let match;
+    let processedLine = line;
+    while ((match = subCmdRegex.exec(line)) !== null) {
+        const fullMatch = match[0]; 
+        const innerCmd = match[1];  
+        const wasSilent = term.isSilent;
+        term.isSilent = true; 
+        const result = await executeLine(innerCmd); 
+        term.isSilent = wasSilent; 
+        let replacement = "";
+        if (Array.isArray(result)) replacement = result.join(' '); 
+        else if (typeof result === 'object' && result !== null) replacement = JSON.stringify(result);
+        else replacement = String(result || "");
+        processedLine = processedLine.replace(fullMatch, replacement);
+    }
     
-    // 1. 按分号 (;) 拆分，得到顺序命令
-    // const sequentialCommands = line.split(';').map(cmd => cmd.trim()).filter(cmd => cmd.length > 0);
-    
-    const sequentialCommands = line.replace(/\n/g, ';')
+    // --- 2. 顺序执行 ; (保持不变) ---
+    const sequentialCommands = processedLine.replace(/\n/g, ';')
                                    .split(';')
                                    .map(cmd => cmd.trim())
-                                   .filter(cmd => cmd.length > 0 && !cmd.startsWith('#')); // 顺便支持注释
+                                   .filter(cmd => cmd.length > 0 && !cmd.startsWith('#'));
 
-    if (sequentialCommands.length === 0) {
-        done();
-        return;
-    }
+    let finalResult = null;
 
-    // 依次执行每个顺序命令
     for (const commandSequence of sequentialCommands) {
         
-        // 按管道 (|) 拆分，得到管道命令
+        // --- 3. 管道 | (保持不变) ---
         const pipelineStrings = commandSequence.split('|').map(cmd => cmd.trim()).filter(cmd => cmd.length > 0);
         
-        let lastOutput = null; // 用于存储上一个命令的输出
+        let lastOutput = null; 
 
-        // 依次执行管道中的每个命令
         for (let i = 0; i < pipelineStrings.length; i++) {
-            const commandStr = pipelineStrings[i];
+            let commandStr = pipelineStrings[i];
             
-            // 3. 解析单个命令 (例如 "ls" 或 "grep How")
-            const parsed = parseSingleCommand(commandStr);
+            // ==========================================
+            // [新增] 重定向解析逻辑
+            // ==========================================
+            
+            // 1. 重置当前 IO 状态
+            term.resetIO();
+
+            // 2. 解析输入重定向 (< file)
+            // 匹配 < 后面跟着非空字符
+            const inputRedirectMatch = commandStr.match(/<\s*([^\s]+)/);
+            if (inputRedirectMatch) {
+                const inputFile = inputRedirectMatch[1];
+                try {
+                    const content = readFileContent(inputFile);
+                    // 将文件内容转换为行数组，作为 pipedInput 传入
+                    lastOutput = content.split('\n');
+                    // 从命令字符串中移除重定向部分
+                    commandStr = commandStr.replace(inputRedirectMatch[0], '');
+                } catch (e) {
+                    term.writeError(`startsh: ${e.message}`);
+                    break; // 停止当前管道
+                }
+            }
+
+            // 3. 解析输出重定向 (1>, 2>, >, >>, 2>>)
+            // Regex: (fd?)(>>?) \s* (filename)
+            // Groups: 1=(1 or 2 or empty), 2=(> or >>), 3=(filename)
+            // 注意：要循环匹配，因为可能同时有 1>out 2>err
+            const redirectRegex = /([12]?)(>>?)\s*([^\s]+)/g;
+            let rMatch;
+            const tasks = []; // 存储重定向任务
+
+            // 这里的 replace 是为了把重定向部分从命令字符串中剔除
+            // 同时收集重定向信息
+            commandStr = commandStr.replace(redirectRegex, (full, fdStr, op, target) => {
+                const fd = (fdStr === '2') ? 2 : 1; // 默认为 1 (stdout)
+                const type = (op === '>>') ? 'append' : 'overwrite';
+                term.setRedirect(fd, type, target);
+                tasks.push({ fd, type, target });
+                return ''; // 删除该部分
+            });
+
+            // ==========================================
+            // [结束] 重定向解析
+            // ==========================================
+
+            // --- 4. 变量赋值 (VAR=VAL) (保持不变) ---
+            if (i === 0 && commandStr.includes('=')) {
+                const assignMatch = commandStr.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+                if (assignMatch) {
+                    const key = assignMatch[1];
+                    let val = assignMatch[2];
+                    val = val.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (m, v) => Environment[v] || "");
+                    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+                        val = val.slice(1, -1);
+                    }
+                    Environment[key] = val;
+                    continue; 
+                }
+            }
+
+            // --- 5. 解析单个命令 (保持不变) ---
+            const parsed = parseSingleCommand(commandStr); // 解析剔除了重定向后的纯命令
             if (!parsed) continue;
 
             let { command, args, options } = parsed;
 
-            // 变量替换
-            const varRegex = /\$([A-Za-z_][A-Za-z0-9_]*)/g; // 查找 $VAR
-            const varRegexBrace = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g; // 查找 ${VAR}
-
+            // ... (变量替换 expandVars 保持不变) ...
             const expandVars = (str) => {
-                let expanded = str.replace(varRegex, (match, varName) => {
-                    return Environment[varName] || ""; //
+                return str.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (match, varName) => {
+                    return Environment[varName] || "";
                 });
-                expanded = expanded.replace(varRegexBrace, (match, varName) => {
-                    return Environment[varName] || ""; //
-                });
-                return expanded;
             };
 
-            const unescape = (str) => {
-                // (这个简单的版本只处理转义的空格)
-                return str.replace(/\\ /g, ' '); 
-            };
-
-            // 处理 args 数组：扩展变量并剥离引号
             args = args.map(arg => {
-                let trailingChars = ''; // e.g., '/'
-
-                // 1. 剥离引号
                 if (arg.startsWith('"') && arg.endsWith('"')) {
-                    // --- Case 1: 完美的双引号 "file" ---
-                    arg = arg.slice(1, -1);
-                    return expandVars(arg); // 扩展 + 剥离
-                
+                    return expandVars(arg.slice(1, -1));
                 } else if (arg.startsWith("'") && arg.endsWith("'")) {
-                    // --- Case 2: 完美的单引号 'file' ---
-                    return arg.slice(1, -1); // 只剥离
-                
-                } else if (arg.startsWith('"')) {
-                    // --- Case 3: "脏"的双引号, e.g., "file"/ ---
-                    const lastQuote = arg.lastIndexOf('"');
-                    if (lastQuote > 0) {
-                        trailingChars = arg.substring(lastQuote + 1); // e.g., "/"
-                        arg = arg.substring(1, lastQuote); // e.g., "file"
-                        return expandVars(arg) + trailingChars; // 扩展 + 剥离 + 重新附加
-                    }
-                } else if (arg.startsWith("'")) {
-                    // --- Case 4: "脏"的单引号, e.g., 'file'/ ---
-                    const lastQuote = arg.lastIndexOf("'");
-                    if (lastQuote > 0) {
-                        trailingChars = arg.substring(lastQuote + 1); // e.g., "/"
-                        arg = arg.substring(1, lastQuote); // e.g., "file"
-                        return arg + trailingChars; // 不扩展 + 剥离 + 重新附加
-                    }
+                    return arg.slice(1, -1);
+                } else {
+                    return expandVars(unescapePath(arg));
                 }
-                
-                // --- Case 5: 未加引号的参数 (e.g., $LANG or file)
-                arg = unescapePath(arg);
-                return expandVars(arg);
             });
-
             command = unescapePath(expandVars(command));
-            // Check alias
+
+            // ... (Alias 展开保持不变) ...
             if (AliasEnvironment[command]) {
                 const aliasContent = AliasEnvironment[command];
-                
-                // 将别名内容 (e.g., 'ls -l') 和
-                // 用户输入的多余参数 (e.g., '/bin') 重新组合
-                const reCombinedArgs = args.map(a => a.includes(' ') ? `"${a}"` : a).join(' '); // 确保带空格的参数被引用
+                const reCombinedArgs = args.map(a => a.includes(' ') ? `"${a}"` : a).join(' ');
                 const aliasParsed = parseSingleCommand(aliasContent + " " + reCombinedArgs);
-
-                // 替换原始命令
-                command = aliasParsed.command;
-                args = aliasParsed.args;
-                options = { ...aliasParsed.options, ...options }; // 合并选项
+                if (aliasParsed) {
+                    command = aliasParsed.command;
+                    args = aliasParsed.args;
+                    options = { ...aliasParsed.options, ...options };
+                }
             }
             
+            // --- 7. 查找命令 (保持不变) ---
             let commandFunc = null;
-
             if (command.startsWith('./') || command.startsWith('/') || command.startsWith('~/')) {
                 const result = bookmarkSystem._findNodeByPath(command);
                 if (!result || !result.node) {
-                    term.writeHtml(`<span class="term-error">startsh: ${t('noSuchFileOrDir')}: ${command}</span>`);
+                    term.writeError(`startsh: ${t('noSuchFileOrDir')}: ${command}`); // 改用 writeError
                     isPiping = false; break;
                 }
-                
-                const meta = getMetadata(result.node);
-                // 检查用户执行权限 (0o100 = --x------)
                 if (hasPermission(result.node, 'x')) {
                     commandFunc = globalCommands.sh;
                     args.unshift(command);
                 } else {
-                    term.writeHtml(`<span class="term-error">startsh: ${t('permissionDenied')}: ${command}</span>`);
+                    term.writeError(`startsh: ${t('permissionDenied')}: ${command}`); // 改用 writeError
                     isPiping = false; break;
                 }
-            }
-            else if (bookmarkSystem.commands[command]) {
+            } else if (bookmarkSystem.commands[command]) {
                 commandFunc = bookmarkSystem.commands[command];
             } else if (globalCommands[command]) {
                 commandFunc = globalCommands[command];
             } else {
-                // 如果在内置命令中找不到，检查 /bin/ VFS
                 const vfsPath = '/bin/' + command;
                 const result = bookmarkSystem._findNodeByPath(vfsPath);
-                
                 if (result && result.node && !result.node.children) {
-                    // 找到了一个 /bin/ 中的 VFS 脚本
-                    const meta = getMetadata(result.node);
                     if (hasPermission(result.node, 'x')) {
                         commandFunc = globalCommands.sh;
-                        // 将其作为 sh /bin/welcome arg1 arg2 ... 执行
-                        args.unshift(vfsPath); 
+                        args.unshift(vfsPath);
                     } else {
-                        term.writeHtml(`<span class="term-error">startsh: ${t('permissionDenied')}: ${vfsPath}</span>`);
-                        isPiping = false; 
-                        break;
+                        term.writeError(`startsh: ${t('permissionDenied')}: ${vfsPath}`);
+                        isPiping = false; break;
                     }
                 }
             }
 
-            // 4. [!!] 设置管道状态 [!!]
-            // 检查*这*是不是管道中的最后一个命令
+            // --- 8. 管道状态 (保持不变) ---
             isPiping = (i < pipelineStrings.length - 1);
-            if (isPiping) {
-                pipeBuffer = []; // 如果是，准备好缓冲区
-            }
+            if (isPiping) pipeBuffer = [];
 
+            // --- 9. 执行命令 (保持不变) ---
             const installedPkgs = JSON.parse(localStorage.getItem('installed_packages') || '{}');
             const sandboxPkg = installedPkgs[command];
 
             if (commandFunc) {
-                // --- A. 执行原生命令 ---
-                const result = commandFunc(args, options, lastOutput);
-                if (result instanceof Promise) {
-                    lastOutput = await result;
-                } else {
-                    lastOutput = result;
+                try {
+                    const result = commandFunc(args, options, lastOutput);
+                    if (result instanceof Promise) lastOutput = await result;
+                    else lastOutput = result;
+                } catch (e) {
+                    term.writeError(e.message);
                 }
             } else if (sandboxPkg) {
                 term._writeLogHtml(`<span style="color:gray;">${t('sandboxExec').replace('{0}', command)}</span>`);
-                
-                // lastOutput (pipedInput) 会被传递
                 const result = await term.executeInSandbox(sandboxPkg.code, args, options, lastOutput);
-                lastOutput = result; // "result" 是从 sandbox.js 返回的输出数组
-            
+                lastOutput = result; 
             } else if (command.trim() !== '') {
-                // --- C. 命令未找到 ---
-                term.writeHtml(`<span class="term-error">startsh: ${t('cmdNotFound')}: ${command}</span>`);
-                isPiping = false; 
-                break; 
+                term.writeError(`startsh: ${t('cmdNotFound')}: ${command}`);
+                isPiping = false; break;
             }
 
-            // 5. 如果正在管道中，将缓冲区设为 "lastOutput" 供下一个命令使用
+            // ==========================================
+            // [新增] 处理重定向落地 (Flush Buffers)
+            // ==========================================
+            
+            // 只有当 stdout 被重定向了，我们才保存它
+            if (term.ioState.stdout) {
+                const content = term.ioState.buffer.stdout;
+                // 如果是管道中间的命令，通常 stdout 被重定向给下一个命令 (pipeBuffer)
+                // 但如果用户显式写了 > file，则 pipeBuffer 可能会变空，或者行为取决于 Shell 实现。
+                // 这里我们假设 > file 优先级高于管道（截断流），或者在 Linux 中 tee 行为。
+                // 简单起见：> file 写入文件。
+                if (content.length > 0) {
+                    try {
+                        await writeFile(term.ioState.stdout.path, content, term.ioState.stdout.type === 'append');
+                    } catch (e) {
+                        term.writeError(`IO Error: ${e.message}`);
+                    }
+                }
+            }
+
+            // 处理 stderr 落地
+            if (term.ioState.stderr) {
+                const content = term.ioState.buffer.stderr;
+                if (content.length > 0) {
+                    try {
+                        await writeFile(term.ioState.stderr.path, content, term.ioState.stderr.type === 'append');
+                    } catch (e) {
+                        // 如果连 stderr 都写不进去，那就写屏吧
+                        term._writeSingleLine(`<span class="term-error">IO Error writing stderr: ${e.message}</span>`);
+                        term._handleNewline();
+                    }
+                }
+            }
+
+            // ==========================================
+
             if (isPiping) {
-                lastOutput = pipeBuffer;
+                if (!lastOutput && pipeBuffer.length > 0) lastOutput = pipeBuffer;
             }
         }
+        finalResult = lastOutput; 
     }
     
-    // 所有命令执行完毕
     await bookmarkSystem._refreshBookmarks();
+    term.resetIO(); // 彻底清理
     done();
+    return finalResult; 
 }
 
 

@@ -10,17 +10,38 @@
     --terminal-foreground-color: #d4d4d4;
     --terminal-selection-background: #d4d4d4;
     --terminal-selection-foreground: #1e1e1e;
+
+    /* 壁纸 */
+    --terminal-background-image: none;
+    --terminal-bg-opacity: 1;
 } 
 
-html, body {
+html {
     margin: 0;
     padding: 0;
     width: 100%;
     height: 100%;
+    
+    /* Layer 1: 底层 (壁纸) */
+    background-image: var(--terminal-background-image);
+    background-size: cover;
+    background-position: center;
+    background-repeat: no-repeat;
+    background-color: #000; /* 壁纸加载前的底色 */
+}
+
+body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    
+    /* Layer 2: 顶层 (半透明颜色) */
+    /* JS 将会修改 --terminal-background-color 为 rgba(...) 格式 */
     background-color: var(--terminal-background-color);
     color: var(--terminal-foreground-color);
-
-    /* overflow: hidden; /* 防止滚动条出现 */
+    
+    /* overflow: hidden; */
 }
 
 html, body::selection {
@@ -113,11 +134,11 @@ html, body::selection {
 
     /* 50% 到 100% 保持 "灭" (字符可见) */
     50% {
-        background-color: var(--terminal-background-color);
+        background-color: transparent;
         color: var(--terminal-foreground-color);
     }
     100% {
-        background-color: var(--terminal-background-color);
+        background-color: transparent;
         color: var(--terminal-foreground-color);
     }
 }
