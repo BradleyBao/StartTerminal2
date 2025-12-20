@@ -1,9 +1,11 @@
 :root {
+    /* 光标颜色 */
     --cursor-bg-color: #d4d4d4; /* 光标背景色 */
     --cursor-fg-color: #1e1e1e; /* 光标前景色 */
 
     --terminal-font-family: 'Fira Code', 'Consolas', 'Courier New', monospace;
     --terminal-font-size: 14px;
+    --terminal-accent: #4CAF50;
     --terminal-background-color: #1e1e1e;
     --terminal-foreground-color: #d4d4d4;
     --terminal-selection-background: #d4d4d4;
@@ -64,6 +66,16 @@ html, body::selection {
     font-family: var(--terminal-font-family);
     font-size: var(--terminal-font-size);
     line-height: 1.2; /* 行高，可以调整 */
+}
+
+.term-folder {
+    color: var(--terminal-accent);
+    font-weight: bold;
+}
+
+.term-error {
+    color: #ff5555; /* 经典红色报错 */
+    font-weight: bold;
 }
 
 .term-cursor {

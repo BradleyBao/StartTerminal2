@@ -38,8 +38,10 @@ const Environment = {
     'USER': 'user',
     'HOST': 'ST2.0',
     "PS1": '\\u@\\h:\\w\\$ ',
+    "COMPLETION_STYLE": "bash",
     // More will load by .startrc
 }
+
 
 /**
  * 加载指定用户的环境
@@ -160,8 +162,14 @@ class Terminal {
         this.isReading = false;
         this.readResolve = null;
 
-        this.history = [];
-        this.historyIndex = 0;
+        try {
+            const savedHistory = localStorage.getItem('st2_cmd_history');
+            this.history = savedHistory ? JSON.parse(savedHistory) : [];
+        } catch (e) {
+            console.warn("Failed to load history:", e);
+            this.history = [];
+        }
+        this.historyIndex = this.history.length; // 确保索引指向最新的空行
         this.tempLine = "";
 
         // Zsh 风格菜单状态
@@ -1287,7 +1295,16 @@ class Terminal {
 
             if (command.trim().length > 0 && command !== this.history[this.history.length - 1]) {
                 this.history.push(command);
+                
+                // 限制历史记录数量 (例如 500 条)，防止 localStorage 溢出
+                if (this.history.length > 500) {
+                    this.history.shift();
+                }
+                
+                // 保存
+                localStorage.setItem('st2_cmd_history', JSON.stringify(this.history));
             }
+
             this.historyIndex = this.history.length; // 重置索引到“新行”
             this.tempLine = ""; // 清空临时行
 
@@ -1603,7 +1620,7 @@ class NanoEditor {
         this.term._render();
     }
 
-    handleKeydown(e) {
+    async handleKeydown(e) {
         e.preventDefault();
         e.stopPropagation();
         this.status = ""; // 清除状态
@@ -1629,6 +1646,33 @@ class NanoEditor {
                         return; // 阻止调用 _save()
                     }
                     this._save();
+                    break;
+
+                case 's':
+                    if (this.isReadOnly) {
+                        this.status = t('nanoStatusReadOnly');
+                        this._render(); // 重新渲染以显示状态
+                        return; // 阻止调用 _save()
+                    }
+                    this._save();
+                    break;
+
+                case 'v':
+                    try {
+                        const text = await navigator.clipboard.readText();
+                        if (text) {
+                            this.dirty = true;
+                            // 将剪贴板内容插入当前位置
+                            const line = this.lines[this.cursorY];
+                            this.lines[this.cursorY] = line.substring(0, this.cursorX) + text + line.substring(this.cursorX);
+                            this.cursorX += text.length;
+                            
+                            // (可选) 如果粘贴包含换行符，需要更复杂的拆分逻辑，
+                            // 这里简单处理：暂只支持单行粘贴，或者你需要写一个 insertText 函数处理多行
+                        }
+                    } catch (err) {
+                        this.status = "Paste failed: Permissions?";
+                    }
                     break;
             }
         } else {
@@ -2726,7 +2770,10 @@ export PS1="\\u@\\h:\\w\\$ "
 # 'en' for English
 # 'zh' for 简体中文
 export LANG="en"
-
+#
+# --- Completion Style ---
+export COMPLETION_STYLE="bash"
+#
 # --- Aliases ---
 alias ll='ls -l -a'
 alias la='ls -a'
@@ -2847,10 +2894,7 @@ async function getSearchSuggestions(query) {
 }
 
 /**
- * [重构] Tab 补全 - Zsh 风格菜单启动器
- */
-/**
- * [重构] Tab 补全 - 修复 Bash 显示、优化 Zsh 单项循环
+ * Tab 补全
  */
 async function handleTabCompletion(line, pos) {
     if (term.tabMenu.active) return;
@@ -2883,18 +2927,60 @@ async function handleTabCompletion(line, pos) {
         tokenStartIndex = 0;
     }
 
-    const command = (tokens[0] ? unescapePath(tokens[0]) : "");
+    const rawCommand = (tokens[0] ? unescapePath(tokens[0]) : "");
 
-    // 2. 决定补全类型
-    if (tokenCount === 0 || (tokenCount === 1 && !line.endsWith(' '))) {
+    // --- Sudo 穿透逻辑 ---
+    let targetCommand = rawCommand;
+    let targetTokenCount = tokenCount;
+
+    if (rawCommand === 'sudo') {
+        if (tokenCount === 1 && line.endsWith(' ')) {
+            // Case 1: "sudo " -> 准备输入第二个词 -> 视为补全命令
+            isCompletingFirstWord = true;
+        } else if (tokenCount === 2 && !line.endsWith(' ')) {
+            // Case 2: "sudo ap" -> 正在输入第二个词 -> 视为补全命令
+            isCompletingFirstWord = true;
+        } else if (tokenCount >= 2) {
+            // Case 3: "sudo apt " (count=2, space) 或 "sudo apt up" (count=3)
+            // -> 穿透 sudo，将目标指向下一个词 (apt)，并减少计数
+            targetCommand = unescapePath(tokens[1]);
+            targetTokenCount = tokenCount - 1;
+        }
+    }
+    // ---------------------------
+
+    // 2. 决定补全类型 & 准备候选列表
+    let subCommandCandidates = [];
+
+    // 注意：这里优先检查 isCompletingFirstWord (可能被 sudo 逻辑置为 true)
+    if (isCompletingFirstWord || (tokenCount === 0 || (tokenCount === 1 && !line.endsWith(' ')))) {
         isCompletingFirstWord = true;
-    } else if (command === 'search') { 
+    
+    } else if (targetCommand === 'search') { 
         isCompletingSearch = true;
-    } else if (command === 'open') {
+    
+    } else if (targetCommand === 'open') {
         isCompletingPath = true;
-    } else if (subCommandCompletions.hasOwnProperty(command) && (tokenCount === 1 || (tokenCount === 2 && !line.endsWith(' ')))) {
-        if (subCommandCompletions[command].length > 0) isCompletingSubCommand = true;
-        else isCompletingPath = true;
+    
+    } else if (subCommandCompletions.hasOwnProperty(targetCommand)) {
+        // 使用 targetTokenCount 进行判断
+        if (targetTokenCount === 1 || (targetTokenCount === 2 && !line.endsWith(' '))) {
+            let config = subCommandCompletions[targetCommand];
+            
+            // 执行动态配置函数 (如 theme)
+            if (typeof config === 'function') {
+                config = config();
+            }
+
+            if (Array.isArray(config) && config.length > 0) {
+                isCompletingSubCommand = true;
+                subCommandCandidates = config;
+            } else {
+                isCompletingPath = true;
+            }
+        } else {
+            isCompletingPath = true;
+        }
     } else {
         isCompletingPath = true;
     }
@@ -2907,12 +2993,17 @@ async function handleTabCompletion(line, pos) {
     if (isCompletingFirstWord) {
         const allCommands = getAllCommandNames();
         matches = allCommands.filter(cmd => cmd.startsWith(tokenToComplete)).map(cmd => ({ title: cmd, value: cmd }));
+    
     } else if (isCompletingSearch) {
         if (searchToken.trim().length > 0) {
             matches = await getSearchSuggestions(searchToken);
         }
+    
     } else if (isCompletingSubCommand) {
-        matches = subCommandCompletions[command].filter(cmd => cmd.startsWith(tokenToComplete)).map(cmd => ({ title: cmd, value: cmd }));
+        matches = subCommandCandidates
+            .filter(cmd => cmd.startsWith(tokenToComplete))
+            .map(cmd => ({ title: cmd, value: cmd }));
+    
     } else if (isCompletingPath) {
         const lastSlash = searchToken.lastIndexOf('/');
         if (lastSlash > -1) {
@@ -2936,29 +3027,16 @@ async function handleTabCompletion(line, pos) {
 
     if (matches.length === 0) return;
 
-    // --- 4. 补全逻辑 ---
-
-    // 如果是 Zsh 风格
+    // --- 4. 补全逻辑 (保持不变) ---
+    
     if (isZshStyle) {
-        // [Zsh 逻辑优化]
-        // 无论匹配数量多少，都进入菜单模式。
-        // 如果只有一个匹配项，我们设置 selected = 0，直接应用，
-        // 这样用户再次按 Tab 就会触发 _cycleMenu，进入 selected = -1 (原始输入)。
-        
         term.tabMenu.active = true;
         term.tabMenu.items = matches;
-        
-        // 单个匹配 -> 默认选中第0个 (直接补全)
-        // 多个匹配 -> 默认不选中 (-1)，只显示列表
         term.tabMenu.selected = (matches.length === 1) ? 0 : -1;
-        
         term.tabMenu.originalLine = line;
         term.tabMenu.tokenStart = tokenStartIndex;
         term.tabMenu.completionPrefix = isCompletingSearch ? "" : completionPrefix;
 
-        // 如果默认选中了 (单匹配)，我们需要手动更新一次 currentLine，
-        // 因为 _renderMenu 只负责画菜单，不负责改 Input。
-        // 我们复用 _cycleMenu 的逻辑，或者手动设置一次。
         if (term.tabMenu.selected === 0) {
              const item = matches[0];
              let newValue = item.value || item.title;
@@ -2968,14 +3046,10 @@ async function handleTabCompletion(line, pos) {
              term.currentLine = newLine;
              term.cursorX = term.prompt.length + newLine.length;
         }
-
         term._renderMenu();
         return;
     } 
 
-    // --- 以下是 Bash 风格 (默认) ---
-
-    // 1. 单个匹配直接补全 (经典行为)
     if (matches.length === 1) {
         const match = matches[0];
         let matchValue = match.value || match.title; 
@@ -2992,7 +3066,6 @@ async function handleTabCompletion(line, pos) {
         return;
     }
 
-    // 2. 多个匹配: LCP + 列表
     let lcp = "";
     if (!isCompletingSearch) {
         lcp = findLCP(matches.map(m => ({ title: m.value || m.title })));
@@ -3000,30 +3073,23 @@ async function handleTabCompletion(line, pos) {
     const partial = isCompletingSearch ? searchToken : searchToken.substring(searchToken.lastIndexOf('/') + 1);
 
     if (!isCompletingSearch && lcp.length > partial.length) {
-        // 补全公共前缀
         lastTabMatches = [];
         let completion = completionPrefix + lcp;
         if (completion.includes(' ')) completion = escapePath(completion);
         const newLine = line.substring(0, tokenStartIndex) + completion + line.substring(pos);
         term.setCommand(newLine, (line.substring(0, tokenStartIndex) + completion).length);
     } else {
-        // [修复] 列表显示逻辑
         const isDoubleTap = (currentTime - lastTabTime < 500);
         const currentMatchIds = matches.map(m => m.id || m.title);
         const lastMatchIds = lastTabMatches.map(m => m.id || m.title);
         
         if ((isDoubleTap && arraysAreEqual(currentMatchIds, lastMatchIds)) || isCompletingSearch) {
-            // A. 固化当前行
             const fullLineText = term.prompt + line;
             const escapedLine = term.escapeHtml(fullLineText);
             const padding = ' '.repeat(Math.max(0, term.cols - fullLineText.length));
             term.buffer[term.cursorY] = escapedLine + padding;
-            
-            // B. 换行
             term._handleNewline(); 
             
-            // C. [修复] 打印列表 (Grid Layout)
-            // ----------------------------------------------------
             const displayItems = matches.map(m => {
                 let title = m.title.trim();
                 if (title.length > 30) title = title.substring(0, 27) + "...";
@@ -3063,9 +3129,6 @@ async function handleTabCompletion(line, pos) {
                 }
                 term.writeHtml(currentLineStr);
             }
-            // ----------------------------------------------------
-            
-            // D. 恢复状态
             bookmarkSystem.update_user_path(); 
             term.setCommand(line, pos);
             lastTabMatches = [];
@@ -3364,6 +3427,10 @@ function loadStyleSettings() {
     const fontSize = savedSize || defaultSize;
     document.documentElement.style.setProperty('--terminal-font-family', fontFamily);
     document.documentElement.style.setProperty('--terminal-font-size', fontSize);
+
+    // Themes 
+    const currentTheme = ThemeManager.load(); // <--- 调用 theme.js
+    return { fontFamily, fontSize, theme: currentTheme };
 }
 function saveStyleSettings() {
     const currentFont = getComputedStyle(document.documentElement).getPropertyValue('--terminal-font-family').trim();
@@ -3496,6 +3563,30 @@ const globalCommands = {
             }
         } catch (e) {
             term.writeHtml(`<span class="term-error">Error: ${e.message}</span>`);
+        }
+    },
+    'theme': (args, options) => {
+        const themeName = args[0];
+
+        // 1. 列出主题 (调用 ThemeManager.getList)
+        if (!themeName || themeName === 'ls') {
+            term.writeLine("Available themes:");
+            const list = ThemeManager.getList();
+            
+            list.forEach(item => {
+                const marker = item.active ? '*' : ' ';
+                // 使用该主题的强调色来预览名字
+                term.writeHtml(` ${marker} <span style="color:${item.accent}">${item.name}</span>`);
+            });
+            term.writeLine("\nUsage: theme <name>");
+            return;
+        }
+
+        // 2. 切换主题 (调用 ThemeManager.set)
+        if (ThemeManager.set(themeName)) {
+            term.writeLine(`Theme changed to '${themeName}'.`);
+        } else {
+            term.writeHtml(`<span class="term-error">Theme '${themeName}' not found. Try 'theme ls'.</span>`);
         }
     },
     'sysinfo': async (args, options) => {
@@ -5136,6 +5227,13 @@ const subCommandCompletions = {
     'tabs': ['ls', 'switch', 'close'],
     'apt': ['update', 'list', 'install', 'remove'],
     'style': ['font', 'size', 'reset'],
+    'ext': ['ls', 'toggle', 'enable', 'disable', 'uninstall'],
+    'theme': () => {
+        if (typeof ThemeManager !== 'undefined' && ThemeManager.presets) {
+            return Object.keys(ThemeManager.presets);
+        }
+        return ['default'];
+    },
     'mv': [], // 标记为 'path'
     'cp': [], // 标记为 'path'
     'cd': [], // 标记为 'path'
@@ -5145,6 +5243,26 @@ const subCommandCompletions = {
     'rm': [], // 标记为 'path'
     'mkdir': [], // 标记为 'path'
     'sh': [], // 标记为 'path'
+    'source': [], // 标记为 'path'
+    '.': () => {
+        if (!bookmarkSystem || !bookmarkSystem.current) return [];
+        
+        const children = bookmarkSystem.current.children || [];
+        
+        // 过滤条件：不是目录 且 (是 VFS 脚本 或 拥有 +x 权限)
+        return children
+            .filter(node => {
+                if (node.children) return false; // 排除目录
+                
+                // 检查 VFS 脚本
+                if (node.id.startsWith('vfs-bin-')) return true;
+                
+                // 检查权限位 (0o100 = User Executable)
+                const meta = getMetadata(node);
+                return (meta.mode & 0o100) !== 0;
+            })
+            .map(node => node.title); // 只返回文件名
+    },
 };
 
 function awaiting() {
