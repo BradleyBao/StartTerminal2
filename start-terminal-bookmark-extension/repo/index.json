@@ -2,18 +2,21 @@
   "cowsay": {
     "desc": "A classic ASCII cow.",
     "file": "cowsay.js",
+    "version": "1.0.0",
     "permissions": [],
     "host_permissions": []
   },
   "base64": {
     "desc": "Encode and decode base64 from input.",
     "file": "base64.js",
+    "version": "1.1.0",
     "permissions": [],
     "host_permissions": []
   },
   "weather": {
     "desc": "Fetch weather by city name (e.g., 'weather Fujisawa').",
     "file": "weather.js",
+    "version": "2.0.1",
     "permissions": [],
     "host_permissions": [
       "https://api.open-meteo.com/*",
@@ -23,18 +26,21 @@
   "history": {
     "desc": "Search your browser history (uses 'history' permission).",
     "file": "",
+    "version": "1.0.0",
     "permissions": ["history"],
     "host_permissions": []
   },
   "json": {
     "desc": "Pretty-prints JSON from piped input. Usage: curl ... | json",
     "file": "json.js",
+    "version": "1.0.2",
     "permissions": [],
     "host_permissions": []
   },
   "sha256": {
     "desc": "Calculates the SHA-256 hash of a string.",
     "file": "sha256.js",
+    "version": "1.0.0",
     "permissions": [],
     "host_permissions": []
   }
