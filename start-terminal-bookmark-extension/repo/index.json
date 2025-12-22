@@ -23,13 +23,6 @@
       "https://geocoding-api.open-meteo.com/*"
     ]
   },
-  "history": {
-    "desc": "Search your browser history (uses 'history' permission).",
-    "file": "",
-    "version": "1.0.0",
-    "permissions": ["history"],
-    "host_permissions": []
-  },
   "json": {
     "desc": "Pretty-prints JSON from piped input. Usage: curl ... | json",
     "file": "json.js",
