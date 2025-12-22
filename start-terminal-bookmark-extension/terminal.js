@@ -5871,7 +5871,7 @@ function getAllCommandNames() {
 const subCommandCompletions = {
     'downloads': ['ls', 'open'],
     'tabs': ['ls', 'switch', 'close'],
-    'apt': ['update', 'list', 'install', 'remove'],
+    'apt': ['update', 'list', 'install', 'remove', 'upgrade'],
     'style': ['font', 'size', 'bg', 'fg', 'accent', 'cursor', 'wall', 'opacity', 'reset'],
     'ext': ['ls', 'toggle', 'enable', 'disable', 'uninstall'],
     'theme': () => {
@@ -6000,7 +6000,7 @@ async function executeLine(line) {
             let commandStr = pipelineStrings[i];
             
             // ==========================================
-            // [新增] 重定向解析逻辑
+            // 重定向解析逻辑
             // ==========================================
             
             // 1. 重置当前 IO 状态
