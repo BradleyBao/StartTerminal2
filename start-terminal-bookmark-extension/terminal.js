@@ -5550,56 +5550,154 @@ const globalCommands = {
         const pkgName = args[1];
 
         // 检查 sudo 权限
-        if (!options.sudo && (subCommand === 'install' || subCommand === 'update' || subCommand === 'remove')) {
+        if (!options.sudo && ['install', 'update', 'remove', 'upgrade'].includes(subCommand)) {
             term.writeLine(`apt: This command requires superuser privileges (try 'sudo apt ...')`);
             return;
         }
 
+        // 辅助：获取可升级列表
+        const getUpgradablePackages = () => {
+            const index = JSON.parse(localStorage.getItem('apt_repo_index') || '{}');
+            const installed = JSON.parse(localStorage.getItem('installed_packages') || '{}');
+            const list = [];
+            
+            for (const name in installed) {
+                const localVer = installed[name].version || '0.0.0'; // 旧数据可能没版本，默认为 0
+                const remotePkg = index[name];
+                
+                // 如果远程存在且版本比本地大
+                if (remotePkg && compareVersions(remotePkg.version, localVer) > 0) {
+                    list.push({
+                        name: name,
+                        current: localVer,
+                        new: remotePkg.version
+                    });
+                }
+            }
+            return list;
+        };
+
         try {
             switch (subCommand) {
                 case 'update':
-                    term.writeLine(`Hit:1 ${REPO_URL}index.json`);
-                    
-                    const response = await fetch(REPO_URL + "index.json");
-                    if (!response.ok) {
-                        throw new Error(`Failed to fetch index: ${response.statusText}`);
+                    const startTime = Date.now();
+                    const oldIndexStr = localStorage.getItem('apt_repo_index');
+
+                    try {
+                        const response = await fetch(REPO_URL + "index.json", { cache: "no-cache" });
+
+                        if (!response.ok) {
+                            throw new Error(`${response.status} ${response.statusText}`);
+                        }
+
+                        const blob = await response.blob();
+                        const sizeBytes = blob.size;
+                        const newIndexStr = await blob.text();
+
+                        const isHit = oldIndexStr === newIndexStr;
+
+                        localStorage.setItem('apt_repo_index', newIndexStr);
+                        const index = JSON.parse(newIndexStr);
+
+                        const endTime = Date.now();
+                        const durationSec = Math.max((endTime - startTime) / 1000, 0.01);
+                        const speedKB = (sizeBytes / 1024 / durationSec).toFixed(0);
+
+                        const sizeDisplay = sizeBytes > 1024 
+                            ? `${(sizeBytes/1024).toFixed(1)} kB` 
+                            : `${sizeBytes} B`;
+
+                        if (isHit) {
+                            term.writeLine(`Hit:1 ${REPO_URL}index.json`);
+                        } else {
+                            term.writeLine(`Get:1 ${REPO_URL}index.json [${sizeDisplay}]`);
+                        }
+
+                        if (!isHit) {
+                            term.writeLine(`Fetched ${sizeDisplay} in ${durationSec.toFixed(1)}s (${speedKB} kB/s)`);
+                        }
+
+                        term.writeLine("Reading package lists... Done");
+                        term.writeLine("Building dependency tree... Done");
+                        term.writeLine("Reading state information... Done");
+
+                        // 计算可升级包
+                        const upgradableList = getUpgradablePackages();
+                        const count = upgradableList.length;
+
+                        if (count > 0) {
+                            term.writeLine(`${count} packages can be upgraded. Run 'apt list --upgradable' to see them.`);
+                        } else {
+                            term.writeLine("All packages are up to date.");
+                        }
+                    } catch (e) {
+                        term.writeHtml(`<span class="term-error">Err:1 ${REPO_URL}index.json</span>`);
+                        term.writeHtml(`<span class="term-error">  ${e.message}</span>`);
+                        term.writeLine("Reading package lists... Done");
+                        term.writeHtml(`<span class="term-error">E: Failed to fetch index file.</span>`);
                     }
-                    const index = await response.json();
-                    localStorage.setItem('apt_repo_index', JSON.stringify(index));
-
-                    // --- 模拟 Ubuntu 输出 ---
-                    const installed = JSON.parse(localStorage.getItem('installed_packages') || '{}');
-                    
-                    const allPkgsCount = Object.keys(index).length;
-                    const installedCount = Object.keys(installed).length;
-
-                    term.writeLine(`Fetched ${allPkgsCount} packages in 1s (mock data)`);
-                    term.writeLine("Reading package lists... Done");
-                    term.writeLine("Building dependency tree... Done");
-                    term.writeLine("Reading state information... Done");
-
-                    const upgradableCount = 0; // (我们尚未实现版本控制)
-
-                    if (upgradableCount > 0) {
-                        term.writeLine(`${upgradableCount} packages can be upgraded. Run 'apt list --upgradable' to see them.`);
-                    } else {
-                        term.writeLine("All packages are up to date.");
-                    }
-                    
-                    // 总是显示仓库状态，并引导用户
-                    term.writeLine(`\nFound ${allPkgsCount} available packages. ${installedCount} are installed.`);
-                    term.writeLine("Run 'apt list' to see all available packages.");
                     break;
 
                 case 'list':
                     {
                         const index = JSON.parse(localStorage.getItem('apt_repo_index') || '{}');
                         const installed = JSON.parse(localStorage.getItem('installed_packages') || '{}');
+                        
+                        // If --upgradeable
+                        if (options['upgradable']) {
+                            term.writeLine("Listing... Done");
+                            const list = getUpgradablePackages();
+                            if (list.length === 0) {
+                                // 没有任何输出，符合 apt 行为
+                            } else {
+                                list.forEach(item => {
+                                    // 格式: package/remote_version [upgradable from: local_version]
+                                    // 例如: weather/2.0.1 [upgradable from: 1.0.0]
+                                    term.writeHtml(`<span style="color:var(--color-accent-green, #4CAF50)">${item.name}</span>/${item.new} [upgradable from: ${item.current}]`);
+                                });
+                            }
+                            return;
+                        }
+                        
                         term.writeLine("Available packages:");
                         for (const key in index) {
-                            const installedMark = installed[key] ? "[installed]" : "";
+                            let installedMark = "";
+                            if (installed[key]) {
+                                const ver = installed[key].version || 'unknown';
+                                installedMark = `[installed, v${ver}]`;
+                            }
                             term.writeLine(`  ${key} - ${index[key].desc} ${installedMark}`);
                         }
+                    }
+                    break;
+
+                case 'upgrade':
+                    {
+                        const list = getUpgradablePackages();
+                        if (list.length === 0) {
+                            term.writeLine("0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.");
+                            return;
+                        }
+
+                        term.writeLine("The following packages will be upgraded:");
+                        term.writeLine("  " + list.map(i => i.name).join(" "));
+                        
+                        const answer = await term.readInput(`${list.length} upgraded. Do you want to continue? [Y/n]`);
+                        if (answer !== 'y' && answer !== '') {
+                            term.writeLine("Abort.");
+                            return;
+                        }
+
+                        // 循环调用 install 逻辑
+                        for (const item of list) {
+                            // 我们复用 install 的内部逻辑，这里为了简单，我们手动触发一次 install 命令
+                            // 或者把 install 逻辑抽取出来。为了代码复用，我们直接递归调用 'apt'
+                            // 注意：这会产生多余的 logs，但很真实
+                            term.writeLine(`Upgrading ${item.name}...`);
+                            await globalCommands.apt(['install', item.name], { sudo: true });
+                        }
+                        
+                        term.writeLine("Upgrade complete.");
                     }
                     break;
                 
@@ -5614,18 +5712,24 @@ const globalCommands = {
                         return;
                     }
 
-                    // [!! 1. 组合所有需要的权限 !!]
+                    // 权限检查逻辑 (保持不变)
                     const reqPermissions = pkg.permissions || [];
                     const reqHostPermissions = pkg.host_permissions || [];
                     const allPermissions = {
                         permissions: reqPermissions,
-                        origins: reqHostPermissions // host_permissions 在 API 中被称为 'origins'
+                        origins: reqHostPermissions
                     };
 
-                    term.writeLine(`Package '${pkgName}' will be installed.`);
-                    term.writeLine(pkg.desc);
+                    // 如果已经安装了，且版本相同，提示 (Reinstalling)
+                    const installedData = JSON.parse(localStorage.getItem('installed_packages') || '{}');
+                    if (installedData[pkgName] && installedData[pkgName].version === pkg.version) {
+                        term.writeLine(`${pkgName} is already the newest version (${pkg.version}).`);
+                        term.writeLine(`0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.`);
+                        return;
+                    }
+
+                    term.writeLine(`Package '${pkgName}' (v${pkg.version || '?'}) will be installed.`);
                     
-                    // [!! 2. 检查并询问 !!]
                     let needsPerms = false;
                     if (reqPermissions.length > 0) {
                         term.writeLine(`[!] This package requires new API permissions: ${reqPermissions.join(', ')}`);
@@ -5642,8 +5746,6 @@ const globalCommands = {
                             term.writeLine(t('aptAbort'));
                             return;
                         }
-                        
-                        // [!! 3. 请求权限 !!]
                         const granted = await new Promise((resolve) => {
                             chrome.permissions.request(allPermissions, resolve);
                         });
@@ -5653,7 +5755,6 @@ const globalCommands = {
                         }
                     }
                     
-                    // [!! 4. 安装 (如果 file 存在) !!]
                     if (pkg.file) {
                         term.writeLine(t('aptFetch').replace('{0}', pkgName).replace('{1}', pkg.file));
                         const codeResponse = await fetch(REPO_URL + pkg.file);
@@ -5662,11 +5763,21 @@ const globalCommands = {
                         }
                         const codeString = await codeResponse.text();
                         
+                        // 保存代码的同时保存版本号
                         let installed = JSON.parse(localStorage.getItem('installed_packages') || '{}');
-                        installed[pkgName] = { code: codeString };
+                        installed[pkgName] = { 
+                            code: codeString,
+                            version: pkg.version // 保存版本
+                        };
                         localStorage.setItem('installed_packages', JSON.stringify(installed));
                     } else {
-                        // 这是一个“虚拟”包 (如 history, tree, wget)，只用于授权
+                        // 虚拟包逻辑
+                        let installed = JSON.parse(localStorage.getItem('installed_packages') || '{}');
+                        installed[pkgName] = { 
+                            code: null, // 虚拟包无代码
+                            version: pkg.version 
+                        };
+                        localStorage.setItem('installed_packages', JSON.stringify(installed));
                         term.writeLine(`Permissions for built-in command ${pkgName} are now active.`);
                     }
                     
