@@ -43,6 +43,57 @@ const Environment = {
 }
 
 
+/**
+ * [工具函数] 预加载并平滑切换壁纸
+ * @param {string} url - 图片 URL，如果为 'none' 则移除
+ */
+function setWallpaper(url) {
+    const root = document.documentElement;
+
+    // 情况 1: 清除壁纸
+    if (!url || url === 'none') {
+        // 先淡出
+        root.style.setProperty('--bg-load-opacity', '0');
+        
+        // 等待动画结束后真正移除图片 (与 CSS transition 时间匹配)
+        setTimeout(() => {
+            root.style.setProperty('--terminal-background-image', 'none');
+        }, 700);
+        return;
+    }
+
+    // 情况 2: 设置新壁纸
+    // 1. 先把透明度设为 0 (如果当前有壁纸，会先淡出；如果没有，则保持隐藏)
+    //    注意：如果你希望新旧壁纸直接交叉淡入淡出，逻辑会更复杂，
+    //    这里的逻辑是：旧图淡出/变黑 -> 新图加载 -> 新图淡入。
+    root.style.setProperty('--bg-load-opacity', '0');
+
+    // 2. JS 预加载图片
+    const img = new Image();
+    img.src = url;
+
+    img.onload = () => {
+        // 图片加载完毕！
+        
+        // A. 切换 CSS 变量中的图片 URL
+        root.style.setProperty('--terminal-background-image', `url('${url}')`);
+        
+        // B. 强制浏览器重绘 (可选，防止 CSS 变量更新延迟)
+        // void root.offsetWidth; 
+
+        // C. 开始淡入 (将透明度设为 1)
+        // 使用 requestAnimationFrame 确保 CSS 更新已被应用，从而触发 transition
+        requestAnimationFrame(() => {
+            root.style.setProperty('--bg-load-opacity', '1');
+        });
+    };
+
+    img.onerror = () => {
+        term.writeError(`Failed to load wallpaper: ${url}`);
+        // 加载失败，保持 0 或恢复旧的? 这里我们保持黑屏或保持原样
+    };
+}
+
 
 /**
  * [全局工具] 将颜色转换为 RGBA 格式
@@ -3775,8 +3826,18 @@ function loadStyleSettings() {
     try {
         const overrides = JSON.parse(localStorage.getItem('style_overrides') || '{}');
         for (const [key, value] of Object.entries(overrides)) {
-            // key 应该是 css 变量名，例如 '--terminal-accent'
-            document.documentElement.style.setProperty(key, value);
+            // [修改点]：如果是壁纸，使用我们的新函数，而不是直接 setProperty
+            if (key === '--terminal-background-image') {
+                // 提取 url('...') 中的 URL
+                const match = value.match(/url\(['"]?(.*?)['"]?\)/);
+                if (match) {
+                    setWallpaper(match[1]); // 使用渐变加载
+                } else if (value === 'none') {
+                    setWallpaper('none');
+                }
+            } else {
+                document.documentElement.style.setProperty(key, value);
+            }
         }
     } catch (e) {
         console.warn("Failed to load style overrides", e);
@@ -4953,33 +5014,41 @@ const globalCommands = {
 
             case 'wall': 
             case 'wallpaper':
-                // [修改] 优先使用参数，如果没有参数，检查管道输入
                 let targetUrl = value;
-                
-                // 如果用户没输 URL，且有管道输入 (例如: echo url | style wall)
                 if (!targetUrl && options._pipedInput && options._pipedInput.length > 0) {
                     targetUrl = options._pipedInput[0].trim();
                 }
 
                 if (!targetUrl) { 
-                    term.writeHtml(`<span class="term-error">Usage: style wall <url> (or pipe a url)</span>`); 
+                    term.writeHtml(`<span class="term-error">Usage: style wall <url></span>`); 
                     return; 
                 }
                 
                 if (targetUrl === 'none') {
                     setOverride('--terminal-background-image', 'none');
-                    term.writeLine("Wallpaper removed. (Use 'style opacity 1' if needed)");
+                    setWallpaper('none'); // [调用新函数]
+                    term.writeLine("Wallpaper removed.");
                 } else {
                     const urlStr = `url('${targetUrl}')`;
-                    setOverride('--terminal-background-image', urlStr);
                     
-                    // 智能透明度调整
+                    // 保存到 LocalStorage (Override)
+                    // 注意：setOverride 内部会 setProperty，我们需要避免它直接设置图片导致闪烁
+                    // 你可以修改 setOverride 逻辑，或者像下面这样手动保存：
+                    const overrides = JSON.parse(localStorage.getItem('style_overrides') || '{}');
+                    overrides['--terminal-background-image'] = urlStr;
+                    localStorage.setItem('style_overrides', JSON.stringify(overrides));
+
+                    // 执行渐变加载
+                    setWallpaper(targetUrl);
+                    
+                    // 智能透明度调整 (保持你原有的逻辑)
                     const currentBg = getComputedStyle(document.documentElement).getPropertyValue('--terminal-background-color').trim();
-                    // 检查是否不透明 (hex 或 rgba(.., 1))
                     if (!currentBg.startsWith('rgba') || currentBg.endsWith(', 1)')) {
                         const autoRgba = toRgba(currentBg, 0.7);
-                        setOverride('--terminal-background-color', autoRgba);
-                        term.writeLine(`Wallpaper set from pipe/url. Transparency adjusted to 0.7.`);
+                        document.documentElement.style.setProperty('--terminal-background-color', autoRgba);
+                        overrides['--terminal-background-color'] = autoRgba; // 更新保存
+                        localStorage.setItem('style_overrides', JSON.stringify(overrides));
+                        term.writeLine(`Wallpaper set. Transparency adjusted to 0.7.`);
                     } else {
                         term.writeLine(`Wallpaper set.`);
                     }
