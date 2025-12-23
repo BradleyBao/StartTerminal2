@@ -112,7 +112,7 @@ html, body::selection {
 #terminal-buffer {
     margin: 0;
     white-space: pre;
-    font-family: var(--terminal-font-family);
+    font-family: var(--terminal-font-family), monospace;
     font-size: var(--terminal-font-size);
     line-height: 1.2; /* 行高，可以调整 */
 }

@@ -217,6 +217,37 @@ function unescapePath(str) {
 }
 
 /**
+ * [辅助函数] 检测字体是否可用
+ * 原理：比较目标字体与回退字体(monospace)的渲染宽度
+ */
+function isFontAvailable(fontName) {
+    // 1. 处理通用字体族名，直接放行
+    const generics = ['monospace', 'sans-serif', 'serif', 'cursive', 'fantasy', 'system-ui'];
+    if (generics.includes(fontName.toLowerCase().trim())) return true;
+
+    // 2. 创建画布上下文
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d");
+    
+    // 使用足够长的字符串和足够大的字号以放大差异
+    const text = "abcdefghijklmnopqrstuvwxyz0123456789-=[];',./!@#$%^&*()_+{}|:<>?";
+    const fontSize = "72px";
+    
+    // 3. 测量基准字体 (monospace) 的宽度
+    context.font = `${fontSize} monospace`;
+    const baselineWidth = context.measureText(text).width;
+    
+    // 4. 测量 目标字体 + 回退字体 的宽度
+    // 注意：如果 fontName 包含空格但没加引号，这里最好补上引号
+    const cleanName = fontName.replace(/['"]/g, ''); // 去掉可能存在的引号
+    context.font = `${fontSize} "${cleanName}", monospace`;
+    const targetWidth = context.measureText(text).width;
+
+    // 5. 如果宽度不同，说明目标字体生效了；如果完全相同，说明回退到了 monospace
+    return baselineWidth !== targetWidth;
+}
+
+/**
  * [工具] 写入文件 (处理重定向)
  */
 async function writeFile(path, contentLines, append = false) {
@@ -4916,6 +4947,11 @@ const globalCommands = {
         const value = args.slice(1).join(' '); 
         if (pipedInput) options._pipedInput = pipedInput;
 
+        // 获取当前css
+        const getStyle = (name) => {
+            return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+        };
+
         // 辅助：保存 Override
         const setOverride = (cssVar, cssValue) => {
             const overrides = JSON.parse(localStorage.getItem('style_overrides') || '{}');
@@ -4953,7 +4989,18 @@ const globalCommands = {
 
         switch (subCommand.toLowerCase()) {
             case 'font':
-                if (!value) { term.writeHtml(`<span class="term-error">Usage: style font "Fira Code"</span>`); return; }
+                if (!value) {
+                    term.writeLine(`Current font: ${getStyle('--terminal-font-family')}`);
+                    return;
+                }
+                // 移除用户可能输入的引号，获取纯字体名
+                const fontToCheck = value.replace(/['"]/g, '').trim();
+                
+                // 如果检测不通过
+                if (!isFontAvailable(fontToCheck)) {
+                    term.writeHtml(`<span class="term-error">Error: Font '${term.escapeHtml(fontToCheck)}' seems unavailable on this system.</span>`);
+                    return;
+                }
                 document.documentElement.style.setProperty('--terminal-font-family', value);
                 localStorage.setItem('terminalFontFamily', value);
                 term.writeLine(`Font set to: ${value}`);
@@ -4961,43 +5008,84 @@ const globalCommands = {
                 break;
 
             case 'size':
-                if (!value) { term.writeHtml(`<span class="term-error">Usage: style size 16px</span>`); return; }
-                document.documentElement.style.setProperty('--terminal-font-size', value);
-                localStorage.setItem('terminalFontSize', value);
-                term.writeLine(`Size set to: ${value}`);
+                if (!value) {
+                    term.writeLine(`Current size: ${getStyle('--terminal-font-size')}`);
+                    return;
+                }
+                let finalSize = value.trim();
+                
+                // 正则解释：
+                // ^       字符串开始
+                // \d+     一个或多个数字
+                // (\.\d+)? 可选的小数部分 (例如 .5)
+                // $       字符串结束
+                // 如果只匹配到纯数字，就追加 px
+                if (/^\d+(\.\d+)?$/.test(finalSize)) {
+                    finalSize += 'px';
+                }
+                document.documentElement.style.setProperty('--terminal-font-size', finalSize);
+                localStorage.setItem('terminalFontSize', finalSize);
+                term.writeLine(`Size set to: ${finalSize}`);
                 needsResize = true;
                 break;
 
             case 'bg':
-                if (!value) { term.writeHtml(`<span class="term-error">Usage: style bg #000000</span>`); return; }
+                if (!value) {
+                    term.writeLine(`Current background: ${getStyle('--terminal-background-color')}`);
+                    return;
+                }
                 setOverride('--terminal-background-color', value);
                 term.writeLine(`Background color set to: ${value}`);
                 break;
 
             case 'fg':
-                if (!value) { term.writeHtml(`<span class="term-error">Usage: style fg #ffffff</span>`); return; }
+                if (!value) {
+                    term.writeLine(`Current foreground: ${getStyle('--terminal-foreground-color')}`);
+                    return;
+                }
                 setOverride('--terminal-foreground-color', value);
                 term.writeLine(`Foreground color set to: ${value}`);
                 break;
 
             case 'accent':
-                if (!value) { term.writeHtml(`<span class="term-error">Usage: style accent #ff0000</span>`); return; }
+                if (!value) {
+                    term.writeLine(`Current accent: ${getStyle('--terminal-accent')}`);
+                    return;
+                }
                 setOverride('--terminal-accent', value);
                 setOverride('--color-accent-green', value); // 兼容旧变量
                 term.writeLine(`Accent color set to: ${value}`);
                 break;
                 
             case 'cursor':
-                if (!value) { term.writeHtml(`<span class="term-error">Usage: style cursor #00ff00</span>`); return; }
+                if (!value) {
+                    term.writeLine(`Current cursor: ${getStyle('--cursor-bg-color')}`);
+                    return;
+                }
                 setOverride('--cursor-bg-color', value);
                 term.writeLine(`Cursor color set to: ${value}`);
                 break;
 
             // --- [新增] Opacity ---
             case 'opacity':
+                // 获取逻辑：尝试从 rgba 中解析 alpha 值
+                if (!value) {
+                    const currentBg = getStyle('--terminal-background-color');
+                    let currentOp = "1.0"; // 默认不透明
+                    // 匹配 rgba(r, g, b, alpha) 中的 alpha
+                    const match = currentBg.match(/rgba?\(.*,\s*([\d\.]+)\)/);
+                    if (match) currentOp = match[1];
+                    else if (currentBg.startsWith('#')) currentOp = "1.0"; // Hex 默认为 1
+
+                    term.writeLine(`Current opacity: ${currentOp}`);
+                    return;
+                }
+
+                // 设置逻辑
                 const opacity = parseFloat(value);
                 if (isNaN(opacity) || opacity < 0 || opacity > 1) {
-                    term.writeHtml(`<span class="term-error">Usage: style opacity <0.0 - 1.0></span>`); 
+                    // [修复] 这里使用了 &lt; &gt; 来防止 HTML 解析问题
+                    term.writeHtml(`<span class="term-error">Usage: style opacity &lt;0.0 - 1.0&gt;</span>`); 
                     return; 
                 }
                 
@@ -5020,7 +5108,20 @@ const globalCommands = {
                 }
 
                 if (!targetUrl) { 
-                    term.writeHtml(`<span class="term-error">Usage: style wall <url></span>`); 
+                    const currentWall = getStyle('--terminal-background-image');
+                    // css 返回的是 url("...")，我们只提取里面的地址以便阅读
+                    const match = currentWall.match(/url\(['"]?(.*?)['"]?\)/);
+                    const displayVal = match ? match[1] : currentWall;
+                    
+                    if (displayVal === 'none') {
+                        term.writeLine("Current wallpaper: none");
+                    } else {
+                        // 如果太长，截断显示
+                        const shortVal = displayVal.length > 50 ? displayVal.substring(0, 47) + "..." : displayVal;
+                        term.writeLine(`Current wallpaper: ${shortVal}`);
+                        // 同时建议用法 (这里使用了转义字符)
+                        term.writeHtml(`<span style="color:gray; font-size:0.9em">To change: style wall &lt;url&gt;</span>`);
+                    }
                     return; 
                 }
                 
