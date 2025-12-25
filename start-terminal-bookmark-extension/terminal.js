@@ -5872,95 +5872,110 @@ const globalCommands = {
                     break;
                 
                 case 'install':
-                    if (!pkgName) { term.writeHtml(`<span class="term-error">${t('aptInstallUsage')}</span>`); return; }
+                    // 获取所有参数作为包名列表
+                    const pkgsToInstall = args.slice(1);
+                    if (pkgsToInstall.length === 0) { 
+                        term.writeHtml(`<span class="term-error">${t('aptInstallUsage')}</span>`); 
+                        return; 
+                    }
                     
                     const repoIndex = JSON.parse(localStorage.getItem('apt_repo_index') || '{}');
-                    const pkg = repoIndex[pkgName];
-
-                    if (!pkg) {
-                        term.writeHtml(`<span class="term-error">${t('aptPkgNotFound').replace('{0}', pkgName)}</span>`);
-                        return;
-                    }
-
-                    // 权限检查逻辑 (保持不变)
-                    const reqPermissions = pkg.permissions || [];
-                    const reqHostPermissions = pkg.host_permissions || [];
-                    const allPermissions = {
-                        permissions: reqPermissions,
-                        origins: reqHostPermissions
-                    };
-
-                    // 如果已经安装了，且版本相同，提示 (Reinstalling)
-                    const installedData = JSON.parse(localStorage.getItem('installed_packages') || '{}');
-                    if (installedData[pkgName] && installedData[pkgName].version === pkg.version) {
-                        term.writeLine(`${pkgName} is already the newest version (${pkg.version}).`);
-                        term.writeLine(`0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.`);
-                        return;
-                    }
-
-                    term.writeLine(`Package '${pkgName}' (v${pkg.version || '?'}) will be installed.`);
                     
-                    let needsPerms = false;
-                    if (reqPermissions.length > 0) {
-                        term.writeLine(`[!] This package requires new API permissions: ${reqPermissions.join(', ')}`);
-                        needsPerms = true;
-                    }
-                    if (reqHostPermissions.length > 0) {
-                        term.writeLine(`[!] This package needs to access new hosts: ${reqHostPermissions.join(', ')}`);
-                        needsPerms = true;
-                    }
+                    // 循环处理每个包
+                    for (const pkgName of pkgsToInstall) {
+                        term.writeLine(`\nProcessing: ${pkgName}...`);
 
-                    if (needsPerms) {
-                        const answer = await term.readInput(t('aptConfirm'));
-                        if (answer !== 'y' && answer !== '') {
-                            term.writeLine(t('aptAbort'));
-                            return;
+                        const pkg = repoIndex[pkgName];
+
+                        if (!pkg) {
+                            term.writeHtml(`<span class="term-error">${t('aptPkgNotFound').replace('{0}', pkgName)}</span>`);
+                            continue; // 跳过，处理下一个
                         }
-                        const granted = await new Promise((resolve) => {
-                            chrome.permissions.request(allPermissions, resolve);
-                        });
-                        if (!granted) {
-                            term.writeLine("Permissions not granted. Install failed.");
-                            return;
+
+                        // 权限检查逻辑
+                        const reqPermissions = pkg.permissions || [];
+                        const reqHostPermissions = pkg.host_permissions || [];
+                        const allPermissions = {
+                            permissions: reqPermissions,
+                            origins: reqHostPermissions
+                        };
+
+                        // 检查是否已安装
+                        const installedData = JSON.parse(localStorage.getItem('installed_packages') || '{}');
+                        if (installedData[pkgName] && installedData[pkgName].version === pkg.version) {
+                            term.writeLine(`${pkgName} is already the newest version (${pkg.version}).`);
+                            continue; // 跳过
                         }
-                    }
-                    
-                    if (pkg.file) {
-                        term.writeLine(t('aptFetch').replace('{0}', pkgName).replace('{1}', pkg.file));
-                        const codeResponse = await fetch(REPO_URL + pkg.file);
-                        if (!codeResponse.ok) {
-                            throw new Error(`Failed to fetch package code: ${codeResponse.statusText}`);
+
+                        // 权限请求 (只能串行，不能并行)
+                        let needsPerms = false;
+                        if (reqPermissions.length > 0) {
+                            term.writeLine(`[!] Package '${pkgName}' requires API: ${reqPermissions.join(', ')}`);
+                            needsPerms = true;
                         }
-                        const codeString = await codeResponse.text();
+                        if (reqHostPermissions.length > 0) {
+                            term.writeLine(`[!] Package '${pkgName}' requires Hosts: ${reqHostPermissions.join(', ')}`);
+                            needsPerms = true;
+                        }
+
+                        if (needsPerms) {
+                            const answer = await term.readInput(t('aptConfirm'));
+                            if (answer !== 'y' && answer !== '') {
+                                term.writeLine(`Skipping ${pkgName}.`);
+                                continue;
+                            }
+                            const granted = await new Promise((resolve) => {
+                                chrome.permissions.request(allPermissions, resolve);
+                            });
+                            if (!granted) {
+                                term.writeLine(`Permissions denied. Skipping ${pkgName}.`);
+                                continue;
+                            }
+                        }
                         
-                        // 保存代码的同时保存版本号
-                        let installed = JSON.parse(localStorage.getItem('installed_packages') || '{}');
-                        installed[pkgName] = { 
-                            code: codeString,
-                            version: pkg.version // 保存版本
-                        };
-                        localStorage.setItem('installed_packages', JSON.stringify(installed));
-                    } else {
-                        // 虚拟包逻辑
-                        let installed = JSON.parse(localStorage.getItem('installed_packages') || '{}');
-                        installed[pkgName] = { 
-                            code: null, // 虚拟包无代码
-                            version: pkg.version 
-                        };
-                        localStorage.setItem('installed_packages', JSON.stringify(installed));
-                        term.writeLine(`Permissions for built-in command ${pkgName} are now active.`);
+                        // 下载与安装
+                        if (pkg.file) {
+                            term.writeLine(t('aptFetch').replace('{0}', pkgName).replace('{1}', pkg.file));
+                            try {
+                                const codeResponse = await fetch(REPO_URL + pkg.file);
+                                if (!codeResponse.ok) {
+                                    throw new Error(`${codeResponse.status} ${codeResponse.statusText}`);
+                                }
+                                const codeString = await codeResponse.text();
+                                
+                                // 重新读取 localStorage，防止循环中覆盖
+                                let currentInstalled = JSON.parse(localStorage.getItem('installed_packages') || '{}');
+                                currentInstalled[pkgName] = { 
+                                    code: codeString,
+                                    version: pkg.version
+                                };
+                                localStorage.setItem('installed_packages', JSON.stringify(currentInstalled));
+                                term.writeLine(`Successfully installed ${pkgName}.`);
+                            } catch (err) {
+                                term.writeHtml(`<span class="term-error">Failed to fetch ${pkgName}: ${err.message}</span>`);
+                            }
+                        } else {
+                            // 虚拟包逻辑 (无代码，仅权限)
+                            let currentInstalled = JSON.parse(localStorage.getItem('installed_packages') || '{}');
+                            currentInstalled[pkgName] = { 
+                                code: null, 
+                                version: pkg.version 
+                            };
+                            localStorage.setItem('installed_packages', JSON.stringify(currentInstalled));
+                            term.writeLine(`Permissions for ${pkgName} activated.`);
+                        }
                     }
-                    
-                    term.writeLine(`Successfully installed ${pkgName}.`);
                     break;
 
                 case 'remove':
-                     if (!pkgName) { term.writeLine("Usage: sudo apt remove <package>"); return; }
-                     {
+                     const pkgsToRemove = args.slice(1);
+                     if (pkgsToRemove.length === 0) { term.writeLine("Usage: sudo apt remove <package1> [package2...]"); return; }
+                     
+                     for (const pkgName of pkgsToRemove) {
                         let installed = JSON.parse(localStorage.getItem('installed_packages') || '{}');
                         if (!installed[pkgName]) {
                             term.writeLine(`${pkgName} is not installed.`);
-                            return;
+                            continue;
                         }
                         delete installed[pkgName];
                         localStorage.setItem('installed_packages', JSON.stringify(installed));
