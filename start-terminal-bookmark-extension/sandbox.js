@@ -22,8 +22,14 @@ window.addEventListener('message', (event) => {
         writeLine: function(msg) {
             this._post('writeLine', String(msg));
         },
+        write: function(msg) {
+            this._post('write', String(msg));  
+        },
         writeHtml: function(html) {
             this._post('writeHtml', html);
+        },
+        writeError: function(msg) {
+            this._post('WriteError', String(msg));
         }
     };
 

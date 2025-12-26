@@ -457,8 +457,14 @@ class Terminal {
                 case 'writeLine':
                     this.writeLine(payload);
                     break;
+                case 'write':
+                    this.writeLine(payload); // Temp using writeLine
+                    break;
                 case 'writeHtml':
                     this.writeHtml(payload);
+                    break;
+                case 'writeError':
+                    this.writeError(payload);
                     break;
                 case 'error':
                     this.writeHtml(`<span class="term-error">Script Error: ${payload}</span>`);
