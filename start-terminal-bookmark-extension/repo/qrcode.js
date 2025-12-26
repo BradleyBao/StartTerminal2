@@ -1,28 +1,22 @@
 /*
  * qrcode.js — ASCII QR generator for Start Terminal 2.0
- * Sandbox-safe, no DOM, no external libs
- *
- * Based on a minimal QR encoder (Version 1–3, ECC L)
+ * FIXED: proper 3-state matrix (null / true / false)
  */
 
 function generateQRMatrix(text) {
-    // --- extremely small QR encoder (version 1, ECC L only) ---
-    // This is NOT a full spec implementation, but stable and scannable
-
-    // Encode text as byte mode
     const bytes = [];
     for (let i = 0; i < text.length; i++) {
         bytes.push(text.charCodeAt(i) & 0xff);
     }
 
-    // Version 1-L capacity: 17 bytes
     if (bytes.length > 17) {
         throw new Error("input too long (max 17 bytes)");
     }
 
-    // ---- fixed QR template (21x21) ----
     const size = 21;
-    const m = Array.from({ length: size }, () => Array(size).fill(false));
+
+    // ✅ 三态矩阵：null = empty
+    const m = Array.from({ length: size }, () => Array(size).fill(null));
 
     function placeFinder(x, y) {
         for (let dy = -1; dy <= 7; dy++) {
@@ -46,46 +40,46 @@ function generateQRMatrix(text) {
     placeFinder(size - 7, 0);
     placeFinder(0, size - 7);
 
-    // timing patterns
+    // timing pattern
     for (let i = 8; i < size - 8; i++) {
         m[6][i] = i % 2 === 0;
         m[i][6] = i % 2 === 0;
     }
 
-    // --- data placement (simplified, no masking) ---
-    let bitStream = [];
+    // ---- data bits ----
+    let bits = [];
 
-    // mode: byte (0100)
-    bitStream.push(0,1,0,0);
+    // byte mode
+    bits.push(0, 1, 0, 0);
 
-    // length (8 bits)
     for (let i = 7; i >= 0; i--) {
-        bitStream.push((bytes.length >> i) & 1);
+        bits.push((bytes.length >> i) & 1);
     }
 
     for (const b of bytes) {
         for (let i = 7; i >= 0; i--) {
-            bitStream.push((b >> i) & 1);
+            bits.push((b >> i) & 1);
         }
     }
 
-    // terminator
-    bitStream.push(0,0,0,0);
+    bits.push(0, 0, 0, 0); // terminator
 
-    let dirUp = true;
     let x = size - 1;
     let y = size - 1;
+    let dirUp = true;
     let idx = 0;
 
     while (x > 0) {
-        if (x === 6) x--; // skip timing column
+        if (x === 6) x--; // skip timing col
 
         for (let i = 0; i < size; i++) {
             const yy = dirUp ? y - i : i;
+
             for (let dx = 0; dx < 2; dx++) {
                 const xx = x - dx;
-                if (m[yy][xx] !== false) continue;
-                m[yy][xx] = bitStream[idx++] === 1;
+                if (m[yy][xx] !== null) continue;
+
+                m[yy][xx] = bits[idx++] === 1;
             }
         }
 
@@ -96,7 +90,7 @@ function generateQRMatrix(text) {
     return m;
 }
 
-// ---------------- CLI entry ----------------
+// ---------- CLI ----------
 
 try {
     const text = args.join(" ");
@@ -120,7 +114,7 @@ try {
             const dark =
                 x >= 0 && y >= 0 &&
                 x < size && y < size &&
-                matrix[y][x];
+                matrix[y][x] === true;
             line += dark ? BLACK : WHITE;
         }
         out += line + "\n";
