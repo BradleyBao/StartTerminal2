@@ -40,7 +40,7 @@
   "qrcode": {
     "desc": "Generate a QR code in ASCII using local processing.",
     "file": "qrcode.js",
-    "version": "2.1.0",
+    "version": "2.1.4",
     "permissions": [],
     "host_permissions": [] 
   }
