@@ -4191,6 +4191,8 @@ const globalCommands = {
         }
 
         const path = args[0];
+        const scriptArgs = args.slice(1);
+
         const result = bookmarkSystem._findNodeByPath(path);
 
         if (!result || !result.node) {
@@ -4235,9 +4237,19 @@ const globalCommands = {
              return;
         }
 
+        // 替换 $0 (脚本名), $1-$9 (参数), $@/$* (所有参数)
+        // 注意：这是简单的文本替换，模拟 Shell 行为
+        
+        scriptContent = scriptContent.replace(/\$(\d+|@|\*)/g, (match, token) => {
+            if (token === '0') return path; // $0
+            if (token === '@' || token === '*') return scriptArgs.join(' '); // $@
+            
+            const index = parseInt(token); // $1, $2...
+            // 参数索引从 1 开始，对应 scriptArgs 数组的 0
+            return scriptArgs[index - 1] || ""; 
+        });
+
         // --- 核心执行 ---
-        // 我们只需递归调用 executeLine，它现在可以处理 \n
-        // await/return 链和 executeNestLevel 会处理好一切。
         return executeLine(scriptContent);
      },
      'chmod': (args, options) => {
