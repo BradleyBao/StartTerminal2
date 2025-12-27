@@ -2,7 +2,7 @@
   "cowsay": {
     "desc": "A classic ASCII cow.",
     "file": "cowsay.js",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "permissions": [],
     "host_permissions": []
   },
