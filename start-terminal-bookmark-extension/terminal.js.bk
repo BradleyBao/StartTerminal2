@@ -38,7 +38,99 @@ const Environment = {
     'USER': 'user',
     'HOST': 'ST2.0',
     "PS1": '\\u@\\h:\\w\\$ ',
+    "COMPLETION_STYLE": "bash",
     // More will load by .startrc
+}
+
+
+/**
+ * [工具函数] 预加载并平滑切换壁纸
+ * @param {string} url - 图片 URL，如果为 'none' 则移除
+ */
+function setWallpaper(url) {
+    const root = document.documentElement;
+
+    // 情况 1: 清除壁纸
+    if (!url || url === 'none') {
+        // 先淡出
+        root.style.setProperty('--bg-load-opacity', '0');
+        
+        // 等待动画结束后真正移除图片 (与 CSS transition 时间匹配)
+        setTimeout(() => {
+            root.style.setProperty('--terminal-background-image', 'none');
+        }, 700);
+        return;
+    }
+
+    // 情况 2: 设置新壁纸
+    // 1. 先把透明度设为 0 (如果当前有壁纸，会先淡出；如果没有，则保持隐藏)
+    //    注意：如果你希望新旧壁纸直接交叉淡入淡出，逻辑会更复杂，
+    //    这里的逻辑是：旧图淡出/变黑 -> 新图加载 -> 新图淡入。
+    root.style.setProperty('--bg-load-opacity', '0');
+
+    // 2. JS 预加载图片
+    const img = new Image();
+    img.src = url;
+
+    img.onload = () => {
+        // 图片加载完毕！
+        
+        // A. 切换 CSS 变量中的图片 URL
+        root.style.setProperty('--terminal-background-image', `url('${url}')`);
+        
+        // B. 强制浏览器重绘 (可选，防止 CSS 变量更新延迟)
+        // void root.offsetWidth; 
+
+        // C. 开始淡入 (将透明度设为 1)
+        // 使用 requestAnimationFrame 确保 CSS 更新已被应用，从而触发 transition
+        requestAnimationFrame(() => {
+            root.style.setProperty('--bg-load-opacity', '1');
+        });
+    };
+
+    img.onerror = () => {
+        term.writeError(`Failed to load wallpaper: ${url}`);
+        // 加载失败，保持 0 或恢复旧的? 这里我们保持黑屏或保持原样
+    };
+}
+
+
+/**
+ * [全局工具] 将颜色转换为 RGBA 格式
+ * @param {string} color - Hex (#fff, #ffffff), rgb(), or rgba()
+ * @param {number} alpha - 透明度 (0.0 - 1.0)
+ * @returns {string} rgba(...) 字符串
+ */
+function toRgba(color, alpha) {
+    // 1. 处理 Hex (#FFF 或 #FFFFFF)
+    if (color.startsWith('#')) {
+        let hex = color.slice(1);
+        if (hex.length === 3) {
+            hex = hex.split('').map(c => c + c).join(''); // FFF -> FFFFFF
+        }
+        const r = parseInt(hex.substring(0, 2), 16);
+        const g = parseInt(hex.substring(2, 4), 16);
+        const b = parseInt(hex.substring(4, 6), 16);
+        return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    }
+    
+    // 2. 处理 rgb(r, g, b)
+    if (color.startsWith('rgb(')) {
+        const parts = color.match(/\d+/g);
+        if (parts && parts.length >= 3) {
+            return `rgba(${parts[0]}, ${parts[1]}, ${parts[2]}, ${alpha})`;
+        }
+    }
+    
+    // 3. 处理 rgba(r, g, b, a) -> 替换 a
+    if (color.startsWith('rgba(')) {
+        const parts = color.match(/[\d.]+/g);
+        if (parts && parts.length >= 3) {
+            return `rgba(${parts[0]}, ${parts[1]}, ${parts[2]}, ${alpha})`;
+        }
+    }
+    
+    return color; // 如果无法解析，返回原值
 }
 
 /**
@@ -125,6 +217,122 @@ function unescapePath(str) {
 }
 
 /**
+ * [辅助函数] 检测字体是否可用
+ * 原理：比较目标字体与回退字体(monospace)的渲染宽度
+ */
+function isFontAvailable(fontName) {
+    // 1. 处理通用字体族名，直接放行
+    const generics = ['monospace', 'sans-serif', 'serif', 'cursive', 'fantasy', 'system-ui'];
+    if (generics.includes(fontName.toLowerCase().trim())) return true;
+
+    // 2. 创建画布上下文
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d");
+    
+    // 使用足够长的字符串和足够大的字号以放大差异
+    const text = "abcdefghijklmnopqrstuvwxyz0123456789-=[];',./!@#$%^&*()_+{}|:<>?";
+    const fontSize = "72px";
+    
+    // 3. 测量基准字体 (monospace) 的宽度
+    context.font = `${fontSize} monospace`;
+    const baselineWidth = context.measureText(text).width;
+    
+    // 4. 测量 目标字体 + 回退字体 的宽度
+    // 注意：如果 fontName 包含空格但没加引号，这里最好补上引号
+    const cleanName = fontName.replace(/['"]/g, ''); // 去掉可能存在的引号
+    context.font = `${fontSize} "${cleanName}", monospace`;
+    const targetWidth = context.measureText(text).width;
+
+    // 5. 如果宽度不同，说明目标字体生效了；如果完全相同，说明回退到了 monospace
+    return baselineWidth !== targetWidth;
+}
+
+/**
+ * [工具] 写入文件 (处理重定向)
+ */
+async function writeFile(path, contentLines, append = false) {
+    if (path === '/dev/null') return; // 黑洞
+
+    const content = contentLines.join('\n');
+    
+    // 1. 查找文件节点
+    const result = bookmarkSystem._findNodeByPath(path);
+    let node = result ? result.node : null;
+
+    // 2. 如果文件不存在，创建它
+    if (!node) {
+        // 解析路径 (类似 touch)
+        const parentPath = path.substring(0, path.lastIndexOf('/')) || (path.includes('/') ? '/' : '.');
+        const fileName = path.split('/').pop();
+        
+        const parentResult = bookmarkSystem._findNodeByPath(parentPath);
+        if (!parentResult || !parentResult.node) throw new Error(`Directory not found: ${parentPath}`);
+        
+        // 创建逻辑 (区分 VFS /bin 和普通书签)
+        if (parentResult.node.id === 'vfs-bin') {
+             // VFS script
+             saveVfsScript(fileName, content, 0o644, Environment.USER);
+             await bookmarkSystem._refreshBookmarks(); // 刷新
+             return;
+        } else {
+             // 书签
+             await new Promise(r => chrome.bookmarks.create({
+                 parentId: parentResult.node.id,
+                 title: fileName,
+                 url: 'data:text/plain,' + encodeURIComponent(content)
+             }, r));
+             return;
+        }
+    }
+
+    // 3. 文件存在，执行覆盖或追加
+    let newContent = content;
+    if (append) {
+        // 读取旧内容
+        let oldContent = "";
+        if (node.id.startsWith('vfs-')) {
+             const b64 = (node.url||'').split(',')[1]||'';
+             oldContent = decodeURIComponent(atob(b64));
+        } else {
+             oldContent = decodeURIComponent(node.url.replace('data:text/plain,', ''));
+        }
+        newContent = oldContent + '\n' + content;
+    }
+
+    // 保存
+    if (node.id.startsWith('vfs-bin-')) {
+        saveVfsScript(node.title, newContent);
+    } else if (node.id === 'vfs-startrc') {
+        localStorage.setItem('.startrc', newContent);
+    } else {
+        chrome.bookmarks.update(node.id, { url: 'data:text/plain,' + encodeURIComponent(newContent) });
+    }
+}
+
+/**
+ * [工具] 读取文件 (用于 < 输入重定向)
+ */
+function readFileContent(path) {
+    const result = bookmarkSystem._findNodeByPath(path);
+    if (!result || !result.node) throw new Error(`No such file: ${path}`);
+    
+    const node = result.node;
+    if (node.children) throw new Error(`Is a directory: ${path}`);
+
+    if (node.id.startsWith('vfs-')) {
+        const b64 = (node.url||'').split(',')[1]||'';
+        return decodeURIComponent(atob(b64));
+    } else {
+        // 假设是 data:text/plain
+        const raw = node.url || "";
+        if (raw.startsWith('data:text/plain')) {
+             return decodeURIComponent(raw.substring(raw.indexOf(',') + 1));
+        }
+        return raw; // 普通 URL
+    }
+}
+
+/**
  * 核心终端模拟器类
  */
 class Terminal {
@@ -160,8 +368,17 @@ class Terminal {
         this.isReading = false;
         this.readResolve = null;
 
-        this.history = [];
-        this.historyIndex = 0;
+        // 静默模式开关
+        this.isSilent = false;
+
+        try {
+            const savedHistory = localStorage.getItem('st2_cmd_history');
+            this.history = savedHistory ? JSON.parse(savedHistory) : [];
+        } catch (e) {
+            console.warn("Failed to load history:", e);
+            this.history = [];
+        }
+        this.historyIndex = this.history.length; // 确保索引指向最新的空行
         this.tempLine = "";
 
         // Zsh 风格菜单状态
@@ -184,6 +401,31 @@ class Terminal {
         this._initBuffer();
         this._attachListeners();
         this.focus();
+
+        // I/O 重定向状态
+        this.ioState = {
+            stdout: null, // null = 屏幕, { type: 'overwrite'|'append', path: '...' } = 文件
+            stderr: null,
+            buffer: { stdout: [], stderr: [] }
+        };
+    }
+
+    /**
+     * 重置重定向状态 (每次命令前调用)
+     */
+    resetIO() {
+        this.ioState = { stdout: null, stderr: null, buffer: { stdout: [], stderr: [] } };
+    }
+
+    /**
+     * 设置重定向
+     * @param {number} fd - 1 (stdout) or 2 (stderr)
+     * @param {string} type - '>' (overwrite) or '>>' (append)
+     * @param {string} path - 目标文件路径
+     */
+    setRedirect(fd, type, path) {
+        if (fd === 1) this.ioState.stdout = { type, path };
+        if (fd === 2) this.ioState.stderr = { type, path };
     }
 
     clearLastLines(count) {
@@ -215,8 +457,14 @@ class Terminal {
                 case 'writeLine':
                     this.writeLine(payload);
                     break;
+                case 'write':
+                    this.writeLine(payload); // Temp using writeLine
+                    break;
                 case 'writeHtml':
                     this.writeHtml(payload);
+                    break;
+                case 'writeError':
+                    this.writeError(payload);
                     break;
                 case 'error':
                     this.writeHtml(`<span class="term-error">Script Error: ${payload}</span>`);
@@ -744,12 +992,43 @@ class Terminal {
             }
         }
         this.domBuffer.innerHTML = html;
-        this.scrollToBottom();
+        this.scrollToCursor();
     }
 
+    // Deprecated 
     scrollToBottom() {
         requestAnimationFrame(() => {
             this.container.scrollTop = this.container.scrollHeight;
+        });
+    }
+
+    /**
+     * 智能滚动：始终确保光标在视口内可见
+     * 替代原来的 scrollToBottom，避免缩放时跳到大量空白处
+     */
+    scrollToCursor() {
+        requestAnimationFrame(() => {
+            if (!this.cellHeight) return;
+
+            // 1. 计算光标当前行的像素位置 (Top 和 Bottom)
+            const cursorTop = this.cursorY * this.cellHeight;
+            const cursorBottom = cursorTop + this.cellHeight;
+
+            // 2. 获取当前视口状态
+            const viewportHeight = this.container.clientHeight;
+            const currentScrollTop = this.container.scrollTop;
+
+            // 3. 判断与滚动
+            // 情况 A: 光标跑到了视口上方 -> 向上滚动，直到光标出现在顶部
+            if (cursorTop < currentScrollTop) {
+                this.container.scrollTop = cursorTop;
+            }
+            // 情况 B: 光标跑到了视口下方 -> 向下滚动，直到光标出现在底部
+            else if (cursorBottom > currentScrollTop + viewportHeight) {
+                this.container.scrollTop = cursorBottom - viewportHeight;
+            }
+            
+            // 情况 C: 光标在视口中间 -> 什么都不做 (这是防止画面抖动的关键)
         });
     }
 
@@ -822,7 +1101,7 @@ class Terminal {
             this.cursorY--;      // 光标上移
         }
 
-        this.scrollToBottom(); // 自动滚动到底部
+        this.scrollToCursor(); // 自动滚动到底部
     }
 
     /**
@@ -877,30 +1156,59 @@ class Terminal {
     }
 
     /**
-     * [公共] 打印一行文本
-     * @param {string} text
+     * 标准输出 (stdout)
      */
     writeLine(text) {
-        const textString = String(text);
-        
-        // 功能 1：管道支持
-        if (isPiping) {
-            pipeBuffer.push(textString);
-            return;
+        if (this.isSilent) return; // $(...) 静默模式优先级最高
+
+        // 检查是否重定向
+        if (this.ioState.stdout) {
+            // 如果是 /dev/null，直接丢弃
+            if (this.ioState.stdout.path === '/dev/null') return;
+            // 否则存入缓冲区
+            this.ioState.buffer.stdout.push(text);
+        } else {
+            // 正常写屏
+            if (isPiping) {
+                pipeBuffer.push(String(text));
+            } else {
+                this._prepareOutput();
+                this.writeHtml(this.escapeHtml(String(text)));
+            }
         }
-
-        // const currentBufferLine = this.buffer[this.cursorY] || "";
-        // const hasContent = this._stripHtml(currentBufferLine).trim().length > 0;
-
-        // if (this.cursorX > 0 || hasContent) {
-        //     this._handleNewline();
-        //     this.cursorX = 0;
-            
-        // }
-        this._prepareOutput();
-
-        this.writeHtml(this.escapeHtml(textString));
     }
+
+    /**
+     * 标准错误输出 (stderr)
+     * 所有之前的 term.writeHtml(`<span class="term-error">...</span>`) 都应该改用这个
+     */
+    writeError(text) {
+        if (this.ioState.stderr) {
+            if (this.ioState.stderr.path === '/dev/null') return;
+            this.ioState.buffer.stderr.push(text);
+        } else {
+            // 正常写屏 (红色)
+            this._prepareOutput();
+            // 注意：这里手动加 span，或者你也可以封装进去
+            const html = `<span class="term-error">${text}</span>`;
+            
+            // 为了复用 writeHtml 的逻辑 (自动换行等)，我们直接调用它
+            // 但 writeHtml 会受 ioState.stdout 影响吗？
+            // 这是一个设计点。为了简单，我们让 writeHtml 总是写屏(除非 isSilent)，
+            // 而 writeLine 负责 stdout。
+            // 更好的做法是直接操作 DOM 或调用底层 _writeSingleLine
+            
+            // 临时方案：直接写 buffer
+            const lines = html.split('\n');
+            for(let l of lines) {
+                this.buffer[this.cursorY] = this._overwriteHtml(this.buffer[this.cursorY], this.cursorX, l);
+                this._handleNewline();
+            }
+            this._render();
+        }
+    }
+
+    
 
     /**
      * 准备输出：确保当前行是干净的
@@ -1053,11 +1361,15 @@ class Terminal {
         return result;
     }
 
+    /**
+     * [修复版] 截取 HTML 字符串，感知 HTML 实体 (如 &quot;) 为单个字符
+     * 防止在实体中间截断导致显示乱码
+     */
     _truncateHtml(html, length, start = 0) {
         let visibleCount = 0;
         let captureCount = 0;
         let startIndex = 0;
-        let endIndex = 0;
+        let endIndex = html.length; // 默认为末尾
         let inTag = false;
         let foundStart = (start === 0);
 
@@ -1065,45 +1377,82 @@ class Terminal {
 
         for (let i = 0; i < html.length; i++) {
             const char = html[i];
-            if (char === '<') {
-                inTag = true;
-            } else if (char === '>') {
-                inTag = false;
+            
+            if (char === '<') inTag = true;
+
+            // --- 核心修复：检测 HTML 实体 ---
+            let isEntity = false;
+            let entityLen = 0;
+            // 如果不在标签内，且遇到 &，尝试向后查找 ;
+            if (!inTag && char === '&') {
+                const nextSemi = html.indexOf(';', i);
+                // 限制查找范围（比如 12 字符内），防止误判普通文本中的 &
+                if (nextSemi !== -1 && nextSemi - i < 12) {
+                     isEntity = true;
+                     entityLen = nextSemi - i + 1; // 实体总长度 (例如 &quot; 是 6)
+                }
             }
+            // -----------------------------
 
             if (!inTag) {
                 if (!foundStart) {
-                    // --- 1. 跳过阶段 ---
-                    visibleCount++;
+                    // --- 1. 跳过阶段 (Skipping) ---
+                    visibleCount++; // 实体算作 1 个可见宽度
+                    
+                    // 如果是实体，跳过整个实体长度
+                    if (isEntity) i += (entityLen - 1);
+                    
                     if (visibleCount >= start) {
                         foundStart = true;
-                        startIndex = i; // 从这个 HTML 索引开始捕获
+                        startIndex = i + 1; // 下一个字符开始捕获
                     }
-                }
-                
-                if (foundStart) {
-                    // --- 2. 捕获阶段 ---
+                } else {
+                    // --- 2. 捕获阶段 (Capturing) ---
                     captureCount++;
+                    
+                    // 如果是实体，跳过整个实体长度（保证不切断）
+                    if (isEntity) i += (entityLen - 1);
+                    
                     if (captureCount >= length) {
-                        // 我们已捕获足够的字符。
-                        endIndex = i + 1; // 结束索引是当前字符之后
-                        break;
+                        endIndex = i + 1;
+                        break; // 完成
                     }
                 }
+            } else if (char === '>') {
+                inTag = false;
             }
-
-            // 如果我们还没 break，则 endIndex 必须至少跟上 i
-            endIndex = i + 1;
         }
 
-        if (!foundStart) return ""; // 从未找到起始点
+        if (!foundStart) return "";
         return html.substring(startIndex, endIndex);
     }
 
     writeHtml(html) {
+        if (this.isSilent) return;
         // 功能 1：管道支持
         if (isPiping) {
             pipeBuffer.push(this._stripHtml(html)); // 管道中只应传递纯文本
+            return;
+        }
+
+        if (this.ioState.stderr && html.includes('class="term-error"')) {
+             if (this.ioState.stderr.path === '/dev/null') return; // 丢弃
+             // 剥离 HTML 标签，只存纯文本错误信息
+             this.ioState.buffer.stderr.push(this._stripHtml(html));
+             return;
+        }
+
+        // 标准输出流拦截 (Stdout Redirection >)
+        if (this.ioState.stdout) {
+            if (this.ioState.stdout.path === '/dev/null') return; // 丢弃
+            // 将 HTML 转换为纯文本保存 (文件通常只存纯文本)
+            this.ioState.buffer.stdout.push(this._stripHtml(html));
+            return;
+        }
+
+        // 管道支持 (Pipe |)
+        if (isPiping) {
+            pipeBuffer.push(this._stripHtml(html)); // 管道传递纯文本
             return;
         }
 
@@ -1287,7 +1636,16 @@ class Terminal {
 
             if (command.trim().length > 0 && command !== this.history[this.history.length - 1]) {
                 this.history.push(command);
+                
+                // 限制历史记录数量 (例如 500 条)，防止 localStorage 溢出
+                if (this.history.length > 500) {
+                    this.history.shift();
+                }
+                
+                // 保存
+                localStorage.setItem('st2_cmd_history', JSON.stringify(this.history));
             }
+
             this.historyIndex = this.history.length; // 重置索引到“新行”
             this.tempLine = ""; // 清空临时行
 
@@ -1318,6 +1676,17 @@ class Terminal {
                 this._render(); // [!] 移动到内部
             }
             return; // 结束
+
+        } else if (e.key === 'Delete') {
+            e.preventDefault();
+            const pos = this.cursorX - this.prompt.length;
+            // 只有当光标不在行尾时才删除
+            if (pos < this.currentLine.length) {
+                this.currentLine = this.currentLine.substring(0, pos) + this.currentLine.substring(pos + 1);
+                // 光标位置不变，但文字变短了
+                this._render();
+            }
+            return;
 
         } else if (e.key === 'ArrowLeft') {
             e.preventDefault();
@@ -1418,38 +1787,54 @@ class Terminal {
         const newRows = this.rows;
         const newCols = this.cols;
 
-        // 3. 调整 buffer 数组以匹配 newRows (在顶部添加/删除行)
-        // if (newRows > oldRows) {
-        //     // 窗口变高了，在顶部添加新行（模拟内容向上滚动）
-        //     const diff = newRows - oldRows;
-        //     const newLines = Array(diff).fill(' '.repeat(newCols));
-        //     this.buffer.splice(0, 0, ...newLines); // 在 buffer 顶部插入
-        // } else if (newRows < oldRows) {
-        //     // 窗口变矮了，从顶部删除行（模拟内容滚出屏幕）
-        //     const diff = oldRows - newRows;
-        //     this.buffer.splice(0, diff); // 从 buffer 顶部删除
-        // }
+        // 3. 调整 buffer 数组 (保持原有逻辑)
+        if (newRows > oldRows) {
+            // 窗口变高了，可选：在顶部填充空行
+        } else if (newRows < oldRows) {
+            // 窗口变矮了，不做处理，_render 会自动截取
+        }
         
-        // 4. 调整 buffer 中*每行*的宽度 (天真的重排：截断或填充)
-        //    用户接受这种 "被打乱" 的布局
+        // 4. [核心修复] 智能调整每行宽度
         this.buffer = this.buffer.map(line => {
-            const textContent = this._stripHtml(line); // 获取纯文本
-            if (textContent.length > newCols) {
-                // 截断
-                return this.escapeHtml(textContent.substring(0, newCols)); 
+            // A. 获取去除 HTML 标签后的纯文本
+            const plainText = this._stripHtml(line);
+            
+            // B. 获取去除尾部空格后的“实际内容”
+            //    (用于判断这些内容是否真的比新窗口宽)
+            const trimmedPlainText = plainText.trimEnd();
+            const contentLen = getVisualLength(trimmedPlainText);
+            
+            if (contentLen > newCols) {
+                // [情况 1]: 实际内容（不含空格）比新窗口还宽
+                // 必须截断。为了防止切断 HTML 标签导致渲染崩溃，只能忍痛剥离颜色。
+                // 这是唯一会丢失颜色的情况（通常只在窗口缩得非常小时发生）。
+                return this.escapeHtml(plainText.substring(0, newCols)); 
+                
             } else {
-                // 填充
-                return this.escapeHtml(textContent) + ' '.repeat(newCols - textContent.length);
+                // [情况 2]: 实际内容能放得下 (即使之前有很长的填充空格)
+                // 这是一个能够保留颜色的安全操作。
+                
+                // 1. 移除旧的 HTML 字符串末尾的空格
+                //    (注意：这可能会移除一部分带有背景色的空格，但在 Resize 场景下通常是可以接受的)
+                const trimmedLine = line.trimEnd();
+                
+                // 2. 计算剩余部分的视觉长度
+                //    (注意：必须重新 stripHtml 计算，因为 trimEnd 后长度变了)
+                const currentVisualLen = getVisualLength(this._stripHtml(trimmedLine));
+                
+                // 3. 计算需要补多少空格才能填满新窗口
+                const paddingNeeded = Math.max(0, newCols - currentVisualLen);
+                
+                // 4. 返回：原始带色内容 + 新的填充空格
+                return trimmedLine + ' '.repeat(paddingNeeded);
             }
         });
 
-        // 5. 确保光标在调整后的最后一行
-        //    (在我们的设计中，光标总是在缓冲区之外的“当前行”)
-        //    我们只需要确保 cursorY 是最后一行，_render 会处理的
-        // this.cursorY = this.rows - 1;
+        // 5. 确保光标位置合法
+        if (this.cursorX >= newCols) this.cursorX = newCols - 1;
+        if (this.cursorY >= newRows) this.cursorY = newRows - 1;
 
-        // 6. 重新渲染 (将显示 reflowed 缓冲区和新提示符)
-        //    setPrompt 会被 _render 隐式调用
+        // 6. 重新渲染
         this._render();
     }
 
@@ -1587,7 +1972,7 @@ class NanoEditor {
         this.term._render();
     }
 
-    handleKeydown(e) {
+    async handleKeydown(e) {
         e.preventDefault();
         e.stopPropagation();
         this.status = ""; // 清除状态
@@ -1613,6 +1998,94 @@ class NanoEditor {
                         return; // 阻止调用 _save()
                     }
                     this._save();
+                    break;
+
+                case 's':
+                    if (this.isReadOnly) {
+                        this.status = t('nanoStatusReadOnly');
+                        this._render(); // 重新渲染以显示状态
+                        return; // 阻止调用 _save()
+                    }
+                    this._save();
+                    break;
+
+                case 'v':
+                    try {
+                        const text = await navigator.clipboard.readText();
+                        if (text) {
+                            this.dirty = true;
+                            
+                            // 1. 规范化换行符 (CRLF -> LF)
+                            const cleanText = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+                            const parts = cleanText.split('\n');
+                            
+                            // 获取光标当前所在行，并拆分为 光标前(pre) 和 光标后(post)
+                            const currentLine = this.lines[this.cursorY];
+                            const pre = currentLine.substring(0, this.cursorX);
+                            const post = currentLine.substring(this.cursorX);
+                            
+                            if (parts.length === 1) {
+                                // --- 单行粘贴 ---
+                                this.lines[this.cursorY] = pre + parts[0] + post;
+                                this.cursorX += parts[0].length;
+                            } else {
+                                // --- 多行粘贴 ---
+                                // 1. 当前行变成：pre + 第一段
+                                this.lines[this.cursorY] = pre + parts[0];
+                                
+                                // 2. 中间部分直接插入新行
+                                // parts.slice(1, -1) 获取中间的所有行
+                                // 如果只有2行，中间就是空的，逻辑依然成立
+                                const middleLines = parts.slice(1, -1);
+                                if (middleLines.length > 0) {
+                                    this.lines.splice(this.cursorY + 1, 0, ...middleLines);
+                                }
+                                
+                                // 3. 最后一行：最后一段 + post
+                                // 注意：需要计算最后一行插入的位置
+                                const lastPart = parts[parts.length - 1];
+                                const insertionIndex = this.cursorY + parts.length - 1;
+                                
+                                // 在正确位置插入最后一行
+                                this.lines.splice(insertionIndex, 0, lastPart + post);
+                                
+                                // 4. 更新光标位置
+                                this.cursorY = insertionIndex;
+                                this.cursorX = lastPart.length; 
+                            }
+                            
+                            // [关键] 强制检查光标位置并滚动视图
+                            this._validateCursor();
+                            this._handleScrolling();
+                            this._render();
+                        }
+                    } catch (err) {
+                        this.status = "Paste failed: " + err.message;
+                        this._render();
+                    }
+                    break;
+
+                case 'k':
+                    this.dirty = true;
+                    if (this.lines.length > 0) {
+                        // 删除当前行
+                        this.lines.splice(this.cursorY, 1);
+                        
+                        // 如果删完了，至少保留一行空行
+                        if (this.lines.length === 0) {
+                            this.lines.push("");
+                        }
+                        
+                        // 如果光标在最后一行被删后，上移一行
+                        if (this.cursorY >= this.lines.length) {
+                            this.cursorY = this.lines.length - 1;
+                        }
+                        // 确保 X 不越界
+                        this.cursorX = Math.min(this.cursorX, this.lines[this.cursorY].length);
+                        
+                        this._handleScrolling();
+                        this._render();
+                    }
                     break;
             }
         } else {
@@ -1804,10 +2277,12 @@ class BookmarkSystem {
                 if (result && result.node && result.node.children) {
                     targetNode = result.node;
                 } else if (result && result.node) {
-                    this.term.writeHtml(`<span class="term-error">ls: ${targetPath}: Not a directory</span>`);
+                    // [修改] 使用 writeError
+                    this.term.writeError(`ls: ${targetPath}: Not a directory`);
                     return;
                 } else {
-                    this.term.writeHtml(`<span class="term-error">ls: ${targetPath}: No such directory</span>`);
+                    // [修改] 使用 writeError
+                    this.term.writeError(`ls: ${targetPath}: No such directory`);
                     return;
                 }
 
@@ -2710,7 +3185,10 @@ export PS1="\\u@\\h:\\w\\$ "
 # 'en' for English
 # 'zh' for 简体中文
 export LANG="en"
-
+#
+# --- Completion Style ---
+export COMPLETION_STYLE="bash"
+#
 # --- Aliases ---
 alias ll='ls -l -a'
 alias la='ls -a'
@@ -2831,10 +3309,7 @@ async function getSearchSuggestions(query) {
 }
 
 /**
- * [重构] Tab 补全 - Zsh 风格菜单启动器
- */
-/**
- * [重构] Tab 补全 - 修复 Bash 显示、优化 Zsh 单项循环
+ * Tab 补全
  */
 async function handleTabCompletion(line, pos) {
     if (term.tabMenu.active) return;
@@ -2867,18 +3342,68 @@ async function handleTabCompletion(line, pos) {
         tokenStartIndex = 0;
     }
 
-    const command = (tokens[0] ? unescapePath(tokens[0]) : "");
+    const rawCommand = (tokens[0] ? unescapePath(tokens[0]) : "");
 
-    // 2. 决定补全类型
-    if (tokenCount === 0 || (tokenCount === 1 && !line.endsWith(' '))) {
-        isCompletingFirstWord = true;
-    } else if (command === 'search') { 
-        isCompletingSearch = true;
-    } else if (command === 'open') {
+    let onlyExecutables = false;
+
+    // --- Sudo 穿透逻辑 ---
+    let targetCommand = rawCommand;
+    let targetTokenCount = tokenCount;
+
+    if (rawCommand === 'sudo') {
+        if (tokenCount === 1 && line.endsWith(' ')) {
+            // Case 1: "sudo " -> 准备输入第二个词 -> 视为补全命令
+            isCompletingFirstWord = true;
+        } else if (tokenCount === 2 && !line.endsWith(' ')) {
+            // Case 2: "sudo ap" -> 正在输入第二个词 -> 视为补全命令
+            isCompletingFirstWord = true;
+        } else if (tokenCount >= 2) {
+            // Case 3: "sudo apt " (count=2, space) 或 "sudo apt up" (count=3)
+            // -> 穿透 sudo，将目标指向下一个词 (apt)，并减少计数
+            targetCommand = unescapePath(tokens[1]);
+            targetTokenCount = tokenCount - 1;
+        }
+    }
+    // ---------------------------
+
+    // 2. 决定补全类型 & 准备候选列表
+    let subCommandCandidates = [];
+
+    // 注意：这里优先检查 isCompletingFirstWord (可能被 sudo 逻辑置为 true)
+    if ((tokenCount === 0 || (tokenCount === 1 && !line.endsWith(' '))) && 
+        (tokenToComplete.startsWith('./') || tokenToComplete.startsWith('/') || tokenToComplete.startsWith('~/'))) {
+        
         isCompletingPath = true;
-    } else if (subCommandCompletions.hasOwnProperty(command) && (tokenCount === 1 || (tokenCount === 2 && !line.endsWith(' ')))) {
-        if (subCommandCompletions[command].length > 0) isCompletingSubCommand = true;
-        else isCompletingPath = true;
+        isCompletingFirstWord = false; // [!] 覆盖默认判断，不再查命令列表
+        onlyExecutables = true;        // [!] 开启只显示可执行文件的过滤器
+
+    } else if (tokenCount === 0 || (tokenCount === 1 && !line.endsWith(' '))) {
+        isCompletingFirstWord = true;
+    } else if (targetCommand === 'search') { 
+        isCompletingSearch = true;
+    
+    } else if (targetCommand === 'open') {
+        isCompletingPath = true;
+    
+    } else if (subCommandCompletions.hasOwnProperty(targetCommand)) {
+        // 使用 targetTokenCount 进行判断
+        if (targetTokenCount === 1 || (targetTokenCount === 2 && !line.endsWith(' '))) {
+            let config = subCommandCompletions[targetCommand];
+            
+            // 执行动态配置函数 (如 theme)
+            if (typeof config === 'function') {
+                config = config();
+            }
+
+            if (Array.isArray(config) && config.length > 0) {
+                isCompletingSubCommand = true;
+                subCommandCandidates = config;
+            } else {
+                isCompletingPath = true;
+            }
+        } else {
+            isCompletingPath = true;
+        }
     } else {
         isCompletingPath = true;
     }
@@ -2891,12 +3416,17 @@ async function handleTabCompletion(line, pos) {
     if (isCompletingFirstWord) {
         const allCommands = getAllCommandNames();
         matches = allCommands.filter(cmd => cmd.startsWith(tokenToComplete)).map(cmd => ({ title: cmd, value: cmd }));
+    
     } else if (isCompletingSearch) {
         if (searchToken.trim().length > 0) {
             matches = await getSearchSuggestions(searchToken);
         }
+    
     } else if (isCompletingSubCommand) {
-        matches = subCommandCompletions[command].filter(cmd => cmd.startsWith(tokenToComplete)).map(cmd => ({ title: cmd, value: cmd }));
+        matches = subCommandCandidates
+            .filter(cmd => cmd.startsWith(tokenToComplete))
+            .map(cmd => ({ title: cmd, value: cmd }));
+    
     } else if (isCompletingPath) {
         const lastSlash = searchToken.lastIndexOf('/');
         if (lastSlash > -1) {
@@ -2920,29 +3450,16 @@ async function handleTabCompletion(line, pos) {
 
     if (matches.length === 0) return;
 
-    // --- 4. 补全逻辑 ---
-
-    // 如果是 Zsh 风格
+    // --- 4. 补全逻辑 (保持不变) ---
+    
     if (isZshStyle) {
-        // [Zsh 逻辑优化]
-        // 无论匹配数量多少，都进入菜单模式。
-        // 如果只有一个匹配项，我们设置 selected = 0，直接应用，
-        // 这样用户再次按 Tab 就会触发 _cycleMenu，进入 selected = -1 (原始输入)。
-        
         term.tabMenu.active = true;
         term.tabMenu.items = matches;
-        
-        // 单个匹配 -> 默认选中第0个 (直接补全)
-        // 多个匹配 -> 默认不选中 (-1)，只显示列表
         term.tabMenu.selected = (matches.length === 1) ? 0 : -1;
-        
         term.tabMenu.originalLine = line;
         term.tabMenu.tokenStart = tokenStartIndex;
         term.tabMenu.completionPrefix = isCompletingSearch ? "" : completionPrefix;
 
-        // 如果默认选中了 (单匹配)，我们需要手动更新一次 currentLine，
-        // 因为 _renderMenu 只负责画菜单，不负责改 Input。
-        // 我们复用 _cycleMenu 的逻辑，或者手动设置一次。
         if (term.tabMenu.selected === 0) {
              const item = matches[0];
              let newValue = item.value || item.title;
@@ -2952,14 +3469,10 @@ async function handleTabCompletion(line, pos) {
              term.currentLine = newLine;
              term.cursorX = term.prompt.length + newLine.length;
         }
-
         term._renderMenu();
         return;
     } 
 
-    // --- 以下是 Bash 风格 (默认) ---
-
-    // 1. 单个匹配直接补全 (经典行为)
     if (matches.length === 1) {
         const match = matches[0];
         let matchValue = match.value || match.title; 
@@ -2976,7 +3489,6 @@ async function handleTabCompletion(line, pos) {
         return;
     }
 
-    // 2. 多个匹配: LCP + 列表
     let lcp = "";
     if (!isCompletingSearch) {
         lcp = findLCP(matches.map(m => ({ title: m.value || m.title })));
@@ -2984,30 +3496,23 @@ async function handleTabCompletion(line, pos) {
     const partial = isCompletingSearch ? searchToken : searchToken.substring(searchToken.lastIndexOf('/') + 1);
 
     if (!isCompletingSearch && lcp.length > partial.length) {
-        // 补全公共前缀
         lastTabMatches = [];
         let completion = completionPrefix + lcp;
         if (completion.includes(' ')) completion = escapePath(completion);
         const newLine = line.substring(0, tokenStartIndex) + completion + line.substring(pos);
         term.setCommand(newLine, (line.substring(0, tokenStartIndex) + completion).length);
     } else {
-        // [修复] 列表显示逻辑
         const isDoubleTap = (currentTime - lastTabTime < 500);
         const currentMatchIds = matches.map(m => m.id || m.title);
         const lastMatchIds = lastTabMatches.map(m => m.id || m.title);
         
         if ((isDoubleTap && arraysAreEqual(currentMatchIds, lastMatchIds)) || isCompletingSearch) {
-            // A. 固化当前行
             const fullLineText = term.prompt + line;
             const escapedLine = term.escapeHtml(fullLineText);
             const padding = ' '.repeat(Math.max(0, term.cols - fullLineText.length));
             term.buffer[term.cursorY] = escapedLine + padding;
-            
-            // B. 换行
             term._handleNewline(); 
             
-            // C. [修复] 打印列表 (Grid Layout)
-            // ----------------------------------------------------
             const displayItems = matches.map(m => {
                 let title = m.title.trim();
                 if (title.length > 30) title = title.substring(0, 27) + "...";
@@ -3047,9 +3552,6 @@ async function handleTabCompletion(line, pos) {
                 }
                 term.writeHtml(currentLineStr);
             }
-            // ----------------------------------------------------
-            
-            // D. 恢复状态
             bookmarkSystem.update_user_path(); 
             term.setCommand(line, pos);
             lastTabMatches = [];
@@ -3339,16 +3841,48 @@ function compareVersions(v1, v2) {
 
 // Helper Function 
 function loadStyleSettings() {
+    // 1. 加载 Theme (基准)
+    const currentTheme = ThemeManager.load(); 
+
+    // 2. 加载 Font (独立设置)
     const savedFont = localStorage.getItem('terminalFontFamily');
     const savedSize = localStorage.getItem('terminalFontSize');
+    
     const rootStyle = getComputedStyle(document.documentElement);
     const defaultFont = rootStyle.getPropertyValue('--terminal-font-family').trim() || "'Consolas', 'Courier New', monospace";
     const defaultSize = rootStyle.getPropertyValue('--terminal-font-size').trim() || '14px';
+
     const fontFamily = savedFont || defaultFont;
     const fontSize = savedSize || defaultSize;
+
     document.documentElement.style.setProperty('--terminal-font-family', fontFamily);
     document.documentElement.style.setProperty('--terminal-font-size', fontSize);
+
+    // 3. 加载 Override (覆盖层)
+    // 允许用户覆盖 theme 中的具体颜色，或设置壁纸
+    try {
+        const overrides = JSON.parse(localStorage.getItem('style_overrides') || '{}');
+        for (const [key, value] of Object.entries(overrides)) {
+            // [修改点]：如果是壁纸，使用我们的新函数，而不是直接 setProperty
+            if (key === '--terminal-background-image') {
+                // 提取 url('...') 中的 URL
+                const match = value.match(/url\(['"]?(.*?)['"]?\)/);
+                if (match) {
+                    setWallpaper(match[1]); // 使用渐变加载
+                } else if (value === 'none') {
+                    setWallpaper('none');
+                }
+            } else {
+                document.documentElement.style.setProperty(key, value);
+            }
+        }
+    } catch (e) {
+        console.warn("Failed to load style overrides", e);
+    }
+
+    return { fontFamily, fontSize, theme: currentTheme };
 }
+
 function saveStyleSettings() {
     const currentFont = getComputedStyle(document.documentElement).getPropertyValue('--terminal-font-family').trim();
     const currentSize = getComputedStyle(document.documentElement).getPropertyValue('--terminal-font-size').trim();
@@ -3378,6 +3912,274 @@ const bookmarkSystem = new BookmarkSystem(term); // 将 term 传给 BookmarkSyst
 // --- 将非书签命令移到这里 ---
 // (替换) 你现有的 globalCommands 对象
 const globalCommands = {
+    'ext': async (args, options) => {
+        // 1. 动态权限检查与请求
+        const hasPerm = await new Promise(r => chrome.permissions.contains({ permissions: ['management'] }, r));
+
+        if (!hasPerm) {
+            term.writeLine("This command requires 'management' permission to manage extensions.");
+            
+            // 必须在用户操作（如按回车）的上下文中调用 request
+            try {
+                const granted = await new Promise(r => chrome.permissions.request({ permissions: ['management'] }, r));
+                if (!granted) {
+                    term.writeHtml(`<span class="term-error">Permission denied. Cannot execute 'ext'.</span>`);
+                    return;
+                }
+                term.writeLine("Permission granted! Re-running command...");
+            } catch (e) {
+                // 如果在非用户手势下调用，Chrome 会报错
+                term.writeHtml(`<span class="term-error">Error requesting permission: ${e.message}</span>`);
+                return;
+            }
+        }
+
+        // --- 以下是原有的逻辑 (没有任何变化，只是被包裹在了权限检查之后) ---
+        
+        const subCommand = args[0] || 'ls';
+
+        try {
+            if (subCommand === 'ls') {
+                const list = await new Promise(r => chrome.management.getAll(r));
+                
+                list.sort((a, b) => {
+                    if (a.enabled === b.enabled) return a.name.localeCompare(b.name);
+                    return a.enabled ? -1 : 1;
+                });
+
+                const total = list.length;
+                const enabledCount = list.filter(i => i.enabled).length;
+                term.writeLine(`Found ${total} items (${enabledCount} enabled).`);
+                term.writeLine("ID                                   State  Name");
+                term.writeLine("---------------------------------------------------------------");
+
+                list.forEach(item => {
+                    if ((options.e || options.enabled) && !item.enabled) return;
+                    if (item.id === chrome.runtime.id) return;
+
+                    const checkMark = item.enabled ? "[x]" : "[ ]";
+                    const statusColor = item.enabled ? "var(--color-accent-green, #4CAF50)" : "gray";
+                    const nameColor = item.enabled ? "var(--terminal-foreground-color)" : "gray";
+                    
+                    let typeLabel = "";
+                    if (item.type === 'theme') typeLabel = " (theme)";
+                    else if (item.type !== 'extension') typeLabel = " (app)";
+
+                    const idHtml = `<span style="color:gray">${item.id}</span>`;
+                    const stateHtml = `<span style="color:${statusColor}">${checkMark}</span>`;
+                    const nameHtml = `<span style="color:${nameColor}">${term.escapeHtml(item.name)}${typeLabel}</span>`;
+                    
+                    term.writeHtml(`${idHtml}  ${stateHtml}    ${nameHtml}`);
+                });
+
+            } else if (subCommand === 'toggle' || subCommand === 'enable' || subCommand === 'disable') {
+                const id = args[1];
+                if (!id) { term.writeHtml(`<span class="term-error">Usage: ext ${subCommand} <extension-id></span>`); return; }
+
+                const ext = await new Promise(resolve => {
+                    chrome.management.get(id, (info) => resolve(chrome.runtime.lastError ? null : info));
+                });
+
+                if (!ext) {
+                    term.writeHtml(`<span class="term-error">Error: Extension ${id} not found.</span>`);
+                    return;
+                }
+
+                let newState;
+                if (subCommand === 'toggle') newState = !ext.enabled;
+                else if (subCommand === 'enable') newState = true;
+                else newState = false;
+
+                await new Promise(r => chrome.management.setEnabled(id, newState, r));
+                
+                const statusStr = newState ? "ENABLED" : "DISABLED";
+                const color = newState ? "var(--color-accent-green, #4CAF50)" : "gray";
+                
+                term.writeHtml(`Extension '${term.escapeHtml(ext.name)}' is now <span style="color:${color}; font-weight:bold">${statusStr}</span>.`);
+
+            } else if (subCommand === 'uninstall' || subCommand === 'rm') {
+                const id = args[1];
+                if (!id) { term.writeHtml(`<span class="term-error">Usage: ext uninstall <extension-id></span>`); return; }
+                
+                chrome.management.uninstall(id, { showConfirmDialog: true }, () => {
+                    if (chrome.runtime.lastError) {
+                        term.writeHtml(`<span class="term-error">Error: ${chrome.runtime.lastError.message}</span>`);
+                    } else {
+                        term.writeLine(`Uninstall request initiated.`);
+                    }
+                });
+
+            } else {
+                term.writeHtml(`<span class="term-error">Usage: ext [ls|toggle|enable|disable|uninstall]</span>`);
+            }
+        } catch (e) {
+            term.writeHtml(`<span class="term-error">Error: ${e.message}</span>`);
+        }
+    },
+    'theme': (args, options) => {
+        const themeName = args[0];
+
+        // 1. 列出主题 (调用 ThemeManager.getList)
+        if (!themeName || themeName === 'ls') {
+            term.writeLine("Available themes:");
+            const list = ThemeManager.getList();
+            
+            list.forEach(item => {
+                const marker = item.active ? '*' : ' ';
+                // 使用该主题的强调色来预览名字
+                term.writeHtml(` ${marker} <span style="color:${item.accent}">${item.name}</span>`);
+            });
+            term.writeLine("\nUsage: theme <name>");
+            return;
+        }
+
+        // 2. 切换主题 (调用 ThemeManager.set)
+        if (ThemeManager.set(themeName)) {
+            term.writeLine(`Theme changed to '${themeName}'.`);
+        } else {
+            term.writeHtml(`<span class="term-error">Theme '${themeName}' not found. Try 'theme ls'.</span>`);
+        }
+    },
+    // --- JSON 处理器 ---
+    'jq': (args, options, pipedInput) => {
+        if (!pipedInput || pipedInput.length === 0) {
+            term.writeHtml(`<span class="term-error">jq: error: no input data (use pipe)</span>`);
+            return;
+        }
+
+        const path = args[0]; // e.g., ".url" or "[0].url" or "data.image"
+        
+        try {
+            // 1. 将管道输入的行合并回单个 JSON 字符串
+            const jsonString = pipedInput.join('');
+            let data = JSON.parse(jsonString);
+
+            // 2. 如果没有参数，直接格式化输出整个 JSON
+            if (!path || path === '.') {
+                const pretty = JSON.stringify(data, null, 2);
+                const lines = pretty.split('\n');
+                lines.forEach(l => term.writeLine(l));
+                return lines;
+            }
+
+            // 3. 解析路径 (非常简易的解析器: 支持 .key 和 [index])
+            // 将 "[0].url" 转换为 ["0", "url"]
+            const cleanPath = path.replace(/^\./, ''); // 去除开头的 .
+            // 使用正则拆分: 匹配点号或方括号
+            const keys = cleanPath.split(/[.\[\]]+/).filter(k => k !== '');
+
+            let current = data;
+            for (const key of keys) {
+                if (current === undefined || current === null) break;
+                
+                // 尝试作为数组索引
+                if (Array.isArray(current) && !isNaN(parseInt(key))) {
+                    current = current[parseInt(key)];
+                } else {
+                    // 作为对象键
+                    current = current[key];
+                }
+            }
+
+            // 4. 输出结果
+            if (current === undefined) {
+                term.writeHtml(`<span class="term-error">jq: value not found at path '${path}'</span>`);
+                return;
+            }
+
+            // 如果结果是字符串，直接输出（不带引号，方便作为命令参数）
+            // 如果是对象/数组，格式化输出
+            let output;
+            if (typeof current === 'string') {
+                output = current;
+            } else {
+                output = JSON.stringify(current);
+            }
+            
+            term.writeLine(output);
+            return [output]; // 返回给管道下一级
+
+        } catch (e) {
+            term.writeHtml(`<span class="term-error">jq: parse error: ${e.message}</span>`);
+        }
+    },
+    'sysinfo': async (args, options) => {
+        // 1. 获取系统数据
+        const manifest = chrome.runtime.getManifest();
+        const storageUsed = (JSON.stringify(localStorage).length / 1024).toFixed(2);
+        
+        // 解析 User Agent 获取 Chrome 版本和 OS
+        const ua = navigator.userAgent;
+        const chromeVer = ua.match(/Chrome\/([\d.]+)/)?.[1] || "Unknown";
+        const osMatch = ua.match(/\(([^)]+)\)/)?.[1] || "Web OS";
+        
+        // 获取屏幕和窗口信息
+        const screenRes = `${window.screen.width}x${window.screen.height}`;
+        const termSize = `${term.cols}x${term.rows}`;
+        
+        // 计算 Uptime
+        const startTime = window.st2_startTime || Date.now();
+        const uptimeMin = Math.floor((Date.now() - startTime) / 60000);
+        const uptimeStr = uptimeMin > 60 ? `${Math.floor(uptimeMin/60)}h ${uptimeMin%60}m` : `${uptimeMin}m`;
+
+        // 2. 定义 Logo (HTML 格式以支持特定颜色)
+        // 提取自 icon128.png 的配色
+        const cBlue = "#4285F4";  // Google Blue
+        const cRed  = "#EA4335";  // Google Red
+        const cWht  = "var(--terminal-foreground-color, #fff)"; // 跟随主题文字色
+        const cGry  = "#5f6368";  // 边框灰
+
+        const logoLines = [
+            `<span style="color:${cGry}">╭──────────────────────╮</span>`,
+            `<span style="color:${cGry}">│</span> <span style="color:${cBlue}">\\</span>         <span style="color:${cWht}">_.(##)._</span>   <span style="color:${cGry}">│</span>`,
+            `<span style="color:${cGry}">│</span>  <span style="color:${cBlue}">\\</span>        <span style="color:${cWht}">(_####_)</span>   <span style="color:${cGry}">│</span>`,
+            `<span style="color:${cGry}">│</span>  <span style="color:${cRed}">/</span>         <span style="color:${cWht}">'(__)'</span>    <span style="color:${cGry}">│</span>`,
+            `<span style="color:${cGry}">│</span> <span style="color:${cRed}">/</span>          <span style="color:${cWht}">______</span>    <span style="color:${cGry}">│</span>`,
+            `<span style="color:${cGry}">╰──────────────────────╯</span>`
+        ];
+
+        // 3. 定义信息行
+        // 使用 CSS 变量 var(--color-accent-green) 以便未来可以通过 style/theme 命令调节高亮色
+        const accent = "var(--color-accent-green, #4CAF50)";
+        
+        const infoLines = [
+            `<span style="color:${accent}; font-weight:bold;">${Environment.USER}</span>@<span style="color:${accent}; font-weight:bold;">${Environment.HOST}</span>`,
+            `-------------------------`,
+            `<span style="color:${accent}">OS</span>: Chrome OS / Browser`,
+            `<span style="color:${accent}">Kernel</span>: ${osMatch}`,
+            `<span style="color:${accent}">Browser</span>: Chrome ${chromeVer}`,
+            `<span style="color:${accent}">Extension</span>: v${manifest.version}`,
+            `<span style="color:${accent}">Resolution</span>: ${screenRes}`,
+            `<span style="color:${accent}">Terminal</span>: StartTerminal 2.0`,
+            `<span style="color:${accent}">Uptime</span>: ${uptimeStr}`,
+            `<span style="color:${accent}">Memory (VFS)</span>: ${storageUsed} KB`
+        ];
+
+        // 4. 渲染 (左右布局)
+        term.writeLine(""); // 顶部分隔
+        const maxLines = Math.max(logoLines.length, infoLines.length);
+        
+        for (let i = 0; i < maxLines; i++) {
+            // 获取 Logo 行 (如果没有则用空字符串填充，保持对齐)
+            // 注意：因为 Logo 包含 HTML 标签，我们需要一个固定的视觉宽度来做 padding
+            // 简单起见，我们假设 Logo 在视觉上大概占用 26 个字符宽度
+            const logoLine = logoLines[i] || "                        "; 
+            const infoLine = infoLines[i] || "";
+            
+            // 如果 logo 这一行是空的（比如 info 比 logo 长），我们需要补齐空格
+            // 这里用稍微取巧的方式：如果 i >= logoLines.length，我们手动写空格
+            const leftCol = (i < logoLines.length) ? logoLines[i] : "                        ";
+            
+            // 打印： Logo + 间距 + Info
+            term.writeHtml(`${leftCol}   ${infoLine}`);
+        }
+        term.writeLine(""); // 底部分隔
+    },
+
+    // 添加别名 neofetch
+    'neofetch': (args, options) => {
+        return globalCommands.sysinfo(args, options);
+    },
     'sh': async (args, options, pipedInput) => {
         if (!args[0]) {
             term.writeHtml(`<span class="term-error">sh: missing file operand</span>`);
@@ -3926,14 +4728,28 @@ const globalCommands = {
         const url = args[0];
         if (!url) { term.writeHtml('<span class="term-error">Usage: wget <url></span>'); return; }
         
-        if (typeof chrome === 'undefined' || !chrome.downloads) {
-            term.writeHtml(`<span class="term-error">'chrome.downloads' API not available.</span>`);
-            // 'downloads' 权限是默认安装的
-            return;
+        // 1. 动态权限检查 (Downloads Permission)
+        const hasPerm = await new Promise(r => chrome.permissions.contains({ permissions: ['downloads'] }, r));
+
+        if (!hasPerm) {
+            term.writeLine("wget: Requires 'downloads' permission to save files.");
+            try {
+                const granted = await new Promise(r => chrome.permissions.request({ permissions: ['downloads'] }, r));
+                if (!granted) {
+                    term.writeHtml(`<span class="term-error">Permission denied. Cannot execute wget.</span>`);
+                    return;
+                }
+            } catch (e) {
+                term.writeHtml(`<span class="term-error">Error requesting permission: ${e.message}</span>`);
+                return;
+            }
         }
 
+        // 2. 执行下载
         try {
             term.writeLine(`Starting download: ${url}`);
+            
+            // 此时 chrome.downloads 肯定可用
             const downloadId = await new Promise((resolve, reject) => {
                 chrome.downloads.download({ url: url }, (id) => {
                     if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
@@ -3952,22 +4768,31 @@ const globalCommands = {
             return;
         }
 
-        // 权限检查
-        const hasPermission = await new Promise(resolve => {
-            chrome.permissions.contains({ origins: ["<all_urls>"] }, resolve);
-        });
+        // 1. 动态权限检查 (Host Permissions)
+        const origin = "<all_urls>"; // 或者更精确地解析 url 获取 origin
+        const hasPerm = await new Promise(r => chrome.permissions.contains({ origins: [origin] }, r));
 
-        if (!hasPermission) {
-            // 使用 _writeLogHtml
-            term._writeLogHtml(`<span class="term-error">${t('curlPermDenied')}</span>`);
-            term._writeLogHtml(`<span class="term-error">${t('curlPermTry')}</span>`);
-            return;
+        if (!hasPerm) {
+            term.writeLine("curl: Requires permission to access external websites.");
+            try {
+                // 动态请求 Host 权限
+                const granted = await new Promise(r => chrome.permissions.request({ origins: [origin] }, r));
+                if (!granted) {
+                    term.writeHtml(`<span class="term-error">Permission denied. Cannot execute curl.</span>`);
+                    return;
+                }
+                term.writeLine("Permission granted! Continuing...");
+            } catch (e) {
+                term.writeHtml(`<span class="term-error">Error requesting permission: ${e.message}</span>`);
+                return;
+            }
         }
 
+        // 2. 执行 Fetch
         try {
-            // 使用 _writeLogLine
-            term._writeLogLine(t('curlProgress').replace('{0}', url)); // 写入 stderr
+            term._writeLogLine(t('curlProgress').replace('{0}', url)); 
             
+            // mode: 'cors' 是关键
             const response = await fetch(url, { cache: 'no-store', mode: 'cors' });
             
             if (!response.ok) {
@@ -3978,11 +4803,13 @@ const globalCommands = {
             
             // 写入 stdout / 管道
             term.writeLine(text); 
-            return text.split('\n'); //
+            return text.split('\n'); 
             
         } catch(e) {
-            // [!! 核心修复：使用 _writeLogHtml (L629) !!]
-            term._writeLogHtml(`<span class="term-error">${e.message}</span>`); // 写入 stderr
+            term._writeLogHtml(`<span class="term-error">curl error: ${e.message}</span>`);
+            if (e.message.includes("Failed to fetch")) {
+                term._writeLogHtml(`<span class="term-error">Tip: The target server might not allow CORS requests from extensions.</span>`);
+            }
         }
     },
 
@@ -4066,13 +4893,22 @@ const globalCommands = {
         term.writeLine(t('helpTitle'));
         term.writeLine("---");
         
-        term.writeHtml(`<b>${t('helpFS')}</b>`);
+        // 1. 核心与语法 (新增部分)
+        term.writeHtml(`<b>${t('helpSyntax')}</b>`);
+        term.writeHtml(formatHelp('|', 'help_pipe'));
+        term.writeHtml(formatHelp('> >> < 2>', 'help_redirect'));
+        term.writeHtml(formatHelp('$(...)', 'help_subcmd'));
+        term.writeHtml(formatHelp('VAR=VAL', 'help_var'));
+
+        term.writeHtml(`\n<b>${t('helpFS')}</b>`);
         term.writeHtml(formatHelp('ls', 'help_ls'));
         term.writeHtml(formatHelp('cd', 'help_cd'));
         term.writeHtml(formatHelp('cat', 'help_cat'));
         term.writeHtml(formatHelp('nano', 'help_nano'));
         term.writeHtml(formatHelp('mkdir', 'help_mkdir'));
         term.writeHtml(formatHelp('rm', 'help_rm'));
+        term.writeHtml(formatHelp('cp', 'cpUsage')); // 确保 i18n 有这个
+        term.writeHtml(formatHelp('mv', 'mvUsage')); // 确保 i18n 有这个
         term.writeHtml(formatHelp('sh, ./', 'help_sh'));
         term.writeHtml(formatHelp('chmod', 'help_chmod'));
         term.writeHtml(formatHelp('chown', 'help_chown'));
@@ -4086,18 +4922,21 @@ const globalCommands = {
         term.writeHtml(formatHelp('alias', 'help_alias'));
         term.writeHtml(formatHelp('unalias', 'help_unalias'));
         term.writeHtml(formatHelp('source, .', 'help_source'));
+        term.writeHtml(formatHelp('theme', 'help_theme')); // [新增]
+        term.writeHtml(formatHelp('ext', 'help_ext'));     // [新增]
         
         term.writeHtml(`\n<b>${t('helpUtil')}</b>`);
         term.writeHtml(formatHelp('apt', 'help_apt'));
         term.writeHtml(formatHelp('open', 'help_open'));
         term.writeHtml(formatHelp('search', 'help_search'));
+        term.writeHtml(formatHelp('curl', 'curlUsage'));
+        term.writeHtml(formatHelp('wget', 'wgetUsage'));
+        term.writeHtml(formatHelp('jq', 'help_jq'));       // [新增]
         term.writeHtml(formatHelp('style', 'help_style'));
         term.writeHtml(formatHelp('date', 'help_date'));
-        term.writeHtml(formatHelp('cal', 'help_cal'));
-        term.writeHtml(formatHelp('uptime', 'help_uptime'));
+        term.writeHtml(formatHelp('sysinfo', 'help_neofetch'));
         term.writeHtml(formatHelp('clear', 'help_clear'));
         term.writeHtml(formatHelp('whatsnew', 'help_whatsnew'));
-        term.writeHtml(formatHelp('help', 'help_help'));
         
         term.writeLine("\n" + t('helpMore'));
     },
@@ -4109,108 +4948,293 @@ const globalCommands = {
              if (options.v || options.verbose) { term.writeLine(" (Verbose mode enabled!)"); }
          } else { term.writeHtml(`<span class="term-error">${t('greetUsage')}</span>`); }
      },
-     'style': async (args, options) => {
+     'style': async (args, options, pipedInput) => {
         const subCommand = args[0];
-        const value = args.slice(1).join(' ');
-        const rootStyle = getComputedStyle(document.documentElement);
-        const currentFont = rootStyle.getPropertyValue('--terminal-font-family').trim();
-        const currentSize = rootStyle.getPropertyValue('--terminal-font-size').trim();
+        const value = args.slice(1).join(' '); 
+        if (pipedInput) options._pipedInput = pipedInput;
+
+        // 获取当前css
+        const getStyle = (name) => {
+            return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+        };
+
+        // 辅助：保存 Override
+        const setOverride = (cssVar, cssValue) => {
+            const overrides = JSON.parse(localStorage.getItem('style_overrides') || '{}');
+            if (cssValue === null) {
+                delete overrides[cssVar]; 
+            } else {
+                overrides[cssVar] = cssValue;
+            }
+            localStorage.setItem('style_overrides', JSON.stringify(overrides));
+            
+            if (cssValue === null) {
+                ThemeManager.load();
+                loadStyleSettings(); 
+            } else {
+                document.documentElement.style.setProperty(cssVar, cssValue);
+            }
+        };
+
         if (!subCommand) {
-            term.writeLine(`${t('styleCurrent')}:`);
-            term.writeLine(`  font: ${currentFont}`);
-            term.writeLine(`  size: ${currentSize}`);
+            term.writeLine("Usage: style <command> [value]");
+            term.writeLine("Commands:");
+            term.writeLine("  font <name>       Set font family");
+            term.writeLine("  size <size>       Set font size (e.g. 16px)");
+            term.writeLine("  bg <color>        Set background color");
+            term.writeLine("  fg <color>        Set foreground (text) color");
+            term.writeLine("  accent <color>    Set accent color");
+            term.writeLine("  cursor <color>    Set cursor color");
+            term.writeLine("  wall <url|none>   Set wallpaper");
+            term.writeLine("  opacity <0-1>     Set background opacity");
+            term.writeLine("  reset             Reset all styles");
             return;
         }
+
         let needsResize = false;
+
         switch (subCommand.toLowerCase()) {
             case 'font':
-                if (!value) { 
-                    // 如果用户只输入 "style font"，则显示帮助
-                    term.writeLine("Usage: style font \"<font-name>\"");
-                    term.writeLine("\nRecommended monospace fonts (must be installed on your system):");
-                    // (使用与 'help' (L1538) 命令相同的颜色 (L1453))
-                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>'Fira Code'</span> (Default, supports ligatures)");
-                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>'SF Mono'</span> (macOS, user favorite)");
-                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>'Menlo'</span> (macOS)");
-                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>'Consolas'</span> (Windows)");
-                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>'JetBrains Mono'</span> (Popular, free)");
-                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>'Courier New'</span> (Universal fallback)");
-                    term.writeHtml("  - <span style='color: var(--color-accent-green, #4CAF50);'>monospace</span> (Generic)");
-                    term.writeLine("\nExample: style font \"Fira Code\"");
-                    return; // 退出，不执行后续代码
+                if (!value) {
+                    term.writeLine(`Current font: ${getStyle('--terminal-font-family')}`);
+                    return;
+                }
+                // 移除用户可能输入的引号，获取纯字体名
+                const fontToCheck = value.replace(/['"]/g, '').trim();
+                
+                // 如果检测不通过
+                if (!isFontAvailable(fontToCheck)) {
+                    term.writeHtml(`<span class="term-error">Error: Font '${term.escapeHtml(fontToCheck)}' seems unavailable on this system.</span>`);
+                    return;
+                }
+                document.documentElement.style.setProperty('--terminal-font-family', value);
+                localStorage.setItem('terminalFontFamily', value);
+                term.writeLine(`Font set to: ${value}`);
+                needsResize = true;
+                break;
+
+            case 'size':
+                if (!value) {
+                    term.writeLine(`Current size: ${getStyle('--terminal-font-size')}`);
+                    return;
+                }
+                let finalSize = value.trim();
+                
+                // 正则解释：
+                // ^       字符串开始
+                // \d+     一个或多个数字
+                // (\.\d+)? 可选的小数部分 (例如 .5)
+                // $       字符串结束
+                // 如果只匹配到纯数字，就追加 px
+                if (/^\d+(\.\d+)?$/.test(finalSize)) {
+                    finalSize += 'px';
+                }
+                document.documentElement.style.setProperty('--terminal-font-size', finalSize);
+                localStorage.setItem('terminalFontSize', finalSize);
+                term.writeLine(`Size set to: ${finalSize}`);
+                needsResize = true;
+                break;
+
+            case 'bg':
+                if (!value) {
+                    term.writeLine(`Current background: ${getStyle('--terminal-background-color')}`);
+                    return;
+                }
+                setOverride('--terminal-background-color', value);
+                term.writeLine(`Background color set to: ${value}`);
+                break;
+
+            case 'fg':
+                if (!value) {
+                    term.writeLine(`Current foreground: ${getStyle('--terminal-foreground-color')}`);
+                    return;
+                }
+                setOverride('--terminal-foreground-color', value);
+                term.writeLine(`Foreground color set to: ${value}`);
+                break;
+
+            case 'accent':
+                if (!value) {
+                    term.writeLine(`Current accent: ${getStyle('--terminal-accent')}`);
+                    return;
+                }
+                setOverride('--terminal-accent', value);
+                setOverride('--color-accent-green', value); // 兼容旧变量
+                term.writeLine(`Accent color set to: ${value}`);
+                break;
+                
+            case 'cursor':
+                if (!value) {
+                    term.writeLine(`Current cursor: ${getStyle('--cursor-bg-color')}`);
+                    return;
+                }
+                setOverride('--cursor-bg-color', value);
+                term.writeLine(`Cursor color set to: ${value}`);
+                break;
+
+            // --- [新增] Opacity ---
+            case 'opacity':
+                // 获取逻辑：尝试从 rgba 中解析 alpha 值
+                if (!value) {
+                    const currentBg = getStyle('--terminal-background-color');
+                    let currentOp = "1.0"; // 默认不透明
+                    // 匹配 rgba(r, g, b, alpha) 中的 alpha
+                    const match = currentBg.match(/rgba?\(.*,\s*([\d\.]+)\)/);
+                    if (match) currentOp = match[1];
+                    else if (currentBg.startsWith('#')) currentOp = "1.0"; // Hex 默认为 1
+
+                    term.writeLine(`Current opacity: ${currentOp}`);
+                    return;
                 }
 
-                if (value.length < 3) { term.writeHtml(`<span class="term-error">${t('styleInvalidSize')} "${value}"</span>`); return; }
-                document.documentElement.style.setProperty('--terminal-font-family', value);
-                term.writeLine(`${t('fontSet')} ${value}`);
-                needsResize = true;
+                // 设置逻辑
+                const opacity = parseFloat(value);
+                if (isNaN(opacity) || opacity < 0 || opacity > 1) {
+                    // [修复] 这里使用了 &lt; &gt; 来防止 HTML 解析问题
+                    term.writeHtml(`<span class="term-error">Usage: style opacity &lt;0.0 - 1.0&gt;</span>`); 
+                    return; 
+                }
+                
+                // 1. 获取当前生效的背景色 (可能是 Override 的，也可能是 Theme 的)
+                const currentBg = getComputedStyle(document.documentElement).getPropertyValue('--terminal-background-color').trim();
+                
+                // 2. 转换为带透明度的 RGBA
+                const newRgba = toRgba(currentBg, opacity);
+                
+                // 3. 设置为 Override
+                setOverride('--terminal-background-color', newRgba);
+                term.writeLine(`Opacity set to ${opacity}. (Color: ${newRgba})`);
                 break;
-            case 'size':
-                if (!value) { term.writeHtml(`<span class="term-error">${t('styleUsageSize')}</span>`); return; }
-                if (!/^\d+(\.\d+)?(px|em|rem|pt)$/i.test(value)) { term.writeHtml(`<span class="term-error">${t('styleInvalidSize')} "${value}"</span>`); return; }
-                document.documentElement.style.setProperty('--terminal-font-size', value);
-                term.writeLine(`${t('sizeSet')} ${value}`);
-                needsResize = true;
+
+            case 'wall': 
+            case 'wallpaper':
+                let targetUrl = value;
+                if (!targetUrl && options._pipedInput && options._pipedInput.length > 0) {
+                    targetUrl = options._pipedInput[0].trim();
+                }
+
+                if (!targetUrl) { 
+                    const currentWall = getStyle('--terminal-background-image');
+                    // css 返回的是 url("...")，我们只提取里面的地址以便阅读
+                    const match = currentWall.match(/url\(['"]?(.*?)['"]?\)/);
+                    const displayVal = match ? match[1] : currentWall;
+                    
+                    if (displayVal === 'none') {
+                        term.writeLine("Current wallpaper: none");
+                    } else {
+                        // 如果太长，截断显示
+                        const shortVal = displayVal.length > 50 ? displayVal.substring(0, 47) + "..." : displayVal;
+                        term.writeLine(`Current wallpaper: ${shortVal}`);
+                        // 同时建议用法 (这里使用了转义字符)
+                        term.writeHtml(`<span style="color:gray; font-size:0.9em">To change: style wall &lt;url&gt;</span>`);
+                    }
+                    return; 
+                }
+                
+                if (targetUrl === 'none') {
+                    setOverride('--terminal-background-image', 'none');
+                    setWallpaper('none'); // [调用新函数]
+                    term.writeLine("Wallpaper removed.");
+                } else {
+                    const urlStr = `url('${targetUrl}')`;
+                    
+                    // 保存到 LocalStorage (Override)
+                    // 注意：setOverride 内部会 setProperty，我们需要避免它直接设置图片导致闪烁
+                    // 你可以修改 setOverride 逻辑，或者像下面这样手动保存：
+                    const overrides = JSON.parse(localStorage.getItem('style_overrides') || '{}');
+                    overrides['--terminal-background-image'] = urlStr;
+                    localStorage.setItem('style_overrides', JSON.stringify(overrides));
+
+                    // 执行渐变加载
+                    setWallpaper(targetUrl);
+                    
+                    // 智能透明度调整 (保持你原有的逻辑)
+                    const currentBg = getComputedStyle(document.documentElement).getPropertyValue('--terminal-background-color').trim();
+                    if (!currentBg.startsWith('rgba') || currentBg.endsWith(', 1)')) {
+                        const autoRgba = toRgba(currentBg, 0.7);
+                        document.documentElement.style.setProperty('--terminal-background-color', autoRgba);
+                        overrides['--terminal-background-color'] = autoRgba; // 更新保存
+                        localStorage.setItem('style_overrides', JSON.stringify(overrides));
+                        term.writeLine(`Wallpaper set. Transparency adjusted to 0.7.`);
+                    } else {
+                        term.writeLine(`Wallpaper set.`);
+                    }
+                }
                 break;
+
             case 'reset':
                  const defaultFont = "'Fira Code', 'Consolas', 'Courier New', monospace";
                  const defaultSize = "14px";
                  document.documentElement.style.setProperty('--terminal-font-family', defaultFont);
                  document.documentElement.style.setProperty('--terminal-font-size', defaultSize);
-                 term.writeLine(t('styleReset'));
+                 localStorage.setItem('terminalFontFamily', defaultFont);
+                 localStorage.setItem('terminalFontSize', defaultSize);
+                 
+                 localStorage.removeItem('style_overrides');
+                 ThemeManager.load();
+                 
+                 term.writeLine("Style reset to current theme defaults.");
                  needsResize = true;
                  break;
+
             default:
-                term.writeHtml(`<span class="term-error">${t('styleUnknownCmd')} ${subCommand}.</span>`);
+                term.writeHtml(`<span class="term-error">Unknown style command: ${subCommand}</span>`);
                 return;
         }
+
         if (needsResize) {
-            saveStyleSettings();
             await new Promise(resolve => setTimeout(resolve, 50));
             await term._handleResize();
         }
      },
 
      // --- cat 命令 ---
-     'cat': (args, options) => {
-        if (!args[0]) {
-            term.writeHtml(`<span class="term-error">${t('missingOperand')}</span>`);
+     'cat': (args, options, pipedInput) => {
+        // 1. 优先检查是否有输入流 (来自管道 | 或 输入重定向 <)
+        if (pipedInput && pipedInput.length > 0) {
+            pipedInput.forEach(line => term.writeLine(line));
             return;
         }
+
+        // 2. 如果没有输入流，检查参数
+        if (!args[0]) {
+            // 既没有参数也没有输入流 -> 报错
+            term.writeError(`${t('missingOperand')}`);
+            return;
+        }
+
         const path = args[0];
         const result = bookmarkSystem._findNodeByPath(path);
 
         if (!result || !result.node) {
-            term.writeHtml(`<span class="term-error">${t('noSuchFileOrDir')}: ${path}</span>`);
+            term.writeError(`${t('noSuchFileOrDir')}: ${path}`);
             return;
         }
         if (result.node.children) {
-            term.writeHtml(`<span class="term-error">${t('isADir')}: ${path}</span>`);
+            term.writeError(`${t('isADir')}: ${path}`);
             return;
         }
 
         if (!hasPermission(result.node, 'r')) {
-            term.writeHtml(`<span class="term-error">cat: ${path}: ${t('permissionDenied')}</span>`);
+            term.writeError(`cat: ${path}: ${t('permissionDenied')}`);
             return;
         }
 
         const url = result.node.url;
         if (!url) {
-            term.writeLine(""); // 空文件
+            term.writeLine(""); 
             return;
         }
 
-        // 检查是否是 VFS 文件 (startrc 或 bin 脚本)
         if (result.node.id.startsWith('vfs-')) {
             try {
                 const base64Content = url.split(',')[1] || '';
                 const content = decodeURIComponent(atob(base64Content));
-                term.writeLine(content); // 打印解码后的文件内容
+                term.writeLine(content); 
             } catch (e) {
-                term.writeHtml(`<span class="term-error">${path}: Error reading file: ${e.message}</span>`);
+                term.writeError(`${path}: Error reading file: ${e.message}`);
             }
         } else {
-            // 对于普通书签，只打印 URL
             term.writeLine(url);
         }
      },
@@ -4702,136 +5726,262 @@ const globalCommands = {
         const pkgName = args[1];
 
         // 检查 sudo 权限
-        if (!options.sudo && (subCommand === 'install' || subCommand === 'update' || subCommand === 'remove')) {
+        if (!options.sudo && ['install', 'update', 'remove', 'upgrade'].includes(subCommand)) {
             term.writeLine(`apt: This command requires superuser privileges (try 'sudo apt ...')`);
             return;
         }
 
+        // 辅助：获取可升级列表
+        const getUpgradablePackages = () => {
+            const index = JSON.parse(localStorage.getItem('apt_repo_index') || '{}');
+            const installed = JSON.parse(localStorage.getItem('installed_packages') || '{}');
+            const list = [];
+            
+            for (const name in installed) {
+                const localVer = installed[name].version || '0.0.0'; // 旧数据可能没版本，默认为 0
+                const remotePkg = index[name];
+                
+                // 如果远程存在且版本比本地大
+                if (remotePkg && compareVersions(remotePkg.version, localVer) > 0) {
+                    list.push({
+                        name: name,
+                        current: localVer,
+                        new: remotePkg.version
+                    });
+                }
+            }
+            return list;
+        };
+
         try {
             switch (subCommand) {
                 case 'update':
-                    term.writeLine(`Hit:1 ${REPO_URL}index.json`);
-                    
-                    const response = await fetch(REPO_URL + "index.json");
-                    if (!response.ok) {
-                        throw new Error(`Failed to fetch index: ${response.statusText}`);
+                    const startTime = Date.now();
+                    const oldIndexStr = localStorage.getItem('apt_repo_index');
+
+                    try {
+                        const response = await fetch(REPO_URL + "index.json", { cache: "no-cache" });
+
+                        if (!response.ok) {
+                            throw new Error(`${response.status} ${response.statusText}`);
+                        }
+
+                        const blob = await response.blob();
+                        const sizeBytes = blob.size;
+                        const newIndexStr = await blob.text();
+
+                        const isHit = oldIndexStr === newIndexStr;
+
+                        localStorage.setItem('apt_repo_index', newIndexStr);
+                        const index = JSON.parse(newIndexStr);
+
+                        const endTime = Date.now();
+                        const durationSec = Math.max((endTime - startTime) / 1000, 0.01);
+                        const speedKB = (sizeBytes / 1024 / durationSec).toFixed(0);
+
+                        const sizeDisplay = sizeBytes > 1024 
+                            ? `${(sizeBytes/1024).toFixed(1)} kB` 
+                            : `${sizeBytes} B`;
+
+                        if (isHit) {
+                            term.writeLine(`Hit:1 ${REPO_URL}index.json`);
+                        } else {
+                            term.writeLine(`Get:1 ${REPO_URL}index.json [${sizeDisplay}]`);
+                        }
+
+                        if (!isHit) {
+                            term.writeLine(`Fetched ${sizeDisplay} in ${durationSec.toFixed(1)}s (${speedKB} kB/s)`);
+                        }
+
+                        term.writeLine("Reading package lists... Done");
+                        term.writeLine("Building dependency tree... Done");
+                        term.writeLine("Reading state information... Done");
+
+                        // 计算可升级包
+                        const upgradableList = getUpgradablePackages();
+                        const count = upgradableList.length;
+
+                        if (count > 0) {
+                            term.writeLine(`${count} packages can be upgraded. Run 'apt list --upgradable' to see them.`);
+                        } else {
+                            term.writeLine("All packages are up to date.");
+                        }
+                    } catch (e) {
+                        term.writeHtml(`<span class="term-error">Err:1 ${REPO_URL}index.json</span>`);
+                        term.writeHtml(`<span class="term-error">  ${e.message}</span>`);
+                        term.writeLine("Reading package lists... Done");
+                        term.writeHtml(`<span class="term-error">E: Failed to fetch index file.</span>`);
                     }
-                    const index = await response.json();
-                    localStorage.setItem('apt_repo_index', JSON.stringify(index));
-
-                    // --- 模拟 Ubuntu 输出 ---
-                    const installed = JSON.parse(localStorage.getItem('installed_packages') || '{}');
-                    
-                    const allPkgsCount = Object.keys(index).length;
-                    const installedCount = Object.keys(installed).length;
-
-                    term.writeLine(`Fetched ${allPkgsCount} packages in 1s (mock data)`);
-                    term.writeLine("Reading package lists... Done");
-                    term.writeLine("Building dependency tree... Done");
-                    term.writeLine("Reading state information... Done");
-
-                    const upgradableCount = 0; // (我们尚未实现版本控制)
-
-                    if (upgradableCount > 0) {
-                        term.writeLine(`${upgradableCount} packages can be upgraded. Run 'apt list --upgradable' to see them.`);
-                    } else {
-                        term.writeLine("All packages are up to date.");
-                    }
-                    
-                    // 总是显示仓库状态，并引导用户
-                    term.writeLine(`\nFound ${allPkgsCount} available packages. ${installedCount} are installed.`);
-                    term.writeLine("Run 'apt list' to see all available packages.");
                     break;
 
                 case 'list':
                     {
                         const index = JSON.parse(localStorage.getItem('apt_repo_index') || '{}');
                         const installed = JSON.parse(localStorage.getItem('installed_packages') || '{}');
+                        
+                        // If --upgradeable
+                        if (options['upgradable']) {
+                            term.writeLine("Listing... Done");
+                            const list = getUpgradablePackages();
+                            if (list.length === 0) {
+                                // 没有任何输出，符合 apt 行为
+                            } else {
+                                list.forEach(item => {
+                                    // 格式: package/remote_version [upgradable from: local_version]
+                                    // 例如: weather/2.0.1 [upgradable from: 1.0.0]
+                                    term.writeHtml(`<span style="color:var(--color-accent-green, #4CAF50)">${item.name}</span>/${item.new} [upgradable from: ${item.current}]`);
+                                });
+                            }
+                            return;
+                        }
+                        
                         term.writeLine("Available packages:");
                         for (const key in index) {
-                            const installedMark = installed[key] ? "[installed]" : "";
+                            let installedMark = "";
+                            if (installed[key]) {
+                                const ver = installed[key].version || 'unknown';
+                                installedMark = `[installed, v${ver}]`;
+                            }
                             term.writeLine(`  ${key} - ${index[key].desc} ${installedMark}`);
                         }
                     }
                     break;
+
+                case 'upgrade':
+                    {
+                        const list = getUpgradablePackages();
+                        if (list.length === 0) {
+                            term.writeLine("0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.");
+                            return;
+                        }
+
+                        term.writeLine("The following packages will be upgraded:");
+                        term.writeLine("  " + list.map(i => i.name).join(" "));
+                        
+                        const answer = await term.readInput(`${list.length} upgraded. Do you want to continue? [Y/n]`);
+                        if (answer !== 'y' && answer !== '') {
+                            term.writeLine("Abort.");
+                            return;
+                        }
+
+                        // 循环调用 install 逻辑
+                        for (const item of list) {
+                            // 我们复用 install 的内部逻辑，这里为了简单，我们手动触发一次 install 命令
+                            // 或者把 install 逻辑抽取出来。为了代码复用，我们直接递归调用 'apt'
+                            // 注意：这会产生多余的 logs，但很真实
+                            term.writeLine(`Upgrading ${item.name}...`);
+                            await globalCommands.apt(['install', item.name], { sudo: true });
+                        }
+                        
+                        term.writeLine("Upgrade complete.");
+                    }
+                    break;
                 
                 case 'install':
-                    if (!pkgName) { term.writeHtml(`<span class="term-error">${t('aptInstallUsage')}</span>`); return; }
+                    // 获取所有参数作为包名列表
+                    const pkgsToInstall = args.slice(1);
+                    if (pkgsToInstall.length === 0) { 
+                        term.writeHtml(`<span class="term-error">${t('aptInstallUsage')}</span>`); 
+                        return; 
+                    }
                     
                     const repoIndex = JSON.parse(localStorage.getItem('apt_repo_index') || '{}');
-                    const pkg = repoIndex[pkgName];
-
-                    if (!pkg) {
-                        term.writeHtml(`<span class="term-error">${t('aptPkgNotFound').replace('{0}', pkgName)}</span>`);
-                        return;
-                    }
-
-                    // [!! 1. 组合所有需要的权限 !!]
-                    const reqPermissions = pkg.permissions || [];
-                    const reqHostPermissions = pkg.host_permissions || [];
-                    const allPermissions = {
-                        permissions: reqPermissions,
-                        origins: reqHostPermissions // host_permissions 在 API 中被称为 'origins'
-                    };
-
-                    term.writeLine(`Package '${pkgName}' will be installed.`);
-                    term.writeLine(pkg.desc);
                     
-                    // [!! 2. 检查并询问 !!]
-                    let needsPerms = false;
-                    if (reqPermissions.length > 0) {
-                        term.writeLine(`[!] This package requires new API permissions: ${reqPermissions.join(', ')}`);
-                        needsPerms = true;
-                    }
-                    if (reqHostPermissions.length > 0) {
-                        term.writeLine(`[!] This package needs to access new hosts: ${reqHostPermissions.join(', ')}`);
-                        needsPerms = true;
-                    }
+                    // 循环处理每个包
+                    for (const pkgName of pkgsToInstall) {
+                        term.writeLine(`\nProcessing: ${pkgName}...`);
 
-                    if (needsPerms) {
-                        const answer = await term.readInput(t('aptConfirm'));
-                        if (answer !== 'y' && answer !== '') {
-                            term.writeLine(t('aptAbort'));
-                            return;
+                        const pkg = repoIndex[pkgName];
+
+                        if (!pkg) {
+                            term.writeHtml(`<span class="term-error">${t('aptPkgNotFound').replace('{0}', pkgName)}</span>`);
+                            continue; // 跳过，处理下一个
+                        }
+
+                        // 权限检查逻辑
+                        const reqPermissions = pkg.permissions || [];
+                        const reqHostPermissions = pkg.host_permissions || [];
+                        const allPermissions = {
+                            permissions: reqPermissions,
+                            origins: reqHostPermissions
+                        };
+
+                        // 检查是否已安装
+                        const installedData = JSON.parse(localStorage.getItem('installed_packages') || '{}');
+                        if (installedData[pkgName] && installedData[pkgName].version === pkg.version) {
+                            term.writeLine(`${pkgName} is already the newest version (${pkg.version}).`);
+                            continue; // 跳过
+                        }
+
+                        // 权限请求 (只能串行，不能并行)
+                        let needsPerms = false;
+                        if (reqPermissions.length > 0) {
+                            term.writeLine(`[!] Package '${pkgName}' requires API: ${reqPermissions.join(', ')}`);
+                            needsPerms = true;
+                        }
+                        if (reqHostPermissions.length > 0) {
+                            term.writeLine(`[!] Package '${pkgName}' requires Hosts: ${reqHostPermissions.join(', ')}`);
+                            needsPerms = true;
+                        }
+
+                        if (needsPerms) {
+                            const answer = await term.readInput(t('aptConfirm'));
+                            if (answer !== 'y' && answer !== '') {
+                                term.writeLine(`Skipping ${pkgName}.`);
+                                continue;
+                            }
+                            const granted = await new Promise((resolve) => {
+                                chrome.permissions.request(allPermissions, resolve);
+                            });
+                            if (!granted) {
+                                term.writeLine(`Permissions denied. Skipping ${pkgName}.`);
+                                continue;
+                            }
                         }
                         
-                        // [!! 3. 请求权限 !!]
-                        const granted = await new Promise((resolve) => {
-                            chrome.permissions.request(allPermissions, resolve);
-                        });
-                        if (!granted) {
-                            term.writeLine("Permissions not granted. Install failed.");
-                            return;
+                        // 下载与安装
+                        if (pkg.file) {
+                            term.writeLine(t('aptFetch').replace('{0}', pkgName).replace('{1}', pkg.file));
+                            try {
+                                const codeResponse = await fetch(REPO_URL + pkg.file);
+                                if (!codeResponse.ok) {
+                                    throw new Error(`${codeResponse.status} ${codeResponse.statusText}`);
+                                }
+                                const codeString = await codeResponse.text();
+                                
+                                // 重新读取 localStorage，防止循环中覆盖
+                                let currentInstalled = JSON.parse(localStorage.getItem('installed_packages') || '{}');
+                                currentInstalled[pkgName] = { 
+                                    code: codeString,
+                                    version: pkg.version
+                                };
+                                localStorage.setItem('installed_packages', JSON.stringify(currentInstalled));
+                                term.writeLine(`Successfully installed ${pkgName}.`);
+                            } catch (err) {
+                                term.writeHtml(`<span class="term-error">Failed to fetch ${pkgName}: ${err.message}</span>`);
+                            }
+                        } else {
+                            // 虚拟包逻辑 (无代码，仅权限)
+                            let currentInstalled = JSON.parse(localStorage.getItem('installed_packages') || '{}');
+                            currentInstalled[pkgName] = { 
+                                code: null, 
+                                version: pkg.version 
+                            };
+                            localStorage.setItem('installed_packages', JSON.stringify(currentInstalled));
+                            term.writeLine(`Permissions for ${pkgName} activated.`);
                         }
                     }
-                    
-                    // [!! 4. 安装 (如果 file 存在) !!]
-                    if (pkg.file) {
-                        term.writeLine(t('aptFetch').replace('{0}', pkgName).replace('{1}', pkg.file));
-                        const codeResponse = await fetch(REPO_URL + pkg.file);
-                        if (!codeResponse.ok) {
-                            throw new Error(`Failed to fetch package code: ${codeResponse.statusText}`);
-                        }
-                        const codeString = await codeResponse.text();
-                        
-                        let installed = JSON.parse(localStorage.getItem('installed_packages') || '{}');
-                        installed[pkgName] = { code: codeString };
-                        localStorage.setItem('installed_packages', JSON.stringify(installed));
-                    } else {
-                        // 这是一个“虚拟”包 (如 history, tree, wget)，只用于授权
-                        term.writeLine(`Permissions for built-in command ${pkgName} are now active.`);
-                    }
-                    
-                    term.writeLine(`Successfully installed ${pkgName}.`);
                     break;
 
                 case 'remove':
-                     if (!pkgName) { term.writeLine("Usage: sudo apt remove <package>"); return; }
-                     {
+                     const pkgsToRemove = args.slice(1);
+                     if (pkgsToRemove.length === 0) { term.writeLine("Usage: sudo apt remove <package1> [package2...]"); return; }
+                     
+                     for (const pkgName of pkgsToRemove) {
                         let installed = JSON.parse(localStorage.getItem('installed_packages') || '{}');
                         if (!installed[pkgName]) {
                             term.writeLine(`${pkgName} is not installed.`);
-                            return;
+                            continue;
                         }
                         delete installed[pkgName];
                         localStorage.setItem('installed_packages', JSON.stringify(installed));
@@ -4912,8 +6062,15 @@ function getAllCommandNames() {
 const subCommandCompletions = {
     'downloads': ['ls', 'open'],
     'tabs': ['ls', 'switch', 'close'],
-    'apt': ['update', 'list', 'install', 'remove'],
-    'style': ['font', 'size', 'reset'],
+    'apt': ['update', 'list', 'install', 'remove', 'upgrade'],
+    'style': ['font', 'size', 'bg', 'fg', 'accent', 'cursor', 'wall', 'opacity', 'reset'],
+    'ext': ['ls', 'toggle', 'enable', 'disable', 'uninstall'],
+    'theme': () => {
+        if (typeof ThemeManager !== 'undefined' && ThemeManager.presets) {
+            return Object.keys(ThemeManager.presets);
+        }
+        return ['default'];
+    },
     'mv': [], // 标记为 'path'
     'cp': [], // 标记为 'path'
     'cd': [], // 标记为 'path'
@@ -4923,6 +6080,26 @@ const subCommandCompletions = {
     'rm': [], // 标记为 'path'
     'mkdir': [], // 标记为 'path'
     'sh': [], // 标记为 'path'
+    'source': [], // 标记为 'path'
+    '.': () => {
+        if (!bookmarkSystem || !bookmarkSystem.current) return [];
+        
+        const children = bookmarkSystem.current.children || [];
+        
+        // 过滤条件：不是目录 且 (是 VFS 脚本 或 拥有 +x 权限)
+        return children
+            .filter(node => {
+                if (node.children) return false; // 排除目录
+                
+                // 检查 VFS 脚本
+                if (node.id.startsWith('vfs-bin-')) return true;
+                
+                // 检查权限位 (0o100 = User Executable)
+                const meta = getMetadata(node);
+                return (meta.mode & 0o100) !== 0;
+            })
+            .map(node => node.title); // 只返回文件名
+    },
 };
 
 function awaiting() {
@@ -4965,197 +6142,256 @@ async function updateSystemVersion() {
  * - 正确处理分号 (;) [顺序执行]
  * - 正确处理管道 (|) [流式执行]
  */
+/**
+ * 核心命令执行引擎
+ * 支持:
+ * 1. 变量赋值: VAR=value
+ * 2. 命令替换: $(command)
+ * 3. 顺序执行: cmd1; cmd2
+ * 4. 管道流: cmd1 | cmd2
+ */
 async function executeLine(line) {
+    if (executeNestLevel > 10) return;
     awaiting();
+
+    // --- 1. $(...) 命令替换 (保持不变) ---
+    const subCmdRegex = /\$\((.*?)\)/g;
+    let match;
+    let processedLine = line;
+    while ((match = subCmdRegex.exec(line)) !== null) {
+        const fullMatch = match[0]; 
+        const innerCmd = match[1];  
+        const wasSilent = term.isSilent;
+        term.isSilent = true; 
+        const result = await executeLine(innerCmd); 
+        term.isSilent = wasSilent; 
+        let replacement = "";
+        if (Array.isArray(result)) replacement = result.join(' '); 
+        else if (typeof result === 'object' && result !== null) replacement = JSON.stringify(result);
+        else replacement = String(result || "");
+        processedLine = processedLine.replace(fullMatch, replacement);
+    }
     
-    // 1. 按分号 (;) 拆分，得到顺序命令
-    // const sequentialCommands = line.split(';').map(cmd => cmd.trim()).filter(cmd => cmd.length > 0);
-    
-    const sequentialCommands = line.replace(/\n/g, ';')
+    // --- 2. 顺序执行 ; (保持不变) ---
+    const sequentialCommands = processedLine.replace(/\n/g, ';')
                                    .split(';')
                                    .map(cmd => cmd.trim())
-                                   .filter(cmd => cmd.length > 0 && !cmd.startsWith('#')); // 顺便支持注释
+                                   .filter(cmd => cmd.length > 0 && !cmd.startsWith('#'));
 
-    if (sequentialCommands.length === 0) {
-        done();
-        return;
-    }
+    let finalResult = null;
 
-    // 依次执行每个顺序命令
     for (const commandSequence of sequentialCommands) {
         
-        // 按管道 (|) 拆分，得到管道命令
+        // --- 3. 管道 | (保持不变) ---
         const pipelineStrings = commandSequence.split('|').map(cmd => cmd.trim()).filter(cmd => cmd.length > 0);
         
-        let lastOutput = null; // 用于存储上一个命令的输出
+        let lastOutput = null; 
 
-        // 依次执行管道中的每个命令
         for (let i = 0; i < pipelineStrings.length; i++) {
-            const commandStr = pipelineStrings[i];
+            let commandStr = pipelineStrings[i];
             
-            // 3. 解析单个命令 (例如 "ls" 或 "grep How")
-            const parsed = parseSingleCommand(commandStr);
+            // ==========================================
+            // 重定向解析逻辑
+            // ==========================================
+            
+            // 1. 重置当前 IO 状态
+            term.resetIO();
+
+            // 2. 解析输入重定向 (< file)
+            // 匹配 < 后面跟着非空字符
+            const inputRedirectMatch = commandStr.match(/<\s*([^\s]+)/);
+            if (inputRedirectMatch) {
+                const inputFile = inputRedirectMatch[1];
+                try {
+                    const content = readFileContent(inputFile);
+                    // 将文件内容转换为行数组，作为 pipedInput 传入
+                    lastOutput = content.split('\n');
+                    // 从命令字符串中移除重定向部分
+                    commandStr = commandStr.replace(inputRedirectMatch[0], '');
+                } catch (e) {
+                    term.writeError(`startsh: ${e.message}`);
+                    break; // 停止当前管道
+                }
+            }
+
+            // 3. 解析输出重定向 (1>, 2>, >, >>, 2>>)
+            // Regex: (fd?)(>>?) \s* (filename)
+            // Groups: 1=(1 or 2 or empty), 2=(> or >>), 3=(filename)
+            // 注意：要循环匹配，因为可能同时有 1>out 2>err
+            const redirectRegex = /([12]?)(>>?)\s*([^\s]+)/g;
+            let rMatch;
+            const tasks = []; // 存储重定向任务
+
+            // 这里的 replace 是为了把重定向部分从命令字符串中剔除
+            // 同时收集重定向信息
+            commandStr = commandStr.replace(redirectRegex, (full, fdStr, op, target) => {
+                const fd = (fdStr === '2') ? 2 : 1; // 默认为 1 (stdout)
+                const type = (op === '>>') ? 'append' : 'overwrite';
+                term.setRedirect(fd, type, target);
+                tasks.push({ fd, type, target });
+                return ''; // 删除该部分
+            });
+
+            // ==========================================
+            // [结束] 重定向解析
+            // ==========================================
+
+            // --- 4. 变量赋值 (VAR=VAL) (保持不变) ---
+            if (i === 0 && commandStr.includes('=')) {
+                const assignMatch = commandStr.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+                if (assignMatch) {
+                    const key = assignMatch[1];
+                    let val = assignMatch[2];
+                    val = val.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (m, v) => Environment[v] || "");
+                    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+                        val = val.slice(1, -1);
+                    }
+                    Environment[key] = val;
+                    continue; 
+                }
+            }
+
+            // --- 5. 解析单个命令 (保持不变) ---
+            const parsed = parseSingleCommand(commandStr); // 解析剔除了重定向后的纯命令
             if (!parsed) continue;
 
             let { command, args, options } = parsed;
 
-            // 变量替换
-            const varRegex = /\$([A-Za-z_][A-Za-z0-9_]*)/g; // 查找 $VAR
-            const varRegexBrace = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g; // 查找 ${VAR}
-
+            // ... (变量替换 expandVars 保持不变) ...
             const expandVars = (str) => {
-                let expanded = str.replace(varRegex, (match, varName) => {
-                    return Environment[varName] || ""; //
+                return str.replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, (match, varName) => {
+                    return Environment[varName] || "";
                 });
-                expanded = expanded.replace(varRegexBrace, (match, varName) => {
-                    return Environment[varName] || ""; //
-                });
-                return expanded;
             };
 
-            const unescape = (str) => {
-                // (这个简单的版本只处理转义的空格)
-                return str.replace(/\\ /g, ' '); 
-            };
-
-            // 处理 args 数组：扩展变量并剥离引号
             args = args.map(arg => {
-                let trailingChars = ''; // e.g., '/'
-
-                // 1. 剥离引号
                 if (arg.startsWith('"') && arg.endsWith('"')) {
-                    // --- Case 1: 完美的双引号 "file" ---
-                    arg = arg.slice(1, -1);
-                    return expandVars(arg); // 扩展 + 剥离
-                
+                    return expandVars(arg.slice(1, -1));
                 } else if (arg.startsWith("'") && arg.endsWith("'")) {
-                    // --- Case 2: 完美的单引号 'file' ---
-                    return arg.slice(1, -1); // 只剥离
-                
-                } else if (arg.startsWith('"')) {
-                    // --- Case 3: "脏"的双引号, e.g., "file"/ ---
-                    const lastQuote = arg.lastIndexOf('"');
-                    if (lastQuote > 0) {
-                        trailingChars = arg.substring(lastQuote + 1); // e.g., "/"
-                        arg = arg.substring(1, lastQuote); // e.g., "file"
-                        return expandVars(arg) + trailingChars; // 扩展 + 剥离 + 重新附加
-                    }
-                } else if (arg.startsWith("'")) {
-                    // --- Case 4: "脏"的单引号, e.g., 'file'/ ---
-                    const lastQuote = arg.lastIndexOf("'");
-                    if (lastQuote > 0) {
-                        trailingChars = arg.substring(lastQuote + 1); // e.g., "/"
-                        arg = arg.substring(1, lastQuote); // e.g., "file"
-                        return arg + trailingChars; // 不扩展 + 剥离 + 重新附加
-                    }
+                    return arg.slice(1, -1);
+                } else {
+                    return expandVars(unescapePath(arg));
                 }
-                
-                // --- Case 5: 未加引号的参数 (e.g., $LANG or file)
-                arg = unescapePath(arg);
-                return expandVars(arg);
             });
-
             command = unescapePath(expandVars(command));
-            // Check alias
+
+            // ... (Alias 展开保持不变) ...
             if (AliasEnvironment[command]) {
                 const aliasContent = AliasEnvironment[command];
-                
-                // 将别名内容 (e.g., 'ls -l') 和
-                // 用户输入的多余参数 (e.g., '/bin') 重新组合
-                const reCombinedArgs = args.map(a => a.includes(' ') ? `"${a}"` : a).join(' '); // 确保带空格的参数被引用
+                const reCombinedArgs = args.map(a => a.includes(' ') ? `"${a}"` : a).join(' ');
                 const aliasParsed = parseSingleCommand(aliasContent + " " + reCombinedArgs);
-
-                // 替换原始命令
-                command = aliasParsed.command;
-                args = aliasParsed.args;
-                options = { ...aliasParsed.options, ...options }; // 合并选项
+                if (aliasParsed) {
+                    command = aliasParsed.command;
+                    args = aliasParsed.args;
+                    options = { ...aliasParsed.options, ...options };
+                }
             }
             
+            // --- 7. 查找命令 (保持不变) ---
             let commandFunc = null;
-
             if (command.startsWith('./') || command.startsWith('/') || command.startsWith('~/')) {
                 const result = bookmarkSystem._findNodeByPath(command);
                 if (!result || !result.node) {
-                    term.writeHtml(`<span class="term-error">startsh: ${t('noSuchFileOrDir')}: ${command}</span>`);
+                    term.writeError(`startsh: ${t('noSuchFileOrDir')}: ${command}`); // 改用 writeError
                     isPiping = false; break;
                 }
-                
-                const meta = getMetadata(result.node);
-                // 检查用户执行权限 (0o100 = --x------)
                 if (hasPermission(result.node, 'x')) {
                     commandFunc = globalCommands.sh;
                     args.unshift(command);
                 } else {
-                    term.writeHtml(`<span class="term-error">startsh: ${t('permissionDenied')}: ${command}</span>`);
+                    term.writeError(`startsh: ${t('permissionDenied')}: ${command}`); // 改用 writeError
                     isPiping = false; break;
                 }
-            }
-            else if (bookmarkSystem.commands[command]) {
+            } else if (bookmarkSystem.commands[command]) {
                 commandFunc = bookmarkSystem.commands[command];
             } else if (globalCommands[command]) {
                 commandFunc = globalCommands[command];
             } else {
-                // 如果在内置命令中找不到，检查 /bin/ VFS
                 const vfsPath = '/bin/' + command;
                 const result = bookmarkSystem._findNodeByPath(vfsPath);
-                
                 if (result && result.node && !result.node.children) {
-                    // 找到了一个 /bin/ 中的 VFS 脚本
-                    const meta = getMetadata(result.node);
                     if (hasPermission(result.node, 'x')) {
                         commandFunc = globalCommands.sh;
-                        // 将其作为 sh /bin/welcome arg1 arg2 ... 执行
-                        args.unshift(vfsPath); 
+                        args.unshift(vfsPath);
                     } else {
-                        term.writeHtml(`<span class="term-error">startsh: ${t('permissionDenied')}: ${vfsPath}</span>`);
-                        isPiping = false; 
-                        break;
+                        term.writeError(`startsh: ${t('permissionDenied')}: ${vfsPath}`);
+                        isPiping = false; break;
                     }
                 }
             }
 
-            // 4. [!!] 设置管道状态 [!!]
-            // 检查*这*是不是管道中的最后一个命令
+            // --- 8. 管道状态 (保持不变) ---
             isPiping = (i < pipelineStrings.length - 1);
-            if (isPiping) {
-                pipeBuffer = []; // 如果是，准备好缓冲区
-            }
+            if (isPiping) pipeBuffer = [];
 
+            // --- 9. 执行命令 (保持不变) ---
             const installedPkgs = JSON.parse(localStorage.getItem('installed_packages') || '{}');
             const sandboxPkg = installedPkgs[command];
 
             if (commandFunc) {
-                // --- A. 执行原生命令 ---
-                const result = commandFunc(args, options, lastOutput);
-                if (result instanceof Promise) {
-                    lastOutput = await result;
-                } else {
-                    lastOutput = result;
+                try {
+                    const result = commandFunc(args, options, lastOutput);
+                    if (result instanceof Promise) lastOutput = await result;
+                    else lastOutput = result;
+                } catch (e) {
+                    term.writeError(e.message);
                 }
             } else if (sandboxPkg) {
                 term._writeLogHtml(`<span style="color:gray;">${t('sandboxExec').replace('{0}', command)}</span>`);
-                
-                // lastOutput (pipedInput) 会被传递
                 const result = await term.executeInSandbox(sandboxPkg.code, args, options, lastOutput);
-                lastOutput = result; // "result" 是从 sandbox.js 返回的输出数组
-            
+                lastOutput = result; 
             } else if (command.trim() !== '') {
-                // --- C. 命令未找到 ---
-                term.writeHtml(`<span class="term-error">startsh: ${t('cmdNotFound')}: ${command}</span>`);
-                isPiping = false; 
-                break; 
+                term.writeError(`startsh: ${t('cmdNotFound')}: ${command}`);
+                isPiping = false; break;
             }
 
-            // 5. 如果正在管道中，将缓冲区设为 "lastOutput" 供下一个命令使用
+            // ==========================================
+            // [新增] 处理重定向落地 (Flush Buffers)
+            // ==========================================
+            
+            // 只有当 stdout 被重定向了，我们才保存它
+            if (term.ioState.stdout) {
+                const content = term.ioState.buffer.stdout;
+                // 如果是管道中间的命令，通常 stdout 被重定向给下一个命令 (pipeBuffer)
+                // 但如果用户显式写了 > file，则 pipeBuffer 可能会变空，或者行为取决于 Shell 实现。
+                // 这里我们假设 > file 优先级高于管道（截断流），或者在 Linux 中 tee 行为。
+                // 简单起见：> file 写入文件。
+                if (content.length > 0) {
+                    try {
+                        await writeFile(term.ioState.stdout.path, content, term.ioState.stdout.type === 'append');
+                    } catch (e) {
+                        term.writeError(`IO Error: ${e.message}`);
+                    }
+                }
+            }
+
+            // 处理 stderr 落地
+            if (term.ioState.stderr) {
+                const content = term.ioState.buffer.stderr;
+                if (content.length > 0) {
+                    try {
+                        await writeFile(term.ioState.stderr.path, content, term.ioState.stderr.type === 'append');
+                    } catch (e) {
+                        // 如果连 stderr 都写不进去，那就写屏吧
+                        term._writeSingleLine(`<span class="term-error">IO Error writing stderr: ${e.message}</span>`);
+                        term._handleNewline();
+                    }
+                }
+            }
+
+            // ==========================================
+
             if (isPiping) {
-                lastOutput = pipeBuffer;
+                if (!lastOutput && pipeBuffer.length > 0) lastOutput = pipeBuffer;
             }
         }
+        finalResult = lastOutput; 
     }
     
-    // 所有命令执行完毕
     await bookmarkSystem._refreshBookmarks();
+    term.resetIO(); // 彻底清理
     done();
+    return finalResult; 
 }
 
 

@@ -4762,20 +4762,35 @@ const globalCommands = {
         }
     },
     'curl': async (args, options, pipedInput) => {
-        const url = args[0];
+        // 1. 参数解析：分离 URL 和 Headers
+        // 逻辑：如果参数包含冒号且不是 http 开头，视为 Header
+        let url = null;
+        const headers = {};
+        
+        args.forEach(arg => {
+            if (arg.match(/^https?:\/\//i)) {
+                url = arg;
+            } else if (arg.includes(':')) {
+                // 解析 "Key: Value"
+                const [key, ...values] = arg.split(':');
+                if (key && values.length > 0) {
+                    headers[key.trim()] = values.join(':').trim();
+                }
+            }
+        });
+
         if (!url) {
-            term.writeHtml(`<span class="term-error">${t('curlUsage')}</span>`);
+            term.writeHtml(`<span class="term-error">${t('curlUsage')} [Header: Value]...</span>`);
             return;
         }
 
-        // 1. 动态权限检查 (Host Permissions)
-        const origin = "<all_urls>"; // 或者更精确地解析 url 获取 origin
+        // 2. 动态权限检查 (Host Permissions)
+        const origin = "<all_urls>"; 
         const hasPerm = await new Promise(r => chrome.permissions.contains({ origins: [origin] }, r));
 
         if (!hasPerm) {
             term.writeLine("curl: Requires permission to access external websites.");
             try {
-                // 动态请求 Host 权限
                 const granted = await new Promise(r => chrome.permissions.request({ origins: [origin] }, r));
                 if (!granted) {
                     term.writeHtml(`<span class="term-error">Permission denied. Cannot execute curl.</span>`);
@@ -4788,27 +4803,48 @@ const globalCommands = {
             }
         }
 
-        // 2. 执行 Fetch
+        // 3. 执行 Fetch
         try {
             term._writeLogLine(t('curlProgress').replace('{0}', url)); 
             
-            // mode: 'cors' 是关键
-            const response = await fetch(url, { cache: 'no-store', mode: 'cors' });
+            // 构建请求配置
+            const fetchOptions = { 
+                method: 'GET',
+                cache: 'no-store', 
+                mode: 'cors',
+                headers: headers // 注入用户定义的 Headers
+            };
+
+            const response = await fetch(url, fetchOptions);
             
             if (!response.ok) {
-                throw new Error(t('curlHttpError').replace('{0}', response.status));
+                throw new Error(t('curlHttpError').replace('{0}', `${response.status} ${response.statusText}`));
             }
             
-            const text = await response.text();
+            // 4. 智能内容处理
+            const contentType = response.headers.get('content-type') || '';
             
-            // 写入 stdout / 管道
-            term.writeLine(text); 
-            return text.split('\n'); 
+            if (contentType.startsWith('image/')) {
+                // --- 情况 A: 响应是二进制图片 ---
+                // 转换为 Blob -> ObjectURL
+                const blob = await response.blob();
+                const objectUrl = URL.createObjectURL(blob);
+                
+                // 将 Blob URL 输出到屏幕和管道
+                term.writeLine(objectUrl); 
+                return [objectUrl]; // 传递给下一个命令 (如 style wall)
+                
+            } else {
+                // --- 情况 B: 响应是文本/JSON ---
+                const text = await response.text();
+                term.writeLine(text); 
+                return text.split('\n'); 
+            }
             
         } catch(e) {
             term._writeLogHtml(`<span class="term-error">curl error: ${e.message}</span>`);
             if (e.message.includes("Failed to fetch")) {
-                term._writeLogHtml(`<span class="term-error">Tip: The target server might not allow CORS requests from extensions.</span>`);
+                term._writeLogHtml(`<span class="term-error">Tip: Check CORS or your headers.</span>`);
             }
         }
     },
