@@ -4461,7 +4461,7 @@ const globalCommands = {
     },
 
     'whatsnew': async (args, options) => {
-        const API_URL = "https://api.tianyibrad.com/api/collections/ST2_0/records?sort=-created&perPage=1"; 
+        const API_URL = Resources.urls.api_updates;
         
         term.writeLine("Fetching latest updates from api.tianyibrad.com...");
         
@@ -4514,12 +4514,15 @@ const globalCommands = {
         // 系统版本 
         term.writeLine(t('welcomeTitle').replace('{0}', installedVersion));
         term.writeLine("");
+
+        const welcome_lang = Environment.LANG || 'en';
+        const docUrl = Resources.urls.docs[welcome_lang] || Resources.urls.docs['en'];
         
         // 链接 (使用 VFS 文件夹样式)
         // (你可以用 CSS 在 .term-folder 中定义一个亮色)
-        term.writeHtml(`${t('welcomeDoc')} <span class='term-folder'>https://aka.bradleyproject.eu.org/st20_doc</span>`);
-        term.writeHtml(`${t('welcomeMgmt')} <span class='term-folder'>chrome://extensions</span>`);
-        term.writeHtml(`${t('welcomeSupport')} <span class='term-folder'>https://www.tianyibrad.com</span>`);
+        term.writeHtml(`${t('welcomeDoc')} <span class='term-folder'>${docUrl}</span>`);
+        term.writeHtml(`${t('welcomeMgmt')} <span class='term-folder'>${Resources.urls.extensions}</span>`);
+        term.writeHtml(`${t('welcomeSupport')} <span class='term-folder'>${Resources.urls.support}</span>`);
         term.writeLine("");
 
         // 系统信息 (真实 + 模拟)
@@ -5769,7 +5772,7 @@ const globalCommands = {
 
     // --- `apt` 命令 (使用 fetch) ---
     'apt': async (args, options) => {
-        const REPO_URL = "https://raw.githubusercontent.com/BradleyBao/StartTerminal2/main/start-terminal-bookmark-extension/repo/";
+        const REPO_URL = Resources.urls.repo;
         const subCommand = args[0];
         const pkgName = args[1];
 
