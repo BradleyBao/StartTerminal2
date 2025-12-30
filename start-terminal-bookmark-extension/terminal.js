@@ -1565,7 +1565,9 @@ class Terminal {
                         if (selectedText) {
                             navigator.clipboard.writeText(selectedText);
                         }
-                        // 我们不中断，也不清除选区
+                        // 不中断，也不清除选区
+                        // 复制完成后，强制聚焦回输入框，以便用户可以立即打字
+                        this.focus();
                     } else {
                         // --- 这是 Ctrl+C (中断) ---
                         e.preventDefault(); 

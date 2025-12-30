@@ -68,7 +68,7 @@ var messages = {
         'help_ext': "Manage Chrome extensions (ls, toggle, uninstall).",
         'help_theme': "Switch themes (e.g., theme matrix) or list them.",
         'help_jq': "Process JSON input from pipes (e.g., curl ... | jq .data).",
-        'help_neofetch': "Show system information (alias for sysinfo).",
+        'help_neofetch': "Show system information (alias: neofetch).",
         
         // --- Permissions ---
         'chmodReadOnly': "chmod: {0}: Read-only file system.",
@@ -374,7 +374,7 @@ var messages = {
         'help_ext': "管理 Chrome 扩展程序 (ls, toggle, uninstall)。",
         'help_theme': "切换终端主题 (例如 theme matrix) 或列出主题。",
         'help_jq': "处理来自管道的 JSON 数据 (例如 curl ... | jq .data)。",
-        'help_neofetch': "显示系统信息 (sysinfo 的别名)。",
+        'help_neofetch': "显示系统信息 (别名: neofetch)。",
 
         // --- Shell Commands ---
         'shUsage': "sh: 缺少文件操作数",
