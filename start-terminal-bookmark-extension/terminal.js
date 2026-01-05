@@ -5549,16 +5549,80 @@ const globalCommands = {
             return;
         }
         
-        // 2. [!!] 解析内容 [!!]
+        // 解析内容
         await parseStartrc(fileContent);
 
-        // 3. [!!] 刷新提示符 [!!]
+        // 刷新提示符
         bookmarkSystem.update_user_path();
     },
 
     '.': (args, options) => {
         // 'source' 的别名
         return globalCommands.source(args, options);
+    },
+
+    // 在 globalCommands 对象中添加：
+
+    'df': async (args, options) => {
+        const humanReadable = options.h || options.human;
+
+        // 辅助函数：格式化字节
+        const formatSize = (bytes) => {
+            if (!humanReadable) return Math.ceil(bytes / 1024); // 默认显示 1K-blocks
+            if (bytes === 0) return '0B';
+            const k = 1024;
+            const sizes = ['B', 'K', 'M', 'G'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + sizes[i];
+        };
+
+        const LOCAL_STORAGE_LIMIT = 5 * 1024 * 1024; // 5MB
+        
+        let total = LOCAL_STORAGE_LIMIT;
+        let used = 0;
+
+        // 计算已用空间 (localStorage 字符串长度近似等于字节数，UTF-16 可能会更多，但作为估算足够)
+        // 更精确的计算: new Blob([JSON.stringify(localStorage)]).size;
+        used = new Blob([JSON.stringify(localStorage)]).size; 
+
+        // 如果想保留 "系统视图"，你可以把 271G 那个作为 "/dev/disk" 显示，而把 localStorage 作为 "/"
+        // 但为了简单和诚实，我们直接显示 localStorage 的限制。
+        
+        const available = Math.max(0, total - used);
+        const percent = Math.min(100, Math.round((used / total) * 100)) + '%';
+
+        // 渲染表头
+        // 模仿 Linux df 输出格式
+        // Filesystem     Size   Used  Avail Use% Mounted on
+        const headerFilesystem = "Filesystem".padEnd(15);
+        const headerSize = (humanReadable ? "Size" : "1K-blocks").padEnd(10);
+        const headerUsed = "Used".padEnd(10);
+        const headerAvail = "Avail".padEnd(10);
+        const headerUse = "Use%".padEnd(6);
+        const headerMounted = "Mounted on";
+
+        term.writeLine(`${headerFilesystem}${headerSize}${headerUsed}${headerAvail}${headerUse}${headerMounted}`);
+
+        // 渲染数据行
+        // VFS (localStorage)
+        const fsName = "browser_root".padEnd(15);
+        const sizeStr = formatSize(total).toString().padEnd(10);
+        const usedStr = formatSize(used).toString().padEnd(10);
+        const availStr = formatSize(available).toString().padEnd(10);
+        const useStr = percent.padEnd(6);
+        const mountedStr = "/";
+
+        term.writeLine(`${fsName}${sizeStr}${usedStr}${availStr}${useStr}${mountedStr}`);
+
+        // Bookmark FS (伪造一个无限的/云端的)
+        const bmFsName = "bookmarks".padEnd(15);
+        const bmSizeStr = (humanReadable ? "Unlimited" : "0").padEnd(10); // 书签通常没有硬性字节限制
+        const bmUsedStr = "---".padEnd(10);
+        const bmAvailStr = "---".padEnd(10);
+        const bmUseStr = "-".padEnd(6);
+        const bmMountedStr = "~"; // Home
+
+        term.writeLine(`${bmFsName}${bmSizeStr}${bmUsedStr}${bmAvailStr}${bmUseStr}${bmMountedStr}`);
     },
 
     'search': (args, options) => {
