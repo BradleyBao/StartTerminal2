@@ -17,7 +17,9 @@
     "identity", 
     "storage", 
     "tabs",
-    "search"],
+    "search",
+    "tabGroups"
+  ],
   "host_permissions": [
     "https://login.microsoftonline.com/*",
     "https://graph.microsoft.com/*",

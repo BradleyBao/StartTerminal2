@@ -4446,6 +4446,160 @@ const globalCommands = {
                 }
                 break;
 
+            case 'groups':
+                if (!chrome.tabGroups) return term.writeHtml(`<span class="term-error">tabs: 'chrome.tabGroups' API not available. Check manifest.</span>`);
+                const groups = await new Promise(resolve => chrome.tabGroups.query({}, resolve));
+                if (groups.length === 0) {
+                    term.writeLine("No tab groups found.");
+                    return;
+                }
+                term.writeLine("ID        Color       Title");
+                term.writeLine("----------------------------------------");
+                groups.forEach(g => {
+                    const title = term.escapeHtml(g.title || "(No Title)");
+                    term.writeHtml(`${String(g.id).padEnd(10)}<span style="color:${g.color}">${g.color.padEnd(12)}</span>${title}`);
+                });
+                break;
+
+            case 'group':
+                if (!chrome.tabGroups) return term.writeHtml(`<span class="term-error">API not available.</span>`);
+                const tabIdsToGroup = args.slice(1).map(id => parseInt(id)).filter(id => !isNaN(id));
+                if (tabIdsToGroup.length === 0) return term.writeHtml(`<span class="term-error">Usage: tabs group &lt;tabId1&gt; [tabId2...]</span>`);
+                
+                try {
+                    const newGroupId = await new Promise((resolve, reject) => {
+                        chrome.tabs.group({ tabIds: tabIdsToGroup }, (id) => {
+                            if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+                            else resolve(id);
+                        });
+                    });
+                    term.writeLine(`Successfully grouped tabs into new Group ID: ${newGroupId}`);
+                } catch(e) { term.writeHtml(`<span class="term-error">Error: ${e.message}</span>`); }
+                break;
+
+            case 'group-add':
+                if (!chrome.tabGroups) return term.writeHtml(`<span class="term-error">API not available.</span>`);
+                const targetGroupId = parseInt(args[1]);
+                const tabsToAdd = args.slice(2).map(id => parseInt(id)).filter(id => !isNaN(id));
+                if (isNaN(targetGroupId) || tabsToAdd.length === 0) {
+                    return term.writeHtml(`<span class="term-error">Usage: tabs group-add &lt;groupId&gt; &lt;tabId1&gt; [tabId2...]</span>`);
+                }
+                try {
+                    await new Promise((resolve, reject) => {
+                        chrome.tabs.group({ groupId: targetGroupId, tabIds: tabsToAdd }, () => {
+                            if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+                            else resolve();
+                        });
+                    });
+                    term.writeLine(`Added tabs to Group ID: ${targetGroupId}`);
+                } catch(e) { term.writeHtml(`<span class="term-error">Error: ${e.message}</span>`); }
+                break;
+
+            case 'ungroup':
+                if (!chrome.tabGroups) return term.writeHtml(`<span class="term-error">API not available.</span>`);
+                const tabsToUngroup = args.slice(1).map(id => parseInt(id)).filter(id => !isNaN(id));
+                if (tabsToUngroup.length === 0) return term.writeHtml(`<span class="term-error">Usage: tabs ungroup &lt;tabId1&gt; [tabId2...]</span>`);
+                try {
+                    await new Promise((resolve, reject) => {
+                        chrome.tabs.ungroup(tabsToUngroup, () => {
+                            if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+                            else resolve();
+                        });
+                    });
+                    term.writeLine(`Successfully ungrouped tabs.`);
+                } catch(e) { term.writeHtml(`<span class="term-error">Error: ${e.message}</span>`); }
+                break;
+
+            case 'group-title':
+                if (!chrome.tabGroups) return term.writeHtml(`<span class="term-error">API not available.</span>`);
+                const titleGroupId = parseInt(args[1]);
+                const newTitle = args.slice(2).join(' ');
+                if (isNaN(titleGroupId) || !newTitle) {
+                    return term.writeHtml(`<span class="term-error">Usage: tabs group-title &lt;groupId&gt; &lt;new title...&gt;</span>`);
+                }
+                try {
+                    await new Promise((resolve, reject) => {
+                        chrome.tabGroups.update(titleGroupId, { title: newTitle }, () => {
+                            if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+                            else resolve();
+                        });
+                    });
+                    term.writeLine(`Group ${titleGroupId} title updated to '${term.escapeHtml(newTitle)}'.`);
+                } catch(e) { term.writeHtml(`<span class="term-error">Error: ${e.message}</span>`); }
+                break;
+
+            case 'group-color':
+                if (!chrome.tabGroups) return term.writeHtml(`<span class="term-error">API not available.</span>`);
+                const colorGroupId = parseInt(args[1]);
+                const newColor = args[2];
+                const validColors = ["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"];
+                if (isNaN(colorGroupId) || !validColors.includes(newColor)) {
+                    return term.writeHtml(`<span class="term-error">Usage: tabs group-color &lt;groupId&gt; &lt;${validColors.join('|')}&gt;</span>`);
+                }
+                try {
+                    await new Promise((resolve, reject) => {
+                        chrome.tabGroups.update(colorGroupId, { color: newColor }, () => {
+                            if (chrome.runtime.lastError) reject(chrome.runtime.lastError);
+                            else resolve();
+                        });
+                    });
+                    term.writeLine(`Group ${colorGroupId} color updated to ${newColor}.`);
+                } catch(e) { term.writeHtml(`<span class="term-error">Error: ${e.message}</span>`); }
+                break
+
+            case 'save-group':
+                const sgId = parseInt(args[1]);
+                const sgName = args[2];
+                if (isNaN(sgId) || !sgName) {
+                    return term.writeHtml(`<span class="term-error">Usage: tabs save-group &lt;groupId&gt; &lt;name&gt;</span>`);
+                }
+                
+                const tabsInGroup = await new Promise(resolve => chrome.tabs.query({ groupId: sgId }, resolve));
+                if (tabsInGroup.length === 0) {
+                    return term.writeLine("No tabs found in that group.");
+                }
+                
+                // 过滤掉 Chrome 内部安全页面（无法被扩展自动重新创建）
+                const urlsToSave = tabsInGroup.map(t => t.url).filter(u => u && !u.startsWith('chrome://'));
+                let savedGroupsDB = JSON.parse(localStorage.getItem('st2_saved_groups') || '{}');
+                savedGroupsDB[sgName] = urlsToSave;
+                localStorage.setItem('st2_saved_groups', JSON.stringify(savedGroupsDB));
+                
+                term.writeLine(`Saved ${urlsToSave.length} tabs to local session '${term.escapeHtml(sgName)}'.`);
+                break;
+
+            case 'saved':
+                const db = JSON.parse(localStorage.getItem('st2_saved_groups') || '{}');
+                const keys = Object.keys(db);
+                if (keys.length === 0) return term.writeLine("No saved groups in ST2.0 local storage.");
+                term.writeLine("ST2.0 Local Saved Groups:");
+                keys.forEach(k => term.writeLine(`  ${term.escapeHtml(k)} (${db[k].length} tabs)`));
+                break;
+
+            case 'load-group':
+                const lgName = args[1];
+                if (!lgName) return term.writeHtml(`<span class="term-error">Usage: tabs load-group &lt;name&gt;</span>`);
+                
+                const lgDB = JSON.parse(localStorage.getItem('st2_saved_groups') || '{}');
+                const targetUrls = lgDB[lgName];
+                if (!targetUrls) return term.writeHtml(`<span class="term-error">Saved group '${term.escapeHtml(lgName)}' not found.</span>`);
+                
+                term.writeLine(`Loading ${targetUrls.length} tabs...`);
+                const newIds = [];
+                // 逐个创建静默 Tab
+                for (const u of targetUrls) {
+                    const t = await new Promise(resolve => chrome.tabs.create({ url: u, active: false }, resolve));
+                    if (t && t.id) newIds.push(t.id);
+                }
+                
+                // 自动放入一个新原生 Tab Group 并恢复名字
+                if (chrome.tabGroups && newIds.length > 0) {
+                     const gid = await new Promise(resolve => chrome.tabs.group({ tabIds: newIds }, resolve));
+                     await new Promise(resolve => chrome.tabGroups.update(gid, { title: lgName }, resolve));
+                     term.writeLine(`Successfully restored and grouped under '${term.escapeHtml(lgName)}'.`);
+                }
+                break;
+
             default:
                 term.writeHtml(`<span class="term-error">Unknown command: 'tabs ${subCommand}'. Try 'tabs ls'.</span>`);
         }
@@ -6159,7 +6313,7 @@ function getAllCommandNames() {
  */
 const subCommandCompletions = {
     'downloads': ['ls', 'open'],
-    'tabs': ['ls', 'switch', 'close'],
+    'tabs': ['ls', 'switch', 'close', 'groups', 'group', 'group-add', 'ungroup', 'group-title', 'group-color', 'save-group', 'saved', 'load-group'],
     'apt': ['update', 'list', 'install', 'remove', 'upgrade'],
     'style': ['font', 'size', 'bg', 'fg', 'accent', 'cursor', 'wall', 'opacity', 'reset'],
     'ext': ['ls', 'toggle', 'enable', 'disable', 'uninstall'],
