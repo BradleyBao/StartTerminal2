@@ -208,12 +208,11 @@ function getVisualLength(str) {
 
 function escapePath(str) {
     // 只转义空格，因为这是 parseSingleCommand (L1740) 所关心的
-    return str.replace(/ /g, '\\ ');
+    return str.replace(/([ \\|;"'<>])/g, '\\$1');
 }
 
 function unescapePath(str) {
-    // (这个简单的版本只处理转义的空格)
-    return str.replace(/\\ /g, ' '); 
+    return str.replace(/\\(.)/g, '$1');
 }
 
 /**
@@ -748,7 +747,7 @@ class Terminal {
             // 获取新值 (URL 或 Title)
             let newValue = item.value || item.title;
             // 如果是路径且包含空格，转义之；如果是 URL (通常无空格)，不转义或根据需要转义
-            if (newValue.includes(' ')) newValue = this.escapePath(newValue);
+            newValue = this.escapePath(newValue);
 
             // 拼接： 原文本前半部分 + 补全前缀 + 新值
             const prefix = this.tabMenu.completionPrefix || "";
@@ -1253,7 +1252,7 @@ class Terminal {
     }
 
     parseLine(line) {
-        const commandStrings = line.split(';').map(cmd => cmd.trim()).filter(cmd => cmd.length > 0);
+        const commandStrings = splitByUnquotedChar(line, ';').map(cmd => cmd.trim()).filter(cmd => cmd.length > 0);
         const parsedCommands = [];
 
         for (const commandStr of commandStrings) {
@@ -1271,7 +1270,7 @@ class Terminal {
     } 
 
     parseSingleCommand(commandStr) {
-        const tokens = commandStr.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g);
+        const tokens = tokenizeCommand(commandStr);
 
         if (!tokens || tokens.length === 0) {
             return null; // Empty or invalid command string
@@ -1282,34 +1281,24 @@ class Terminal {
         const options = {};
 
         for (let i = 1; i < tokens.length; i++) {
-            let token = tokens[i];
+            const token = tokens[i];
 
-            // Handle quoted arguments - remove the quotes
-            if ((token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'"))) {
-                token = token.slice(1, -1);
-                args.push(token); // Quoted strings are always arguments
-                continue;
-            }
-
-            // Handle options
             if (token.startsWith('--')) { // Long option (e.g., --all)
                 const optName = token.substring(2);
                 if (optName) {
-                    options[optName] = true; 
+                    options[optName] = true;
                 }
             } else if (token.startsWith('-')) { // Short option(s) (e.g., -a, -l, -al)
                 const optString = token.substring(1);
                 if (optString.length > 0) {
                     for (const char of optString) {
-                        options[char] = true; // Set each char as an option
+                        options[char] = true;
                     }
                 }
             } else {
-                // It's an argument
                 args.push(token);
             }
         }
-        
 
         return { command: commandName, args: args, options: options };
     }
@@ -3465,7 +3454,7 @@ async function handleTabCompletion(line, pos) {
         if (term.tabMenu.selected === 0) {
              const item = matches[0];
              let newValue = item.value || item.title;
-             if (newValue.includes(' ')) newValue = term.escapePath(newValue);
+             newValue = term.escapePath(newValue);
              const prefix = term.tabMenu.completionPrefix || "";
              const newLine = line.substring(0, tokenStartIndex) + prefix + newValue;
              term.currentLine = newLine;
@@ -3482,7 +3471,7 @@ async function handleTabCompletion(line, pos) {
         let completion = isCompletingSearch ? matchValue : (completionPrefix + matchValue);
         let trailingChar = ' ';
         if (match.children) { completion += '/'; trailingChar = ''; }
-        if (completion.includes(' ')) completion = escapePath(completion);
+        completion = escapePath(completion);
         
         const textBeforeToken = line.substring(0, tokenStartIndex);
         const textAfterCursor = line.substring(pos);
@@ -3500,7 +3489,7 @@ async function handleTabCompletion(line, pos) {
     if (!isCompletingSearch && lcp.length > partial.length) {
         lastTabMatches = [];
         let completion = completionPrefix + lcp;
-        if (completion.includes(' ')) completion = escapePath(completion);
+        completion = escapePath(completion);
         const newLine = line.substring(0, tokenStartIndex) + completion + line.substring(pos);
         term.setCommand(newLine, (line.substring(0, tokenStartIndex) + completion).length);
     } else {
@@ -6118,7 +6107,7 @@ const globalCommands = {
 
 
 function parseLine(line) {
-    const commandStrings = line.split(';').map(cmd => cmd.trim()).filter(cmd => cmd.length > 0);
+    const commandStrings = splitByUnquotedChar(line, ';').map(cmd => cmd.trim()).filter(cmd => cmd.length > 0);
     const parsedCommands = [];
     for (const commandStr of commandStrings) {
         const parsed = parseSingleCommand(commandStr);
@@ -6129,31 +6118,23 @@ function parseLine(line) {
 }
 
 function parseSingleCommand(commandStr) {
-    const tokens = commandStr.match(/(?:"[^"]*"|'[^']*'|(?:\\ |[^\s"'])+)/g);
+    const tokens = tokenizeCommand(commandStr);
     if (!tokens || tokens.length === 0) { return null; }
     const commandName = tokens[0];
     const args = [];
     const options = {};
     for (let i = 1; i < tokens.length; i++) {
-        let token = tokens[i]; //
-
-        // 让 'executeLine' 来处理引号和扩展
-        if ((token.startsWith('"') && token.endsWith('"')) || (token.startsWith("'") && token.endsWith("'"))) {
-            args.push(token); // (例如 "Hello $USER")
-            continue;
-        }
-
-        // 处理选项
-        if (token.startsWith('--')) { //
+        const token = tokens[i];
+        if (token.startsWith('--')) {
             const optName = token.substring(2);
-            if (optName) { options[optName] = true; } //
-        } else if (token.startsWith('-')) { //
+            if (optName) { options[optName] = true; }
+        } else if (token.startsWith('-')) {
             const optString = token.substring(1);
             if (optString.length > 0) {
-                for (const char of optString) { options[char] = true; } //
+                for (const char of optString) { options[char] = true; }
             }
         } else {
-            args.push(token); 
+            args.push(token);
         }
     }
     return { command: commandName, args: args, options: options };
@@ -6267,6 +6248,174 @@ async function updateSystemVersion() {
  * 3. 顺序执行: cmd1; cmd2
  * 4. 管道流: cmd1 | cmd2
  */
+function splitByUnquotedChar(str, delimiter) {
+    const parts = [];
+    let current = '';
+    let inSingleQuote = false;
+    let inDoubleQuote = false;
+    let escapeNext = false;
+
+    for (let i = 0; i < str.length; i++) {
+        const ch = str[i];
+
+        if (escapeNext) {
+            current += ch;
+            escapeNext = false;
+            continue;
+        }
+
+        if (ch === '\\') {
+            escapeNext = true;
+            continue;
+        }
+
+        if (ch === '"' && !inSingleQuote) {
+            inDoubleQuote = !inDoubleQuote;
+            current += ch;
+            continue;
+        }
+
+        if (ch === '\'' && !inDoubleQuote) {
+            inSingleQuote = !inSingleQuote;
+            current += ch;
+            continue;
+        }
+
+        if (ch === delimiter && !inSingleQuote && !inDoubleQuote) {
+            parts.push(current);
+            current = '';
+            continue;
+        }
+
+        current += ch;
+    }
+
+    parts.push(current);
+    return parts;
+}
+
+/**
+ * 智能分割命令行字符串
+ * 忽略引号内（' 和 "）以及被转义（\）的分隔符
+ */
+function splitSmart(str, delimiter) {
+    const result = [];
+    let current = '';
+    let inSingleQuote = false;
+    let inDoubleQuote = false;
+    let isEscaped = false;
+
+    for (let i = 0; i < str.length; i++) {
+        const char = str[i];
+
+        if (isEscaped) {
+            // 如果前一个字符是 \，当前字符直接并入，不作为分隔符处理
+            current += char;
+            isEscaped = false;
+            continue;
+        }
+
+        if (char === '\\') {
+            isEscaped = true;
+            current += char; // 保留 \，交由后续 unescapePath 处理
+            continue;
+        }
+
+        // 处理引号状态翻转
+        if (char === "'" && !inDoubleQuote) {
+            inSingleQuote = !inSingleQuote;
+        } else if (char === '"' && !inSingleQuote) {
+            inDoubleQuote = !inDoubleQuote;
+        }
+
+        // 仅在不在引号内且遇到目标分隔符时进行切割
+        if (char === delimiter && !inSingleQuote && !inDoubleQuote) {
+            result.push(current.trim());
+            current = '';
+        } else {
+            current += char;
+        }
+    }
+    
+    if (current.trim()) {
+        result.push(current.trim());
+    }
+    
+    // 过滤掉空字符串
+    return result.filter(cmd => cmd.length > 0);
+}
+
+function tokenizeCommand(commandStr) {
+    const parts = [];
+    let current = '';
+    let inSingleQuote = false;
+    let inDoubleQuote = false;
+    let escaping = false;
+
+    const decodeEscape = (ch) => {
+        switch (ch) {
+            case 'n': return '\n';
+            case 'r': return '\r';
+            case 't': return '\t';
+            case 'b': return '\b';
+            case 'f': return '\f';
+            case 'v': return '\v';
+            case '\\': return '\\';
+            case '"': return '"';
+            case "'": return "'";
+            case ' ': return ' ';
+            case '|': return '|';
+            case ';': return ';';
+            default: return ch;
+        }
+    };
+
+    const pushToken = () => {
+        if (current.length > 0) {
+            parts.push(current);
+            current = '';
+        }
+    };
+
+    for (let i = 0; i < commandStr.length; i++) {
+        const ch = commandStr[i];
+
+        if (escaping) {
+            current += decodeEscape(ch);
+            escaping = false;
+            continue;
+        }
+
+        if (ch === '\\') {
+            escaping = true;
+            continue;
+        }
+
+        if (ch === '"' && !inSingleQuote) {
+            inDoubleQuote = !inDoubleQuote;
+            continue;
+        }
+
+        if (ch === "'" && !inDoubleQuote) {
+            inSingleQuote = !inSingleQuote;
+            continue;
+        }
+
+        if (/\s/.test(ch) && !inSingleQuote && !inDoubleQuote) {
+            pushToken();
+            continue;
+        }
+
+        current += ch;
+    }
+
+    if (escaping) {
+        current += '\\';
+    }
+    pushToken();
+    return parts;
+}
+
 async function executeLine(line) {
     if (executeNestLevel > 10) return;
     awaiting();
@@ -6290,18 +6439,16 @@ async function executeLine(line) {
     }
     
     // --- 2. 顺序执行 ; (保持不变) ---
-    const sequentialCommands = processedLine.replace(/\n/g, ';')
-                                   .split(';')
-                                   .map(cmd => cmd.trim())
-                                   .filter(cmd => cmd.length > 0 && !cmd.startsWith('#'));
+    const processedLineForSeq = processedLine.replace(/\n/g, ';');
+    const sequentialCommands = splitSmart(processedLineForSeq, ';')
+                                   .filter(cmd => !cmd.startsWith('#'));
 
     let finalResult = null;
 
     for (const commandSequence of sequentialCommands) {
         
-        // --- 3. 管道 | (保持不变) ---
-        const pipelineStrings = commandSequence.split('|').map(cmd => cmd.trim()).filter(cmd => cmd.length > 0);
-        
+        // --- 3. 管道 | (使用智能分割) ---
+        const pipelineStrings = splitSmart(commandSequence, '|');
         let lastOutput = null; 
 
         for (let i = 0; i < pipelineStrings.length; i++) {
