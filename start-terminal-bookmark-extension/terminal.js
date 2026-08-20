@@ -182,6 +182,9 @@ function t(key) {
     return messages['en'][key] || key;
 }
 
+// 判断字符串中是否包含"宽字符"（与 getVisualLength 使用同一套 Unicode 范围）
+const WIDE_CHAR_REGEX = /[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7af\uf900-\ufaff\ufe10-\ufe19\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]/;
+
 function getVisualLength(str) {
     let length = 0;
     for (let i = 0; i < str.length; i++) {
@@ -1310,6 +1313,29 @@ class Terminal {
         return doc.body.textContent || "";
     }
 
+    // 测量一段纯文本在当前字体下的真实像素宽度。
+    // getVisualLength() 假定宽字符恰好是 2 * cellWidth，但宽字符走的是系统回退字体
+    // （因为字体栈里没有 CJK 字体），实际宽度与该假定并不一致，需要用真实渲染宽度替代。
+    _measureLineWidth(text) {
+        // _render() 会整体重写 domBuffer.innerHTML，这会把之前缓存的测量用 span 从
+        // 文档中摘掉（引用还在，但已不在文档树里，getBoundingClientRect 会返回 0），
+        // 所以每次使用前都要确认它仍连接在文档中，否则重新创建并挂载。
+        if (!this._measureSpan || !this._measureSpan.isConnected) {
+            const bufferStyle = window.getComputedStyle(this.domBuffer);
+            const span = document.createElement('span');
+            span.style.position = 'absolute';
+            span.style.visibility = 'hidden';
+            span.style.whiteSpace = 'pre';
+            span.style.fontFamily = bufferStyle.fontFamily;
+            span.style.fontSize = bufferStyle.fontSize;
+            span.style.lineHeight = bufferStyle.lineHeight;
+            this.domBuffer.appendChild(span);
+            this._measureSpan = span;
+        }
+        this._measureSpan.textContent = text;
+        return this._measureSpan.getBoundingClientRect().width;
+    }
+
     _overwriteHtml(originalLine, atIndex, newHtmlFragment) {
         // Calculate the visible length of the fragment to insert
         const fragmentVisibleLength = this._stripHtml(newHtmlFragment).length;
@@ -1786,37 +1812,60 @@ class Terminal {
         }
         
         // 4. [核心修复] 智能调整每行宽度
+        const containerWidth = this.container.clientWidth;
         this.buffer = this.buffer.map(line => {
             // A. 获取去除 HTML 标签后的纯文本
             const plainText = this._stripHtml(line);
-            
+
             // B. 获取去除尾部空格后的“实际内容”
             //    (用于判断这些内容是否真的比新窗口宽)
             const trimmedPlainText = plainText.trimEnd();
-            const contentLen = getVisualLength(trimmedPlainText);
-            
-            if (contentLen > newCols) {
-                // [情况 1]: 实际内容（不含空格）比新窗口还宽
-                // 必须截断。为了防止切断 HTML 标签导致渲染崩溃，只能忍痛剥离颜色。
-                // 这是唯一会丢失颜色的情况（通常只在窗口缩得非常小时发生）。
-                return this.escapeHtml(plainText.substring(0, newCols)); 
-                
+
+            // 含宽字符（CJK 等）的行走真实像素测量，因为宽字符渲染用的是系统回退字体，
+            // 其实际宽度并不严格等于 2 * cellWidth；纯 ASCII 行沿用原来的按字符数计算（更快，且已验证正确）。
+            if (!WIDE_CHAR_REGEX.test(trimmedPlainText)) {
+                const contentLen = getVisualLength(trimmedPlainText);
+
+                if (contentLen > newCols) {
+                    // [情况 1]: 实际内容（不含空格）比新窗口还宽
+                    // 必须截断。为了防止切断 HTML 标签导致渲染崩溃，只能忍痛剥离颜色。
+                    // 这是唯一会丢失颜色的情况（通常只在窗口缩得非常小时发生）。
+                    return this.escapeHtml(plainText.substring(0, newCols));
+
+                } else {
+                    // [情况 2]: 实际内容能放得下 (即使之前有很长的填充空格)
+                    // 这是一个能够保留颜色的安全操作。
+
+                    // 1. 移除旧的 HTML 字符串末尾的空格
+                    //    (注意：这可能会移除一部分带有背景色的空格，但在 Resize 场景下通常是可以接受的)
+                    const trimmedLine = line.trimEnd();
+
+                    // 2. 计算剩余部分的视觉长度
+                    //    (注意：必须重新 stripHtml 计算，因为 trimEnd 后长度变了)
+                    const currentVisualLen = getVisualLength(this._stripHtml(trimmedLine));
+
+                    // 3. 计算需要补多少空格才能填满新窗口
+                    const paddingNeeded = Math.max(0, newCols - currentVisualLen);
+
+                    // 4. 返回：原始带色内容 + 新的填充空格
+                    return trimmedLine + ' '.repeat(paddingNeeded);
+                }
+            }
+
+            // [宽字符慢路径] 用真实像素宽度替代 getVisualLength() 的估算
+            const contentWidthPx = this._measureLineWidth(trimmedPlainText);
+
+            if (contentWidthPx > containerWidth) {
+                // 逐字符收缩直到真实宽度能放进容器（行数很少，且仅宽字符行才会走到这里）
+                let truncated = trimmedPlainText;
+                while (truncated.length > 0 && this._measureLineWidth(truncated) > containerWidth) {
+                    truncated = truncated.substring(0, truncated.length - 1);
+                }
+                return this.escapeHtml(truncated);
             } else {
-                // [情况 2]: 实际内容能放得下 (即使之前有很长的填充空格)
-                // 这是一个能够保留颜色的安全操作。
-                
-                // 1. 移除旧的 HTML 字符串末尾的空格
-                //    (注意：这可能会移除一部分带有背景色的空格，但在 Resize 场景下通常是可以接受的)
                 const trimmedLine = line.trimEnd();
-                
-                // 2. 计算剩余部分的视觉长度
-                //    (注意：必须重新 stripHtml 计算，因为 trimEnd 后长度变了)
-                const currentVisualLen = getVisualLength(this._stripHtml(trimmedLine));
-                
-                // 3. 计算需要补多少空格才能填满新窗口
-                const paddingNeeded = Math.max(0, newCols - currentVisualLen);
-                
-                // 4. 返回：原始带色内容 + 新的填充空格
+                const paddingPx = Math.max(0, containerWidth - contentWidthPx);
+                const paddingNeeded = Math.round(paddingPx / this.cellWidth);
                 return trimmedLine + ' '.repeat(paddingNeeded);
             }
         });
