@@ -13,6 +13,8 @@ const Resources = {
         repo: "https://raw.githubusercontent.com/BradleyBao/StartTerminal2/main/start-terminal-bookmark-extension/repo/",
         // 更新 API (PocketBase)
         api_updates: "https://api.tianyibrad.com/api/collections/ST2_0/records?sort=-created&perPage=1",
+        // Cross-application service broadcasts
+        api_broadcasts: "https://api.tianyibrad.com/api/collections/Service_Broadcast/records?sort=-created&perPage=100",
         // 支持/官网
         support: "https://www.tianyibrad.com",
         // 扩展管理页面

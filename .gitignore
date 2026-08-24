@@ -1,3 +1,5 @@
 *.code-workspace
 .claude
 *.zip
+/docs/
+TODO.md
