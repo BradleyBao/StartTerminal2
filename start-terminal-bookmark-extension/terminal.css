@@ -6,10 +6,18 @@
     --terminal-font-family: 'Fira Code', 'Consolas', 'Courier New', monospace;
     --terminal-font-size: 14px;
     --terminal-accent: #4CAF50;
+    --announcement-info: #26c6da;
+    --announcement-warning: #f1c40f;
+    --announcement-maintenance: #bd93f9;
+    --announcement-danger: #ff5555;
     --terminal-background-color: #1e1e1e;
     --terminal-foreground-color: #d4d4d4;
     --terminal-selection-background: #d4d4d4;
     --terminal-selection-foreground: #1e1e1e;
+
+    /* 标准输出/标准错误颜色：默认跟随前景色/沿用原有错误红，可被 .startrc 或 style 命令单独覆盖 */
+    --terminal-stdout-color: var(--terminal-foreground-color);
+    --terminal-stderr-color: #ff5555;
 
     /* 壁纸 */
     --terminal-background-image: none;
@@ -33,28 +41,25 @@ html {
     z-index: 0;
 }
 
-html::before {
-    content: "";
+#terminal-wallpaper {
     position: fixed; /* 保证铺满全屏 */
     top: 0;
     left: 0;
     width: 100%;
     height: 100%;
     z-index: -1; /* 放在最底层，但在 body 的背景色之下 */
-    
-    /* 壁纸设置 */
-    background-image: var(--terminal-background-image);
-    background-size: cover;
-    background-position: center;
-    background-repeat: no-repeat;
-    
+
+    /* 壁纸设置：真实 <img> + object-fit，避免 background-size: cover 的合成模糊 */
+    object-fit: cover;
+    object-position: center;
+
     /* 核心：透明度控制 */
     opacity: var(--bg-load-opacity);
-    
+
     /* 核心：过渡动画 - 0.7秒渐变，你可以随喜好调整 */
     transition: opacity 0.7s ease-in-out;
-    
-    /* 避免点击事件穿透问题 (虽然 z-index -1 通常没事) */
+
+    /* 避免点击事件穿透问题 */
     pointer-events: none;
 }
 
@@ -123,8 +128,12 @@ html, body::selection {
 }
 
 .term-error {
-    color: #ff5555; /* 经典红色报错 */
+    color: var(--terminal-stderr-color, #ff5555);
     font-weight: bold;
+}
+
+.term-input-line {
+    color: var(--terminal-foreground-color, #d4d4d4) !important;
 }
 
 .term-cursor {

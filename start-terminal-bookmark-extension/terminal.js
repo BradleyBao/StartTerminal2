@@ -49,15 +49,17 @@ const Environment = {
  */
 function setWallpaper(url) {
     const root = document.documentElement;
+    const wallpaperEl = document.getElementById('terminal-wallpaper');
 
     // 情况 1: 清除壁纸
     if (!url || url === 'none') {
         // 先淡出
         root.style.setProperty('--bg-load-opacity', '0');
-        
+
         // 等待动画结束后真正移除图片 (与 CSS transition 时间匹配)
         setTimeout(() => {
             root.style.setProperty('--terminal-background-image', 'none');
+            if (wallpaperEl) wallpaperEl.removeAttribute('src');
         }, 700);
         return;
     }
@@ -69,17 +71,20 @@ function setWallpaper(url) {
     root.style.setProperty('--bg-load-opacity', '0');
 
     // 2. JS 预加载图片
-    const img = new Image();
-    img.src = url;
+    const preloadImg = new Image();
+    preloadImg.src = url;
 
-    img.onload = () => {
+    preloadImg.onload = () => {
         // 图片加载完毕！
-        
-        // A. 切换 CSS 变量中的图片 URL
+
+        // A. 切换 CSS 变量中的图片 URL（供 style/loadStyleSettings 持久化读取）
         root.style.setProperty('--terminal-background-image', `url('${url}')`);
-        
+
+        // A2. 用真实的 <img> 元素渲染壁纸（object-fit: cover 避免了 background-size: cover 的模糊问题）
+        if (wallpaperEl) wallpaperEl.src = url;
+
         // B. 强制浏览器重绘 (可选，防止 CSS 变量更新延迟)
-        // void root.offsetWidth; 
+        // void root.offsetWidth;
 
         // C. 开始淡入 (将透明度设为 1)
         // 使用 requestAnimationFrame 确保 CSS 更新已被应用，从而触发 transition
@@ -88,7 +93,7 @@ function setWallpaper(url) {
         });
     };
 
-    img.onerror = () => {
+    preloadImg.onerror = () => {
         term.writeError(`Failed to load wallpaper: ${url}`);
         // 加载失败，保持 0 或恢复旧的? 这里我们保持黑屏或保持原样
     };
@@ -978,9 +983,12 @@ class Terminal {
                 const charAtCursor = paddedLine[this.cursorX] || ' '; 
                 
                 // 替换光标位置的字符，而不是在行尾添加
-                line = this.escapeHtml(paddedLine.substring(0, this.cursorX)) +
+                // Keep the editable prompt line independent from preceding styled output.
+                // Without an explicit foreground reset, a colored announcement can leak into
+                // the prompt when the buffer is re-rendered.
+                line = `<span class="term-input-line">${this.escapeHtml(paddedLine.substring(0, this.cursorX))}` +
                         `<span class="term-cursor">${this.escapeHtml(charAtCursor)}</span>` +
-                        this.escapeHtml(paddedLine.substring(this.cursorX + 1));
+                        `${this.escapeHtml(paddedLine.substring(this.cursorX + 1))}</span>`;
                         
                 html += line + '\n';
             
@@ -1092,7 +1100,7 @@ class Terminal {
         
         // 如果光标超出了当前缓冲区长度，添加新行
         if (this.cursorY >= this.buffer.length) {
-            this.buffer.push(' ');
+            this.buffer.push(' '.repeat(this.cols));
         }
         
         this.cursorX = 0;
@@ -1175,7 +1183,9 @@ class Terminal {
                 pipeBuffer.push(String(text));
             } else {
                 this._prepareOutput();
-                this.writeHtml(this.escapeHtml(String(text)));
+                // 用 --terminal-stdout-color 包裹纯文本输出；未设置时回退到继承色 (与之前行为一致)。
+                // 命令自己输出的带色 HTML (走 writeHtml) 不受影响：子元素的显式颜色总是覆盖祖先的继承色。
+                this.writeHtml(`<span style="color: var(--terminal-stdout-color, inherit);">${this.escapeHtml(String(text))}</span>`);
             }
         }
     }
@@ -1206,6 +1216,7 @@ class Terminal {
                 this.buffer[this.cursorY] = this._overwriteHtml(this.buffer[this.cursorY], this.cursorX, l);
                 this._handleNewline();
             }
+            this._restoreCursorAfterOutput();
             this._render();
         }
     }
@@ -1229,6 +1240,20 @@ class Terminal {
             this._handleNewline();
             this.cursorX = 0;
         }
+    }
+
+    /**
+     * 异步/带外输出（writeError、writeHtml）结束后，把光标恢复到当前 prompt+输入内容之后，
+     * 避免正常同步执行路径之外（例如 setWallpaper 的 img.onerror）触发的输出把光标留在行首。
+     *
+     * 注意：命令执行期间 (inputDisabled === true) 不能在这里改动 cursorX ——
+     * this.currentLine 此时仍是刚执行完的旧命令文本（要等 done() -> setPrompt() 才会清空），
+     * 强行按它计算 cursorX 会让下一次 _prepareOutput() 误判"当前行有内容"，
+     * 从而在同一条命令的多行输出之间插入多余的空行。
+     */
+    _restoreCursorAfterOutput() {
+        if (this.inputDisabled) return;
+        this.cursorX = this.prompt.length + this.currentLine.length;
     }
 
     /**
@@ -1485,6 +1510,7 @@ class Terminal {
             }
         }
         this._handleNewline(); // 默认在每次打印后换行
+        this._restoreCursorAfterOutput();
         this._render();
     }
 
@@ -1578,28 +1604,41 @@ class Terminal {
                         const selection = window.getSelection();
                         const selectedText = selection.toString();
                         if (selectedText) {
-                            navigator.clipboard.writeText(selectedText);
+                            navigator.clipboard.writeText(selectedText).catch(err => {
+                                this._reportClipboardError('Copy', err);
+                            });
                         }
                         // 不中断，也不清除选区
                         // 复制完成后，强制聚焦回输入框，以便用户可以立即打字
                         this.focus();
                     } else {
                         // --- 这是 Ctrl+C (中断) ---
-                        e.preventDefault(); 
-                        
+                        e.preventDefault();
+
                         const lineContent = this.prompt + this.currentLine;
-                        const lineWithMarker = lineContent + '^C'; 
+                        const lineWithMarker = lineContent + '^C';
                         const escapedLine = this.escapeHtml(lineWithMarker);
                         const padding = ' '.repeat(Math.max(0, this.cols - lineWithMarker.length));
                         this.buffer[this.cursorY] = escapedLine + padding;
                         this._handleNewline();
-                        this.currentLine = ''; 
+                        this.currentLine = '';
                         bookmarkSystem.update_user_path();
                         this.enableInput();
                     }
                     break;
 
-                case 'arrowleft': 
+                case 'v':
+                    if (e.shiftKey) {
+                        // --- 这是 Ctrl+Shift+V (现代终端惯例的粘贴快捷键) ---
+                        e.preventDefault();
+                        this._pasteFromSystemClipboard();
+                    } else {
+                        // --- 普通 Ctrl+V：交给浏览器原生粘贴写入隐藏 textarea，触发 input 事件 ---
+                        handled = false;
+                    }
+                    break;
+
+                case 'arrowleft':
                     {
                         const line = this.currentLine;
                         let i = this.cursorX - this.prompt.length - 1; // start from char before cursor
@@ -1773,23 +1812,104 @@ class Terminal {
     _handleInput(e) {
         // 如果正在输入法组合中，忽略所有 `input` 事件
         // 我们将只在 `compositionend` 事件中处理最终结果
-        if (this.isComposing) return; 
+        if (this.isComposing) return;
         if (this.isReading) {
             e.target.value = ''; // 清空 <textarea>
             return;
         }
-        if (this.inputDisabled) return; 
-        
-        // (这个逻辑现在主要用于处理粘贴)
-        const text = e.target.value;
-        if (text) {
-            // const pos = this.cursorX - this.promptLength;
-            const pos = this.cursorX - this.prompt.length;
+        if (this.inputDisabled) return;
+
+        // (这个逻辑现在主要用于处理原生粘贴：浏览器已经把系统剪贴板内容写进了 <textarea>)
+        const rawText = e.target.value;
+        e.target.value = '';
+        if (!rawText) return;
+
+        this._insertPastedText(rawText.replace(/\r\n?/g, '\n'));
+    }
+
+    /**
+     * 在光标处插入一段（可能多行的）粘贴文本，供原生粘贴 (_handleInput)
+     * 和 Ctrl+Shift+V (_pasteFromSystemClipboard) 共用。
+     * @param {string} text - 已统一换行符 (\n) 的文本
+     */
+    _insertPastedText(text) {
+        if (!text) return;
+        const pos = this.cursorX - this.prompt.length;
+
+        if (!text.includes('\n')) {
+            // 单行粘贴：原有逻辑
             this.currentLine = this.currentLine.substring(0, pos) + text + this.currentLine.substring(pos);
             this.cursorX += text.length;
             this._render();
+            return;
         }
-        e.target.value = '';
+
+        // 多行粘贴：把光标处已有内容与粘贴文本合并后按行拆分，
+        // 除最后一段外的每一行都作为独立命令依次执行（类似 bash 粘贴行为），
+        // 避免整块文本被塞进单个 buffer 行导致行尾填充不完整 (white-space: pre 会真的换行)。
+        const merged = this.currentLine.substring(0, pos) + text + this.currentLine.substring(pos);
+        const segments = merged.split('\n');
+        const trailing = segments.pop();
+        this._runPastedLines(segments, trailing);
+    }
+
+    /**
+     * Ctrl+Shift+V（现代终端惯例）：主动从系统剪贴板读取并粘贴。
+     * 与原生 Ctrl+V（通过隐藏 textarea 的 input 事件）互不干扰，共用同一套插入逻辑。
+     */
+    async _pasteFromSystemClipboard() {
+        if (this.inputDisabled || this.isReading) return;
+        try {
+            const text = await navigator.clipboard.readText();
+            if (text) this._insertPastedText(text.replace(/\r\n?/g, '\n'));
+        } catch (err) {
+            this._reportClipboardError('Paste', err);
+        }
+    }
+
+    /**
+     * 剪贴板读写失败时，向终端输出一条可见的提示（而不是静默失败），
+     * 尤其是 Chrome 在用户多次忽略权限弹窗后会直接静默拒绝该权限的情况。
+     */
+    _reportClipboardError(action, err) {
+        const reason = err && err.message ? err.message : String(err);
+        this.writeError(`${action} failed: clipboard access is blocked (${reason})`);
+        this.writeLine('Click the site/tune icon next to the address bar, allow Clipboard under Site settings, then reload this page.');
+    }
+
+    /**
+     * 依次“固化”并执行粘贴内容中的每一整行（除最后一段不完整的行外），
+     * 逻辑镜像 Enter 键处理与 parseStartrc 的顺序 await 执行模式，避免与嵌套命令执行计数器竞争。
+     */
+    async _runPastedLines(lines, trailing) {
+        for (const line of lines) {
+            this.currentLine = line;
+            this.cursorX = this.prompt.length + line.length;
+
+            if (line.trim().length > 0 && line !== this.history[this.history.length - 1]) {
+                this.history.push(line);
+                if (this.history.length > 500) {
+                    this.history.shift();
+                }
+                localStorage.setItem('st2_cmd_history', JSON.stringify(this.history));
+            }
+            this.historyIndex = this.history.length;
+            this.tempLine = "";
+
+            const fullLineText = this.prompt + this.currentLine;
+            const escapedLine = this.escapeHtml(fullLineText);
+            const padding = ' '.repeat(Math.max(0, this.cols - fullLineText.length));
+            this.buffer[this.cursorY] = escapedLine + padding;
+
+            this._handleNewline();
+
+            if (this.onCommand) {
+                await this.onCommand(line);
+            }
+        }
+        this.currentLine = trailing;
+        this.cursorX = this.prompt.length + trailing.length;
+        this._render();
     }
 
     /**
@@ -1892,6 +2012,23 @@ class Terminal {
 // =          NANO EDITOR
 // ===============================================
 
+// 供 NanoEditor 与 VimEditor 共享的内部剪贴板，使得 Vim 里 yank 的内容可以在 Nano 里粘贴，反之亦然。
+let editorClipboard = null; // { type: 'char'|'line', text: string } | null
+
+/**
+ * 渲染一行文本，其中 [selStartCol, selEndCol) 区间使用选区高亮样式。
+ * 供 NanoEditor 的 Shift+方向键 选区渲染复用。
+ */
+function renderRowWithSelection(term, text, selStartCol, selEndCol) {
+    if (selStartCol == null || selEndCol == null || selEndCol <= selStartCol) {
+        return term.escapeHtml(text);
+    }
+    const before = term.escapeHtml(text.substring(0, selStartCol));
+    const mid = term.escapeHtml(text.substring(selStartCol, selEndCol));
+    const after = term.escapeHtml(text.substring(selEndCol));
+    return `${before}<span style="background-color: var(--terminal-selection-background); color: var(--terminal-selection-foreground);">${mid}</span>${after}`;
+}
+
 class NanoEditor {
     constructor(term, filePath, initialContent, onSave, onExit, isReadOnly = false) {
         this.term = term;
@@ -1908,6 +2045,7 @@ class NanoEditor {
         this.dirty = false; // 是否有未保存的修改
         this.termRows = term.rows;
         this.termCols = term.cols;
+        this.selectionAnchor = null; // Shift+方向键 选区起点 {y, x} | null
     }
 
     open() {
@@ -1949,6 +2087,86 @@ class NanoEditor {
         }
     }
 
+    // --- 选区 / 剪贴板辅助函数 ---
+
+    // 返回归一化的选区范围 {start:{y,x}, end:{y,x}}（start 总是先于 end），无选区时返回 null
+    _selectionRange() {
+        if (!this.selectionAnchor) return null;
+        const a = this.selectionAnchor;
+        const b = { y: this.cursorY, x: this.cursorX };
+        const [start, end] = (a.y < b.y || (a.y === b.y && a.x <= b.x)) ? [a, b] : [b, a];
+        if (start.y === end.y && start.x === end.x) return null; // 空选区
+        return { start, end };
+    }
+
+    // 返回给定行在选区内的 [start, end) 列范围，该行不在选区内时返回 null
+    _selectionColsForLine(lineIndex) {
+        const range = this._selectionRange();
+        if (!range) return null;
+        const { start, end } = range;
+        if (lineIndex < start.y || lineIndex > end.y) return null;
+        const line = this.lines[lineIndex] || '';
+        const colStart = (lineIndex === start.y) ? start.x : 0;
+        const colEnd = (lineIndex === end.y) ? end.x : line.length;
+        return { start: colStart, end: colEnd };
+    }
+
+    _extractSelectionText(range) {
+        const { start, end } = range;
+        if (start.y === end.y) {
+            return this.lines[start.y].substring(start.x, end.x);
+        }
+        const parts = [this.lines[start.y].substring(start.x)];
+        for (let y = start.y + 1; y < end.y; y++) {
+            parts.push(this.lines[y]);
+        }
+        parts.push(this.lines[end.y].substring(0, end.x));
+        return parts.join('\n');
+    }
+
+    _deleteSelectionRange(range) {
+        const { start, end } = range;
+        const merged = this.lines[start.y].substring(0, start.x) + this.lines[end.y].substring(end.x);
+        this.lines.splice(start.y, end.y - start.y + 1, merged);
+        this.cursorY = start.y;
+        this.cursorX = start.x;
+    }
+
+    // 在光标处插入文本（支持多行），供 Ctrl+V（系统剪贴板）与 Ctrl+U（内部剪贴板）共用
+    _pasteText(text) {
+        if (!text) return;
+        this.dirty = true;
+
+        const cleanText = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        const parts = cleanText.split('\n');
+
+        const currentLine = this.lines[this.cursorY];
+        const pre = currentLine.substring(0, this.cursorX);
+        const post = currentLine.substring(this.cursorX);
+
+        if (parts.length === 1) {
+            this.lines[this.cursorY] = pre + parts[0] + post;
+            this.cursorX += parts[0].length;
+        } else {
+            this.lines[this.cursorY] = pre + parts[0];
+
+            const middleLines = parts.slice(1, -1);
+            if (middleLines.length > 0) {
+                this.lines.splice(this.cursorY + 1, 0, ...middleLines);
+            }
+
+            const lastPart = parts[parts.length - 1];
+            const insertionIndex = this.cursorY + parts.length - 1;
+            this.lines.splice(insertionIndex, 0, lastPart + post);
+
+            this.cursorY = insertionIndex;
+            this.cursorX = lastPart.length;
+        }
+
+        this._validateCursor();
+        this._handleScrolling();
+    }
+
     // --- 核心渲染和事件 ---
 
     _render() {
@@ -1971,7 +2189,13 @@ class NanoEditor {
             }
 
             if (lineIndex < this.lines.length) {
-                this.term.buffer[y + 1] = this._padLine(this.lines[lineIndex]);
+                const rawLine = this.lines[lineIndex];
+                const sel = this._selectionColsForLine(lineIndex);
+                const html = (sel && sel.end > sel.start)
+                    ? renderRowWithSelection(this.term, rawLine, sel.start, sel.end)
+                    : this.term.escapeHtml(rawLine);
+                const padding = ' '.repeat(Math.max(0, this.termCols - rawLine.length));
+                this.term.buffer[y + 1] = html + padding;
             } else {
                 this.term.buffer[y + 1] = this._padLine("~");
             }
@@ -1979,25 +2203,38 @@ class NanoEditor {
 
         // 3. 绘制底栏
         const saveText = this.isReadOnly ? "" : "  ^O Save";
-        this.term.buffer[this.termRows - 2] = this._padLine(`^X Exit${saveText}`, true);
+        const clipHint = "  ^K Cut  ^Shift+K Copy  ^U Paste";
+        this.term.buffer[this.termRows - 2] = this._padLine(`^X Exit${saveText}${clipHint}`, true);
         this.term.buffer[this.termRows - 1] = this._padLine(this.status, true);
 
         // 4. 绘制光标 (手动插入 <span>)
         const bufferY = (this.cursorY - this.topRow) + 1; // +1 因为顶栏
         if (bufferY > 0 && bufferY < this.termRows - 2) { // 确保在文本区域内
-            
+
             // 1. 从 this.lines (原始) 而不是 this.term.buffer (已转义) 获取
-            let line = this.lines[this.cursorY] || ""; 
-            
+            let line = this.lines[this.cursorY] || "";
+
             // 2. 获取光标下的原始字符
             const char = line[this.cursorX] || ' ';
             // 3. 转义光标字符
             const escapedChar = this.term.escapeHtml(char);
             const cursorSpan = `<span class="term-cursor">${escapedChar}</span>`;
-            
-            // 4. 转义光标前后的部分
-            const lineBefore = this.term.escapeHtml(line.substring(0, this.cursorX));
-            const lineAfter = this.term.escapeHtml(line.substring(this.cursorX + 1));
+
+            // 4. 转义光标前后的部分（若与选区重叠则局部套用选区高亮）
+            const beforeText = line.substring(0, this.cursorX);
+            const afterText = line.substring(this.cursorX + 1);
+            const sel = this._selectionColsForLine(this.cursorY);
+
+            let lineBefore, lineAfter;
+            if (sel && sel.end > sel.start) {
+                lineBefore = renderRowWithSelection(this.term, beforeText, sel.start, Math.min(sel.end, beforeText.length));
+                const afterSelStart = Math.max(0, sel.start - (this.cursorX + 1));
+                const afterSelEnd = Math.max(0, sel.end - (this.cursorX + 1));
+                lineAfter = renderRowWithSelection(this.term, afterText, afterSelStart, afterSelEnd);
+            } else {
+                lineBefore = this.term.escapeHtml(beforeText);
+                lineAfter = this.term.escapeHtml(afterText);
+            }
 
             // 5. 组合，然后填充 (padding)
             const combinedLine = lineBefore + cursorSpan + lineAfter;
@@ -2052,78 +2289,61 @@ class NanoEditor {
                 case 'v':
                     try {
                         const text = await navigator.clipboard.readText();
-                        if (text) {
-                            this.dirty = true;
-                            
-                            // 1. 规范化换行符 (CRLF -> LF)
-                            const cleanText = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-                            const parts = cleanText.split('\n');
-                            
-                            // 获取光标当前所在行，并拆分为 光标前(pre) 和 光标后(post)
-                            const currentLine = this.lines[this.cursorY];
-                            const pre = currentLine.substring(0, this.cursorX);
-                            const post = currentLine.substring(this.cursorX);
-                            
-                            if (parts.length === 1) {
-                                // --- 单行粘贴 ---
-                                this.lines[this.cursorY] = pre + parts[0] + post;
-                                this.cursorX += parts[0].length;
-                            } else {
-                                // --- 多行粘贴 ---
-                                // 1. 当前行变成：pre + 第一段
-                                this.lines[this.cursorY] = pre + parts[0];
-                                
-                                // 2. 中间部分直接插入新行
-                                // parts.slice(1, -1) 获取中间的所有行
-                                // 如果只有2行，中间就是空的，逻辑依然成立
-                                const middleLines = parts.slice(1, -1);
-                                if (middleLines.length > 0) {
-                                    this.lines.splice(this.cursorY + 1, 0, ...middleLines);
-                                }
-                                
-                                // 3. 最后一行：最后一段 + post
-                                // 注意：需要计算最后一行插入的位置
-                                const lastPart = parts[parts.length - 1];
-                                const insertionIndex = this.cursorY + parts.length - 1;
-                                
-                                // 在正确位置插入最后一行
-                                this.lines.splice(insertionIndex, 0, lastPart + post);
-                                
-                                // 4. 更新光标位置
-                                this.cursorY = insertionIndex;
-                                this.cursorX = lastPart.length; 
-                            }
-                            
-                            // [关键] 强制检查光标位置并滚动视图
-                            this._validateCursor();
-                            this._handleScrolling();
-                            this._render();
-                        }
+                        this._pasteText(text);
+                        this._render();
                     } catch (err) {
                         this.status = "Paste failed: " + err.message;
                         this._render();
                     }
                     break;
 
-                case 'k':
+                case 'k': {
+                    const range = this._selectionRange();
+                    if (e.shiftKey) {
+                        // Ctrl+Shift+K：复制选区到内部剪贴板，不删除
+                        if (range) {
+                            editorClipboard = { type: 'char', text: this._extractSelectionText(range) };
+                            this.status = t('nanoCopy');
+                        }
+                        this._render();
+                        return; // 阻止调用后续渲染以外的逻辑
+                    }
+
                     this.dirty = true;
-                    if (this.lines.length > 0) {
+                    if (range) {
+                        // 有选区：剪切选区
+                        editorClipboard = { type: 'char', text: this._extractSelectionText(range) };
+                        this._deleteSelectionRange(range);
+                        this.selectionAnchor = null;
+                        this.status = t('nanoCut');
+                    } else if (this.lines.length > 0) {
+                        // 无选区：退回到整行剪切（沿用原有行为）
+                        editorClipboard = { type: 'line', text: this.lines[this.cursorY] };
+
                         // 删除当前行
                         this.lines.splice(this.cursorY, 1);
-                        
+
                         // 如果删完了，至少保留一行空行
                         if (this.lines.length === 0) {
                             this.lines.push("");
                         }
-                        
+
                         // 如果光标在最后一行被删后，上移一行
                         if (this.cursorY >= this.lines.length) {
                             this.cursorY = this.lines.length - 1;
                         }
                         // 确保 X 不越界
                         this.cursorX = Math.min(this.cursorX, this.lines[this.cursorY].length);
-                        
-                        this._handleScrolling();
+                    }
+                    this._handleScrolling();
+                    this._render();
+                    break;
+                }
+
+                case 'u':
+                    if (editorClipboard && editorClipboard.text) {
+                        this._pasteText(editorClipboard.text);
+                        this.status = t('nanoPaste');
                         this._render();
                     }
                     break;
@@ -2137,6 +2357,18 @@ class NanoEditor {
                 return; // 阻止所有编辑键
             }
             // --- 常规编辑 ---
+            const isArrowKey = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key);
+            if (isArrowKey) {
+                if (e.shiftKey) {
+                    // 首次按下 Shift+方向键时记录选区起点，随后仅移动光标以扩展选区
+                    this.selectionAnchor = this.selectionAnchor || { y: this.cursorY, x: this.cursorX };
+                } else {
+                    this.selectionAnchor = null;
+                }
+            } else if (e.key !== 'Shift') {
+                this.selectionAnchor = null;
+            }
+
             switch (e.key) {
                 case 'ArrowUp':
                     if (this.cursorY > 0) this.cursorY--;
@@ -2228,6 +2460,983 @@ class NanoEditor {
             this.status = `Error saving: ${e.message}`;
         }
     }
+}
+
+// VimEditor 支持的动作字符集（charwise 动作，可配合 d/c/y 使用，也可单独移动光标）
+const VIM_CHARWISE_MOTIONS = {
+    'h': (ed) => ({ y: ed.cursorY, x: Math.max(0, ed.cursorX - 1) }),
+    'l': (ed) => {
+        const maxX = Math.max(0, ed.lines[ed.cursorY].length - 1);
+        return { y: ed.cursorY, x: Math.min(maxX, ed.cursorX + 1) };
+    },
+    '0': (ed) => ({ y: ed.cursorY, x: 0 }),
+    '$': (ed) => ({ y: ed.cursorY, x: Math.max(0, ed.lines[ed.cursorY].length - 1) }),
+    'w': (ed) => ed._motionWordForward(),
+    'e': (ed) => ed._motionWordEnd(),
+    'b': (ed) => ed._motionWordBackward(),
+};
+
+/**
+ * 精简版 Vim 编辑器：支持 Normal/Insert/Visual/Command/Search 模式，
+ * 动作 h j k l w b e 0 $ gg G，操作符 d c y（含 dd yy cc x D C Y），
+ * p/P 粘贴，i I a A o O 进入插入模式，u/Ctrl+R 撤销重做，
+ * v/V 可视模式，/ 搜索 + n/N，: 命令模式（w q wq q! x <N>）。
+ * 明确不实现：宏、标记、:s 替换、具名寄存器、计数前缀、f/t/F/T、{ }、窗口分割、:g/ex 范围。
+ */
+class VimEditor {
+    constructor(term, filePath, initialContent, onSave, onExit, isReadOnly = false) {
+        this.term = term;
+        this.filePath = filePath;
+        this.onSave = onSave;
+        this.onExit = onExit;
+        this.isReadOnly = isReadOnly;
+
+        this.lines = initialContent.split('\n');
+        if (this.lines.length === 0) this.lines = [''];
+
+        this.cursorY = 0;
+        this.cursorX = 0;
+        this.desiredCol = 0;
+        this.topRow = 0;
+        this.dirty = false;
+
+        this.termRows = term.rows;
+        this.termCols = term.cols;
+
+        this.mode = 'normal';
+        this.pendingOperator = null;
+        this.pendingKey = null;
+        this.visualAnchor = null;
+        this.commandBuffer = '';
+        this.searchTerm = '';
+        this.searchDirection = 1;
+        this.undoStack = [];
+        this.redoStack = [];
+        this.status = this.isReadOnly ? t('nanoReadOnly') : '';
+        this._quit = false;
+    }
+
+    open() {
+        this.term.enterFullScreenApp(this);
+        this._render();
+    }
+
+    _padLine(line, inverse = false) {
+        const escaped = this.term.escapeHtml(line);
+        const padding = ' '.repeat(Math.max(0, this.termCols - line.length));
+        if (inverse) {
+            return `<span style="background-color: var(--terminal-foreground-color); color: var(--terminal-background-color);">${escaped}${padding}</span>`;
+        }
+        return escaped + padding;
+    }
+
+    _handleScrolling() {
+        const editorHeight = this.termRows - 3;
+        if (this.cursorY < this.topRow) this.topRow = this.cursorY;
+        if (this.cursorY >= this.topRow + editorHeight) this.topRow = this.cursorY - editorHeight + 1;
+    }
+
+    _validateCursor() {
+        this.cursorY = Math.max(0, Math.min(this.lines.length - 1, this.cursorY));
+        const lineLength = this.lines[this.cursorY].length;
+        const allowEnd = (this.mode === 'insert' || this.mode === 'command' || this.mode === 'search');
+        const maxX = allowEnd ? lineLength : Math.max(0, lineLength - 1);
+        this.cursorX = Math.max(0, Math.min(maxX, this.cursorX));
+    }
+
+    _guardReadOnly() {
+        if (this.isReadOnly) {
+            this.status = t('nanoStatusReadOnly');
+            return true;
+        }
+        return false;
+    }
+
+    // --- 扁平化辅助：把多行文本视为以 \n 连接的一整段，方便做跨行的 word 动作 ---
+    _flatten() {
+        let text = '';
+        const lineStarts = [];
+        for (let i = 0; i < this.lines.length; i++) {
+            lineStarts.push(text.length);
+            text += this.lines[i];
+            if (i < this.lines.length - 1) text += '\n';
+        }
+        return { text, lineStarts };
+    }
+
+    _posToFlat(y, x, lineStarts) {
+        return lineStarts[y] + x;
+    }
+
+    _flatToPos(flat, lineStarts) {
+        let y = 0;
+        for (let i = 0; i < lineStarts.length; i++) {
+            if (lineStarts[i] <= flat) y = i; else break;
+        }
+        return { y, x: flat - lineStarts[y] };
+    }
+
+    _charClass(ch) {
+        if (ch === undefined) return 'edge';
+        if (ch === '\n' || /\s/.test(ch)) return 'space';
+        if (/[A-Za-z0-9_]/.test(ch)) return 'word';
+        return 'punct';
+    }
+
+    _motionWordForward() {
+        const { text, lineStarts } = this._flatten();
+        const n = text.length;
+        let i = this._posToFlat(this.cursorY, this.cursorX, lineStarts);
+        if (i >= n) return { y: this.cursorY, x: this.cursorX };
+        const startCls = this._charClass(text[i]);
+        if (startCls !== 'space') {
+            while (i < n && this._charClass(text[i]) === startCls) i++;
+        }
+        while (i < n && this._charClass(text[i]) === 'space') i++;
+        i = Math.min(i, Math.max(0, n - 1));
+        return this._flatToPos(i, lineStarts);
+    }
+
+    _motionWordEnd() {
+        const { text, lineStarts } = this._flatten();
+        const n = text.length;
+        let i = this._posToFlat(this.cursorY, this.cursorX, lineStarts);
+        i++;
+        while (i < n && this._charClass(text[i]) === 'space') i++;
+        if (i >= n) return this._flatToPos(Math.max(0, n - 1), lineStarts);
+        const cls = this._charClass(text[i]);
+        while (i + 1 < n && this._charClass(text[i + 1]) === cls) i++;
+        return this._flatToPos(i, lineStarts);
+    }
+
+    _motionWordBackward() {
+        const { text, lineStarts } = this._flatten();
+        let i = this._posToFlat(this.cursorY, this.cursorX, lineStarts);
+        i--;
+        while (i >= 0 && this._charClass(text[i]) === 'space') i--;
+        if (i < 0) return { y: 0, x: 0 };
+        const cls = this._charClass(text[i]);
+        while (i - 1 >= 0 && this._charClass(text[i - 1]) === cls) i--;
+        return this._flatToPos(Math.max(0, i), lineStarts);
+    }
+
+    _moveCursor(key) {
+        switch (key) {
+            case 'h': case 'l': case '0': case '$': case 'w': case 'e': case 'b': {
+                const target = VIM_CHARWISE_MOTIONS[key](this);
+                this.cursorY = target.y;
+                this.cursorX = target.x;
+                this.desiredCol = this.cursorX;
+                break;
+            }
+            case 'j': {
+                this.cursorY = Math.min(this.lines.length - 1, this.cursorY + 1);
+                this.cursorX = Math.min(this.desiredCol, Math.max(0, this.lines[this.cursorY].length - 1));
+                break;
+            }
+            case 'k': {
+                this.cursorY = Math.max(0, this.cursorY - 1);
+                this.cursorX = Math.min(this.desiredCol, Math.max(0, this.lines[this.cursorY].length - 1));
+                break;
+            }
+            case 'G': {
+                this.cursorY = this.lines.length - 1;
+                this.cursorX = 0;
+                this.desiredCol = 0;
+                break;
+            }
+            case 'gg': {
+                this.cursorY = 0;
+                this.cursorX = 0;
+                this.desiredCol = 0;
+                break;
+            }
+        }
+    }
+
+    _snapshotUndo() {
+        this.undoStack.push({ lines: this.lines.slice(), cursorY: this.cursorY, cursorX: this.cursorX });
+        if (this.undoStack.length > 200) this.undoStack.shift();
+        this.redoStack = [];
+    }
+
+    _undo() {
+        if (this.undoStack.length === 0) { this.status = 'Already at oldest change'; return; }
+        this.redoStack.push({ lines: this.lines.slice(), cursorY: this.cursorY, cursorX: this.cursorX });
+        const snap = this.undoStack.pop();
+        this.lines = snap.lines;
+        this.cursorY = snap.cursorY;
+        this.cursorX = snap.cursorX;
+        this.dirty = true;
+    }
+
+    _redo() {
+        if (this.redoStack.length === 0) { this.status = 'Already at newest change'; return; }
+        this.undoStack.push({ lines: this.lines.slice(), cursorY: this.cursorY, cursorX: this.cursorX });
+        const snap = this.redoStack.pop();
+        this.lines = snap.lines;
+        this.cursorY = snap.cursorY;
+        this.cursorX = snap.cursorX;
+        this.dirty = true;
+    }
+
+    _applyOperatorMotion(op, motionKey, sameLine = false) {
+        const startY = this.cursorY, startX = this.cursorX;
+        const linewise = sameLine || motionKey === 'j' || motionKey === 'k' || motionKey === 'G' || motionKey === 'gg';
+
+        if (linewise) {
+            let targetY = startY;
+            if (sameLine) targetY = startY;
+            else if (motionKey === 'j') targetY = Math.min(this.lines.length - 1, startY + 1);
+            else if (motionKey === 'k') targetY = Math.max(0, startY - 1);
+            else if (motionKey === 'G') targetY = this.lines.length - 1;
+            else targetY = 0; // gg
+
+            const y1 = Math.min(startY, targetY), y2 = Math.max(startY, targetY);
+
+            if (op === 'y') {
+                editorClipboard = { type: 'line', text: this.lines.slice(y1, y2 + 1).join('\n') + '\n' };
+                this.cursorY = y1;
+                this.cursorX = 0;
+            } else {
+                this._snapshotUndo();
+                const removed = this.lines.splice(y1, y2 - y1 + 1);
+                editorClipboard = { type: 'line', text: removed.join('\n') + '\n' };
+                if (this.lines.length === 0) this.lines.push('');
+                this.cursorY = Math.min(y1, this.lines.length - 1);
+                this.cursorX = 0;
+                this.dirty = true;
+                if (op === 'c') {
+                    this.lines.splice(this.cursorY, 0, '');
+                    this.mode = 'insert';
+                } else {
+                    this.mode = 'normal';
+                }
+            }
+            this.pendingOperator = null;
+            return;
+        }
+
+        const motionFn = VIM_CHARWISE_MOTIONS[motionKey];
+        if (!motionFn) { this.pendingOperator = null; return; }
+        const target = motionFn(this);
+
+        const { text, lineStarts } = this._flatten();
+        const a = this._posToFlat(startY, startX, lineStarts);
+        const b = this._posToFlat(target.y, target.x, lineStarts);
+        const inclusive = (motionKey === '$' || motionKey === 'e');
+        let lo = Math.min(a, b), hi = Math.max(a, b);
+        if (inclusive) hi = Math.min(text.length, hi + 1);
+
+        if (hi <= lo) { this.pendingOperator = null; return; }
+
+        const slice = text.slice(lo, hi);
+        const pos = this._flatToPos(lo, lineStarts);
+
+        if (op === 'y') {
+            editorClipboard = { type: 'char', text: slice };
+            this.cursorY = pos.y;
+            this.cursorX = pos.x;
+        } else {
+            this._snapshotUndo();
+            editorClipboard = { type: 'char', text: slice };
+            const newText = text.slice(0, lo) + text.slice(hi);
+            this.lines = newText.split('\n');
+            this.cursorY = pos.y;
+            this.cursorX = pos.x;
+            this.dirty = true;
+            this.mode = (op === 'c') ? 'insert' : 'normal';
+        }
+        this.pendingOperator = null;
+    }
+
+    _deleteCharUnderCursor() {
+        const line = this.lines[this.cursorY];
+        if (line.length === 0) return;
+        this._snapshotUndo();
+        editorClipboard = { type: 'char', text: line[this.cursorX] || '' };
+        this.lines[this.cursorY] = line.substring(0, this.cursorX) + line.substring(this.cursorX + 1);
+        this.cursorX = Math.min(this.cursorX, Math.max(0, this.lines[this.cursorY].length - 1));
+        this.dirty = true;
+    }
+
+    _deleteToEndOfLine() {
+        const line = this.lines[this.cursorY];
+        editorClipboard = { type: 'char', text: line.substring(this.cursorX) };
+        this.lines[this.cursorY] = line.substring(0, this.cursorX);
+        this.cursorX = this.lines[this.cursorY].length;
+        this.dirty = true;
+    }
+
+    _enterInsert(key) {
+        this._snapshotUndo();
+        switch (key) {
+            case 'i': break;
+            case 'I': this.cursorX = 0; break;
+            case 'a': this.cursorX = Math.min(this.lines[this.cursorY].length, this.cursorX + 1); break;
+            case 'A': this.cursorX = this.lines[this.cursorY].length; break;
+            case 'o':
+                this.lines.splice(this.cursorY + 1, 0, '');
+                this.cursorY++;
+                this.cursorX = 0;
+                this.dirty = true;
+                break;
+            case 'O':
+                this.lines.splice(this.cursorY, 0, '');
+                this.cursorX = 0;
+                this.dirty = true;
+                break;
+        }
+        this.mode = 'insert';
+    }
+
+    _put(before) {
+        if (!editorClipboard) return;
+        if (this._guardReadOnly()) return;
+        this._snapshotUndo();
+        this.dirty = true;
+
+        if (editorClipboard.type === 'line') {
+            const linesToInsert = editorClipboard.text.replace(/\n$/, '').split('\n');
+            const insertAt = before ? this.cursorY : this.cursorY + 1;
+            this.lines.splice(insertAt, 0, ...linesToInsert);
+            this.cursorY = insertAt;
+            this.cursorX = 0;
+        } else {
+            const line = this.lines[this.cursorY];
+            const insertCol = before ? this.cursorX : Math.min(line.length, this.cursorX + 1);
+            const text = editorClipboard.text;
+            if (text.includes('\n')) {
+                const parts = text.split('\n');
+                const pre = line.substring(0, insertCol);
+                const post = line.substring(insertCol);
+                this.lines[this.cursorY] = pre + parts[0];
+                const middle = parts.slice(1, -1);
+                this.lines.splice(this.cursorY + 1, 0, ...middle, parts[parts.length - 1] + post);
+                this.cursorY += parts.length - 1;
+                this.cursorX = 0;
+            } else {
+                this.lines[this.cursorY] = line.substring(0, insertCol) + text + line.substring(insertCol);
+                this.cursorX = Math.max(0, insertCol + text.length - 1);
+            }
+        }
+    }
+
+    _visualRange() {
+        const a = { y: this.visualAnchor.y, x: this.visualAnchor.x };
+        const b = { y: this.cursorY, x: this.cursorX };
+        if (a.y < b.y || (a.y === b.y && a.x <= b.x)) return { start: a, end: b };
+        return { start: b, end: a };
+    }
+
+    _applyVisualAction(op) {
+        if (this.mode === 'visual-line') {
+            const y1 = Math.min(this.visualAnchor.y, this.cursorY);
+            const y2 = Math.max(this.visualAnchor.y, this.cursorY);
+            if (op === 'y') {
+                editorClipboard = { type: 'line', text: this.lines.slice(y1, y2 + 1).join('\n') + '\n' };
+                this.cursorY = y1;
+                this.cursorX = 0;
+            } else {
+                this._snapshotUndo();
+                const removed = this.lines.splice(y1, y2 - y1 + 1);
+                editorClipboard = { type: 'line', text: removed.join('\n') + '\n' };
+                if (this.lines.length === 0) this.lines.push('');
+                this.cursorY = Math.min(y1, this.lines.length - 1);
+                this.cursorX = 0;
+                this.dirty = true;
+            }
+        } else {
+            const { start, end } = this._visualRange();
+            const { text, lineStarts } = this._flatten();
+            const lo = this._posToFlat(start.y, start.x, lineStarts);
+            const hi = Math.min(text.length, this._posToFlat(end.y, end.x, lineStarts) + 1);
+            const slice = text.slice(lo, hi);
+            const pos = this._flatToPos(lo, lineStarts);
+            if (op === 'y') {
+                editorClipboard = { type: 'char', text: slice };
+            } else {
+                this._snapshotUndo();
+                editorClipboard = { type: 'char', text: slice };
+                const newText = text.slice(0, lo) + text.slice(hi);
+                this.lines = newText.split('\n');
+                this.dirty = true;
+            }
+            this.cursorY = pos.y;
+            this.cursorX = pos.x;
+        }
+        this.mode = 'normal';
+        this.visualAnchor = null;
+    }
+
+    _selectionRangeForLine(lineIndex) {
+        if (this.mode !== 'visual' && this.mode !== 'visual-line') return null;
+        if (!this.visualAnchor) return null;
+        const { start, end } = this._visualRange();
+        if (lineIndex < start.y || lineIndex > end.y) return null;
+        const line = this.lines[lineIndex] || '';
+        if (this.mode === 'visual-line') {
+            return { start: 0, end: line.length };
+        }
+        const s = (lineIndex === start.y) ? start.x : 0;
+        const e = (lineIndex === end.y) ? end.x + 1 : line.length;
+        return { start: Math.max(0, s), end: Math.min(line.length, Math.max(s, e)) };
+    }
+
+    _renderEditorLine(lineIndex) {
+        const line = this.lines[lineIndex] || '';
+        const isCursorLine = (lineIndex === this.cursorY);
+        const sel = this._selectionRangeForLine(lineIndex);
+
+        const points = new Set([0, line.length]);
+        if (sel) { points.add(sel.start); points.add(sel.end); }
+        if (isCursorLine) { points.add(this.cursorX); points.add(Math.min(line.length, this.cursorX + 1)); }
+        const sorted = Array.from(points).filter(p => p >= 0 && p <= line.length).sort((a, b) => a - b);
+
+        let html = '';
+        for (let i = 0; i < sorted.length - 1; i++) {
+            const segStart = sorted[i], segEnd = sorted[i + 1];
+            if (segStart === segEnd) continue;
+            const segText = line.substring(segStart, segEnd);
+            const isCursorChar = isCursorLine && segStart === this.cursorX && segEnd === Math.min(line.length, this.cursorX + 1) && this.cursorX < line.length;
+            const isSelected = !!sel && segStart >= sel.start && segEnd <= sel.end && sel.end > sel.start;
+            const escaped = this.term.escapeHtml(segText);
+            if (isCursorChar) {
+                html += `<span class="term-cursor">${escaped}</span>`;
+            } else if (isSelected) {
+                html += `<span style="background-color: var(--terminal-selection-background); color: var(--terminal-selection-foreground);">${escaped}</span>`;
+            } else {
+                html += escaped;
+            }
+        }
+
+        let visibleLength = line.length;
+        if (isCursorLine && this.cursorX >= line.length) {
+            html += `<span class="term-cursor"> </span>`;
+            visibleLength += 1;
+        }
+
+        const padding = ' '.repeat(Math.max(0, this.termCols - visibleLength));
+        return html + padding;
+    }
+
+    _render() {
+        this.term._initBuffer();
+
+        const roText = this.isReadOnly ? ` ${t('nanoReadOnly')}` : '';
+        const topBar = `"${this.filePath}"${this.dirty ? ' [+]' : ''}${roText}`;
+        this.term.buffer[0] = this._padLine(topBar, true);
+
+        const editorHeight = this.termRows - 3;
+        for (let y = 0; y < editorHeight; y++) {
+            const lineIndex = this.topRow + y;
+            if (lineIndex < this.lines.length) {
+                this.term.buffer[y + 1] = this._renderEditorLine(lineIndex);
+            } else {
+                this.term.buffer[y + 1] = this._padLine("~");
+            }
+        }
+
+        const modeLabel = { insert: '-- INSERT --', visual: '-- VISUAL --', 'visual-line': '-- VISUAL LINE --' }[this.mode];
+        let bottomBar1;
+        if (this.mode === 'command') bottomBar1 = ':' + this.commandBuffer;
+        else if (this.mode === 'search') bottomBar1 = '/' + this.commandBuffer;
+        else bottomBar1 = modeLabel || ':w write  :q quit  v/V visual  /search  u undo';
+        this.term.buffer[this.termRows - 2] = this._padLine(bottomBar1, true);
+        this.term.buffer[this.termRows - 1] = this._padLine(this.status, true);
+
+        this.term._render();
+    }
+
+    _handleInsertKey(e) {
+        if (e.key === 'Escape') {
+            this.mode = 'normal';
+            if (this.cursorX > 0) this.cursorX--;
+            return;
+        }
+        switch (e.key) {
+            case 'Backspace':
+                if (this.cursorX > 0) {
+                    const line = this.lines[this.cursorY];
+                    this.lines[this.cursorY] = line.substring(0, this.cursorX - 1) + line.substring(this.cursorX);
+                    this.cursorX--;
+                    this.dirty = true;
+                } else if (this.cursorY > 0) {
+                    const line = this.lines[this.cursorY];
+                    const prevLine = this.lines[this.cursorY - 1];
+                    this.cursorX = prevLine.length;
+                    this.lines[this.cursorY - 1] = prevLine + line;
+                    this.lines.splice(this.cursorY, 1);
+                    this.cursorY--;
+                    this.dirty = true;
+                }
+                break;
+            case 'Enter': {
+                const line = this.lines[this.cursorY];
+                const before = line.substring(0, this.cursorX);
+                const after = line.substring(this.cursorX);
+                this.lines[this.cursorY] = before;
+                this.lines.splice(this.cursorY + 1, 0, after);
+                this.cursorY++;
+                this.cursorX = 0;
+                this.dirty = true;
+                break;
+            }
+            case 'Tab':
+                break;
+            default:
+                if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+                    const line = this.lines[this.cursorY];
+                    this.lines[this.cursorY] = line.substring(0, this.cursorX) + e.key + line.substring(this.cursorX);
+                    this.cursorX++;
+                    this.dirty = true;
+                }
+                break;
+        }
+    }
+
+    async _handleCommandKey(e) {
+        if (e.key === 'Escape') {
+            this.mode = 'normal';
+            this.commandBuffer = '';
+            return;
+        }
+        if (e.key === 'Enter') {
+            const cmd = this.commandBuffer;
+            const wasSearch = (this.mode === 'search');
+            this.mode = 'normal';
+            this.commandBuffer = '';
+            if (wasSearch) {
+                this._executeSearch(cmd, 1);
+            } else {
+                await this._executeExCommand(cmd);
+            }
+            return;
+        }
+        if (e.key === 'Backspace') {
+            this.commandBuffer = this.commandBuffer.slice(0, -1);
+            return;
+        }
+        if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+            this.commandBuffer += e.key;
+        }
+    }
+
+    async _executeExCommand(cmd) {
+        cmd = cmd.trim();
+        if (cmd === 'w') {
+            if (this._guardReadOnly()) return;
+            await this._save();
+        } else if (cmd === 'q') {
+            if (this.dirty) { this.status = 'No write since last change (use :q! to override)'; return; }
+            this._quit = true;
+            this.term.exitFullScreenApp();
+            this.onExit();
+        } else if (cmd === 'q!') {
+            this._quit = true;
+            this.term.exitFullScreenApp();
+            this.onExit();
+        } else if (cmd === 'wq' || cmd === 'x') {
+            if (this._guardReadOnly()) return;
+            await this._save();
+            this._quit = true;
+            this.term.exitFullScreenApp();
+            this.onExit();
+        } else if (/^\d+$/.test(cmd)) {
+            const n = parseInt(cmd, 10);
+            this.cursorY = Math.max(0, Math.min(this.lines.length - 1, n - 1));
+            this.cursorX = 0;
+        } else if (cmd === '') {
+            // no-op
+        } else {
+            this.status = `E492: Not an editor command: ${cmd}`;
+        }
+    }
+
+    _executeSearch(newTerm, dir) {
+        if (newTerm) { this.searchTerm = newTerm; this.searchDirection = 1; dir = 1; }
+        if (!this.searchTerm) return;
+        this.searchDirection = dir;
+        const n = this.lines.length;
+        for (let step = 1; step <= n; step++) {
+            const y = ((this.cursorY + dir * step) % n + n) % n;
+            const idx = this.lines[y].indexOf(this.searchTerm);
+            if (idx !== -1) {
+                this.cursorY = y;
+                this.cursorX = idx;
+                return;
+            }
+        }
+        this.status = `E486: Pattern not found: ${this.searchTerm}`;
+    }
+
+    _handleNormalOrVisualKey(e) {
+        const key = e.key;
+        const inVisual = (this.mode === 'visual' || this.mode === 'visual-line');
+
+        if (e.ctrlKey) {
+            if (key.toLowerCase() === 'r') this._redo();
+            return;
+        }
+
+        if (key === 'Escape') {
+            if (inVisual) { this.mode = 'normal'; this.visualAnchor = null; }
+            this.pendingOperator = null;
+            this.pendingKey = null;
+            return;
+        }
+
+        if (this.pendingKey === 'g') {
+            this.pendingKey = null;
+            if (key === 'g') {
+                if (this.pendingOperator) {
+                    if (this.pendingOperator !== 'y' && this._guardReadOnly()) { this.pendingOperator = null; return; }
+                    this._applyOperatorMotion(this.pendingOperator, 'gg');
+                } else {
+                    this._moveCursor('gg');
+                }
+            }
+            return;
+        }
+
+        if (this.pendingOperator) {
+            const op = this.pendingOperator;
+            if (key === 'd' || key === 'c' || key === 'y') {
+                if (key === op) {
+                    if (op !== 'y' && this._guardReadOnly()) { this.pendingOperator = null; return; }
+                    this._applyOperatorMotion(op, null, true);
+                    return;
+                }
+                this.pendingOperator = null;
+                return;
+            }
+            if (key === 'g') { this.pendingKey = 'g'; return; }
+            if (['h', 'l', '0', '$', 'w', 'e', 'b', 'j', 'k', 'G'].includes(key)) {
+                if (op !== 'y' && this._guardReadOnly()) { this.pendingOperator = null; return; }
+                this._applyOperatorMotion(op, key);
+                return;
+            }
+            this.pendingOperator = null;
+            return;
+        }
+
+        if (inVisual) {
+            if (key === 'y') { this._applyVisualAction('y'); return; }
+            if (key === 'd' || key === 'x') {
+                if (this._guardReadOnly()) return;
+                this._applyVisualAction('d');
+                return;
+            }
+            if (key === 'v') { this.mode = (this.mode === 'visual') ? 'normal' : 'visual'; if (this.mode === 'normal') this.visualAnchor = null; return; }
+            if (key === 'V') { this.mode = (this.mode === 'visual-line') ? 'normal' : 'visual-line'; if (this.mode === 'normal') this.visualAnchor = null; return; }
+            if (key === 'g') { this.pendingKey = 'g'; return; }
+            if (['h', 'l', 'j', 'k', '0', '$', 'w', 'e', 'b', 'G'].includes(key)) {
+                this._moveCursor(key);
+                return;
+            }
+            return;
+        }
+
+        switch (key) {
+            case 'h': case 'l': case 'j': case 'k': case '0': case '$': case 'w': case 'e': case 'b': case 'G':
+                this._moveCursor(key);
+                return;
+            case 'g':
+                this.pendingKey = 'g';
+                return;
+            case 'v':
+                this.mode = 'visual';
+                this.visualAnchor = { y: this.cursorY, x: this.cursorX };
+                return;
+            case 'V':
+                this.mode = 'visual-line';
+                this.visualAnchor = { y: this.cursorY, x: this.cursorX };
+                return;
+            case 'd': case 'c': case 'y':
+                this.pendingOperator = key;
+                return;
+            case 'x':
+                if (this._guardReadOnly()) return;
+                this._deleteCharUnderCursor();
+                return;
+            case 'D':
+                if (this._guardReadOnly()) return;
+                this._snapshotUndo();
+                this._deleteToEndOfLine();
+                return;
+            case 'C':
+                if (this._guardReadOnly()) return;
+                this._snapshotUndo();
+                this._deleteToEndOfLine();
+                this.mode = 'insert';
+                return;
+            case 'Y':
+                this._applyOperatorMotion('y', null, true);
+                return;
+            case 'p':
+                this._put(false);
+                return;
+            case 'P':
+                this._put(true);
+                return;
+            case 'i': case 'I': case 'a': case 'A': case 'o': case 'O':
+                if (this._guardReadOnly()) return;
+                this._enterInsert(key);
+                return;
+            case 'u':
+                this._undo();
+                return;
+            case ':':
+                this.mode = 'command';
+                this.commandBuffer = '';
+                return;
+            case '/':
+                this.mode = 'search';
+                this.commandBuffer = '';
+                return;
+            case 'n':
+                this._executeSearch(null, this.searchDirection || 1);
+                return;
+            case 'N':
+                this._executeSearch(null, -(this.searchDirection || 1));
+                return;
+            default:
+                return;
+        }
+    }
+
+    async handleKeydown(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        this.status = "";
+        this._quit = false;
+
+        if (this.mode === 'insert') {
+            this._handleInsertKey(e);
+        } else if (this.mode === 'command' || this.mode === 'search') {
+            await this._handleCommandKey(e);
+        } else {
+            this._handleNormalOrVisualKey(e);
+        }
+
+        if (this._quit) return;
+
+        this._validateCursor();
+        this._handleScrolling();
+        this._render();
+    }
+
+    async _save() {
+        this.status = "Saving...";
+        try {
+            const content = this.lines.join('\n');
+            const success = this.onSave(this.filePath, content);
+            if (success) {
+                this.dirty = false;
+                this.status = t('nanoStatusSaved').replace('{0}', content.length);
+            } else {
+                if (this.status === "Saving...") {
+                    this.status = t('nanoStatusSaveError');
+                }
+            }
+        } catch (e) {
+            this.status = `Error saving: ${e.message}`;
+        }
+    }
+}
+
+/**
+ * nano/vim 共用的文件打开逻辑：路径解析、权限检查、VFS/书签内容加载、
+ * 保存回写（.startrc、/bin/ 脚本、普通书签、新建文件）。
+ * 只有 cmdName（错误提示前缀）和 EditorClass（NanoEditor / VimEditor）不同。
+ */
+function openFileEditor(cmdName, EditorClass, args) {
+    let path = args[0];
+    if (!path) {
+        term.writeLine(`${cmdName}: File name not specified.`);
+        return;
+    }
+
+    if (!path.startsWith('/') && !path.startsWith('~/')) {
+        const pwd = bookmarkSystem.getPWD();
+        path = (pwd === '/') ? ('/' + path) : (pwd + '/' + path);
+    }
+
+    return new Promise(async (resolve) => {
+        let content = "";
+        let node = null;
+        let resolvedPath = path;
+
+        let isReadOnly = false;
+
+        const result = bookmarkSystem._findNodeByPath(path);
+
+        if (result && result.node) {
+            node = result.node;
+            resolvedPath = "/" + result.newPathArray.slice(1).map(p => p.title).join("/");
+
+            // 检查权限
+            if (!hasPermission(node, 'r')) {
+                term.writeHtml(`<span class="term-error">${cmdName}: ${resolvedPath}: ${t('permissionDenied')}</span>`);
+                resolve();
+                return;
+            }
+
+            if (!hasPermission(node, 'w')) {
+                isReadOnly = true;
+            }
+
+            // [加载 VFS]
+            if (node.id.startsWith('vfs-')) {
+                // 适用于 /etc/.startrc AND /bin/hello.sh
+                try {
+                    const base64Content = (node.url || '').split(',')[1] || '';
+                    content = decodeURIComponent(atob(base64Content));
+                } catch (e) {
+                    content = ""; // 文件已损坏
+                }
+            } else if (node.url) {
+                // 这是普通书签
+                content = node.url;
+            } else if (node.children) {
+                term.writeLine(`${cmdName}: ${resolvedPath} is a directory.`);
+                resolve();
+                return;
+            }
+        } else {
+            // 这是一个新文件，检查父目录的 'w' 权限
+            const parentPath = resolvedPath.substring(0, resolvedPath.lastIndexOf('/')) || '/';
+            const parentResult = bookmarkSystem._findNodeByPath(parentPath);
+            if (!parentResult || !parentResult.node || !hasPermission(parentResult.node, 'w')) {
+                isReadOnly = true;
+            }
+        }
+        // (如果是新文件, 'content' 保持为 "")
+
+        const onSave = async (savedPath, savedContent) => {
+            try {
+                // (权限检查保持不变)
+                if (node) {
+                    if (!hasPermission(node, 'w')) {
+                        term.writeHtml(`<span class="term-error">Error: ${t('permissionDenied')}</span>`);
+                        return false; // [!!] 1. 返回 false
+                    }
+                } else {
+                    const parentPath = savedPath.substring(0, savedPath.lastIndexOf('/')) || '/';
+                    const parentResult = bookmarkSystem._findNodeByPath(parentPath);
+                    if (!parentResult || !parentResult.node || !hasPermission(parentResult.node, 'w')) {
+                        term.writeHtml(`<span class="term-error">Error: Parent directory not writable.</span>`);
+                        return false; // [!!] 2. 返回 false
+                    }
+                }
+
+                // 保存 VFS
+                if (resolvedPath === '/etc/.startrc') {
+                    localStorage.setItem('.startrc', savedContent);
+                    // parseStartrc(savedContent);
+                    // bookmarkSystem.update_user_path();
+                    const startrcNode = bookmarkSystem._findNodeByPath('/etc/.startrc').node;
+                    if (startrcNode) {
+                        startrcNode.url = `data:text/plain;base64,${btoa(encodeURIComponent(savedContent))}`;
+                    }
+
+
+                } else if (node && node.id.startsWith('vfs-bin-')) {
+                    // A. 正在更新一个*已存在的* /bin/ 脚本
+                    saveVfsScript(node.title, savedContent);
+                    // 更新内存中的 VFS 节点 URL
+                    node.url = `data:text/plain;base64,${btoa(encodeURIComponent(savedContent))}`;
+
+                } else if (node) {
+                    // B. 正在更新一个*已存在的*书签 (非 VFS)
+                    chrome.bookmarks.update(node.id, { url: savedContent });
+
+                } else if (!node && savedPath.startsWith('/bin/')) {
+                    // C. 正在创建*新的* /bin/ 脚本
+                    const scriptName = savedPath.substring(5);
+                    if (scriptName && !scriptName.includes('/')) {
+                        saveVfsScript(scriptName, savedContent, 0o755, Environment.USER);
+                        // 更新 VFS (内存中)
+                        const newNode = {
+                            id: `vfs-bin-${scriptName}`,
+                            title: scriptName,
+                            url: `data:text/plain;base64,${btoa(encodeURIComponent(savedContent))}`,
+                            mode: 0o755, // 默认权限
+                            owner: Environment.USER, // 设置 owner
+                            group: Environment.USER,
+                            children: null,
+                            parentId: 'vfs-bin'
+                        };
+                        bookmarkSystem.vfsBin.children.push(newNode);
+                        term.writeLine(`Saved to VFS: ${savedPath}`);
+                    } else {
+                        term.writeHtml(`<span class="term-error">${cmdName}: Invalid path.</span>`);
+                        return false; // [!!] 3. 返回 false
+                    }
+                } else if (!node) {
+                    // --- C. 创建新文件 ---
+
+                    // Case C1: VFS /bin/ 脚本
+                    if (savedPath.startsWith('/bin/')) {
+                        const scriptName = savedPath.substring(5);
+                        if (scriptName && !scriptName.includes('/')) {
+                            saveVfsScript(scriptName, savedContent, 0o755, Environment.USER);
+                            const newNode = {
+                                id: `vfs-bin-${scriptName}`,
+                                title: scriptName,
+                                url: `data:text/plain;base64,${btoa(encodeURIComponent(savedContent))}`,
+                                mode: 0o755, owner: Environment.USER, group: Environment.USER,
+                                children: null, parentId: 'vfs-bin'
+                            };
+                            bookmarkSystem.vfsBin.children.push(newNode);
+                            term.writeLine(`Saved to VFS: ${savedPath}`);
+                        } else {
+                            term.writeHtml(`<span class="term-error">${cmdName}: Invalid path.</span>`);
+                            return false;
+                        }
+                    }
+                    // 普通书签文件
+                    else {
+                        // 1. 找到父目录
+                        const parentPath = savedPath.substring(0, savedPath.lastIndexOf('/')) || '/';
+                        const parentResult = bookmarkSystem._findNodeByPath(parentPath);
+
+                        if (parentResult && parentResult.node && parentResult.node.children) {
+                            // 2. 获取文件名
+                            const newFileName = savedPath.split('/').pop();
+                            // 3. 检查父目录写权限
+                            if (!hasPermission(parentResult.node, 'w')) {
+                                term.writeHtml(`<span class="term-error">${cmdName}: Parent directory not writable.</span>`);
+                                return false;
+                            }
+                            // 4. 创建书签
+                            await new Promise(resolveCreate => {
+                                chrome.bookmarks.create({
+                                    parentId: parentResult.node.id,
+                                    title: newFileName,
+                                    url: savedContent // 内容作为 URL 保存
+                                }, resolveCreate);
+                            });
+                        } else {
+                            term.writeHtml(`<span class="term-error">${cmdName}: Directory not found: ${parentPath}</span>`);
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            } catch (e) {
+                console.error(`${cmdName} save error:`, e);
+                return false; // [!!] 5. 返回 false
+            }
+        };
+
+        const onExit = () => {
+            resolve();
+        };
+
+        const editor = new EditorClass(term, resolvedPath, content, onSave, onExit, isReadOnly);
+        editor.open();
+    });
 }
 
 class BookmarkSystem {
@@ -3229,6 +4438,14 @@ export LANG="en"
 # --- Completion Style ---
 export COMPLETION_STYLE="bash"
 #
+# --- Colors (optional; overrides the active theme) ---
+# export STDOUT_COLOR="#d4d4d4"
+# export STDERR_COLOR="#ff5555"
+# export ANNOUNCE_INFO_COLOR="#26c6da"
+# export ANNOUNCE_WARNING_COLOR="#f1c40f"
+# export ANNOUNCE_MAINTENANCE_COLOR="#bd93f9"
+# export ANNOUNCE_DANGER_COLOR="#ff5555"
+#
 # --- Aliases ---
 alias ll='ls -l -a'
 alias la='ls -a'
@@ -3239,6 +4456,18 @@ welcome
  * 解析 .startrc 内容并更新 Environment 对象
  * @param {string} content - .startrc 文件内容
  */
+// .startrc 中可以 export 的颜色变量，直接映射到对应的 CSS 自定义属性。
+// 由于 .startrc 在 main() 中于 loadStyleSettings()（主题 + style 命令覆盖）之后解析，
+// 这里设置的值会自然覆盖当前主题和 style 命令的覆盖层，无需调整启动顺序。
+const STARTRC_COLOR_VARS = {
+    STDOUT_COLOR: '--terminal-stdout-color',
+    STDERR_COLOR: '--terminal-stderr-color',
+    ANNOUNCE_INFO_COLOR: '--announcement-info',
+    ANNOUNCE_WARNING_COLOR: '--announcement-warning',
+    ANNOUNCE_MAINTENANCE_COLOR: '--announcement-maintenance',
+    ANNOUNCE_DANGER_COLOR: '--announcement-danger',
+};
+
 async function parseStartrc(content) {
     const lines = content.split('\n');
     const exportRegex = /^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/;
@@ -3254,9 +4483,13 @@ async function parseStartrc(content) {
             if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
                 value = value.substring(1, value.length - 1);
             }
-            
+
             Environment[key] = value;
             console.log(`[Env] Set ${key} = "${value}"`);
+
+            if (STARTRC_COLOR_VARS[key]) {
+                document.documentElement.style.setProperty(STARTRC_COLOR_VARS[key], value);
+            }
         } else if (match = line.match(aliasRegex)) {
             const key = match[1];
             let value = match[2];
@@ -4778,6 +6011,7 @@ const globalCommands = {
             term.writeHtml(`${t('updateLink')} <span class='term-folder'>https://aka.bradleyproject.eu.org/st20_releases</span>`);
             // term.writeLine("---------------------------------------------------");
         }
+        displayCachedAnnouncement();
         term.writeLine("");
     },
 
@@ -5150,6 +6384,7 @@ const globalCommands = {
         term.writeHtml(formatHelp('cd', 'help_cd'));
         term.writeHtml(formatHelp('cat', 'help_cat'));
         term.writeHtml(formatHelp('nano', 'help_nano'));
+        term.writeHtml(formatHelp('vim', 'help_vim'));
         term.writeHtml(formatHelp('mkdir', 'help_mkdir'));
         term.writeHtml(formatHelp('rm', 'help_rm'));
         term.writeHtml(formatHelp('cp', 'cpUsage')); // 确保 i18n 有这个
@@ -5228,6 +6463,8 @@ const globalCommands = {
             term.writeLine("  size <size>       Set font size (e.g. 16px)");
             term.writeLine("  bg <color>        Set background color");
             term.writeLine("  fg <color>        Set foreground (text) color");
+            term.writeLine("  stdout <color>    Set command output (stdout) color");
+            term.writeLine("  stderr <color>    Set error output (stderr) color");
             term.writeLine("  accent <color>    Set accent color");
             term.writeLine("  cursor <color>    Set cursor color");
             term.writeLine("  wall <url|none>   Set wallpaper");
@@ -5296,6 +6533,24 @@ const globalCommands = {
                 }
                 setOverride('--terminal-foreground-color', value);
                 term.writeLine(`Foreground color set to: ${value}`);
+                break;
+
+            case 'stdout':
+                if (!value) {
+                    term.writeLine(`Current stdout color: ${getStyle('--terminal-stdout-color')}`);
+                    return;
+                }
+                setOverride('--terminal-stdout-color', value);
+                term.writeLine(`Stdout color set to: ${value}`);
+                break;
+
+            case 'stderr':
+                if (!value) {
+                    term.writeLine(`Current stderr color: ${getStyle('--terminal-stderr-color')}`);
+                    return;
+                }
+                setOverride('--terminal-stderr-color', value);
+                term.writeLine(`Stderr color set to: ${value}`);
                 break;
 
             case 'accent':
@@ -5487,192 +6742,11 @@ const globalCommands = {
      
 
      'nano': (args, options) => {
-        let path = args[0];
-        if (!path) {
-            term.writeLine("nano: File name not specified.");
-            return;
-        }
+        return openFileEditor('nano', NanoEditor, args);
+     },
 
-        if (!path.startsWith('/') && !path.startsWith('~/')) {
-            const pwd = bookmarkSystem.getPWD();
-            path = (pwd === '/') ? ('/' + path) : (pwd + '/' + path);
-        }
-
-        return new Promise(async (resolve) => {
-            let content = "";
-            let node = null;
-            let resolvedPath = path;
-
-            let isReadOnly = false;
-
-            const result = bookmarkSystem._findNodeByPath(path);
-
-            if (result && result.node) {
-                node = result.node;
-                resolvedPath = "/" + result.newPathArray.slice(1).map(p => p.title).join("/");
-
-                // 检查权限
-                if (!hasPermission(node, 'r')) {
-                    term.writeHtml(`<span class="term-error">nano: ${resolvedPath}: ${t('permissionDenied')}</span>`);
-                    resolve();
-                    return;
-                }
-
-                if (!hasPermission(node, 'w')) {
-                    isReadOnly = true;
-                }
-
-                // [加载 VFS]
-                if (node.id.startsWith('vfs-')) {
-                    // 适用于 /etc/.startrc AND /bin/hello.sh
-                    try {
-                        const base64Content = (node.url || '').split(',')[1] || '';
-                        content = decodeURIComponent(atob(base64Content));
-                    } catch (e) {
-                        content = ""; // 文件已损坏
-                    }
-                } else if (node.url) {
-                    // 这是普通书签
-                    content = node.url; 
-                } else if (node.children) {
-                    term.writeLine(`nano: ${resolvedPath} is a directory.`);
-                    resolve();
-                    return;
-                }
-            } else {
-                // 这是一个新文件，检查父目录的 'w' 权限
-                const parentPath = resolvedPath.substring(0, resolvedPath.lastIndexOf('/')) || '/';
-                const parentResult = bookmarkSystem._findNodeByPath(parentPath);
-                if (!parentResult || !parentResult.node || !hasPermission(parentResult.node, 'w')) {
-                    isReadOnly = true;
-                }
-            }
-            // (如果是新文件, 'content' 保持为 "")
-
-            const onSave = async (savedPath, savedContent) => {
-                try {
-                    // (权限检查保持不变)
-                    if (node) { 
-                        if (!hasPermission(node, 'w')) {
-                            term.writeHtml(`<span class="term-error">Error: ${t('permissionDenied')}</span>`); 
-                            return false; // [!!] 1. 返回 false
-                        }
-                    } else {
-                        const parentPath = savedPath.substring(0, savedPath.lastIndexOf('/')) || '/';
-                        const parentResult = bookmarkSystem._findNodeByPath(parentPath);
-                        if (!parentResult || !parentResult.node || !hasPermission(parentResult.node, 'w')) {
-                            term.writeHtml(`<span class="term-error">Error: Parent directory not writable.</span>`); 
-                            return false; // [!!] 2. 返回 false
-                        }
-                    }
-
-                    // 保存 VFS
-                    if (resolvedPath === '/etc/.startrc') {
-                        localStorage.setItem('.startrc', savedContent);
-                        // parseStartrc(savedContent);
-                        // bookmarkSystem.update_user_path();
-                        const startrcNode = bookmarkSystem._findNodeByPath('/etc/.startrc').node;
-                        if (startrcNode) {
-                            startrcNode.url = `data:text/plain;base64,${btoa(encodeURIComponent(savedContent))}`;
-                        }
-
-                    
-                    } else if (node && node.id.startsWith('vfs-bin-')) {
-                        // A. 正在更新一个*已存在的* /bin/ 脚本
-                        saveVfsScript(node.title, savedContent);
-                        // 更新内存中的 VFS 节点 URL
-                        node.url = `data:text/plain;base64,${btoa(encodeURIComponent(savedContent))}`;
-
-                    } else if (node) {
-                        // B. 正在更新一个*已存在的*书签 (非 VFS)
-                        chrome.bookmarks.update(node.id, { url: savedContent });
-
-                    } else if (!node && savedPath.startsWith('/bin/')) {
-                        // C. 正在创建*新的* /bin/ 脚本
-                        const scriptName = savedPath.substring(5);
-                        if (scriptName && !scriptName.includes('/')) {
-                            saveVfsScript(scriptName, savedContent, 0o755, Environment.USER);
-                            // 更新 VFS (内存中)
-                            const newNode = {
-                                id: `vfs-bin-${scriptName}`,
-                                title: scriptName,
-                                url: `data:text/plain;base64,${btoa(encodeURIComponent(savedContent))}`,
-                                mode: 0o755, // 默认权限
-                                owner: Environment.USER, // 设置 owner
-                                group: Environment.USER,
-                                children: null,
-                                parentId: 'vfs-bin'
-                            };
-                            bookmarkSystem.vfsBin.children.push(newNode);
-                            term.writeLine(`Saved to VFS: ${savedPath}`);
-                        } else {
-                            term.writeHtml(`<span class="term-error">nano: Invalid path.</span>`);
-                            return false; // [!!] 3. 返回 false
-                        }
-                    } else if (!node) {
-                        // --- C. 创建新文件 ---
-                        
-                        // Case C1: VFS /bin/ 脚本
-                        if (savedPath.startsWith('/bin/')) {
-                            const scriptName = savedPath.substring(5);
-                            if (scriptName && !scriptName.includes('/')) {
-                                saveVfsScript(scriptName, savedContent, 0o755, Environment.USER);
-                                const newNode = {
-                                    id: `vfs-bin-${scriptName}`,
-                                    title: scriptName,
-                                    url: `data:text/plain;base64,${btoa(encodeURIComponent(savedContent))}`,
-                                    mode: 0o755, owner: Environment.USER, group: Environment.USER,
-                                    children: null, parentId: 'vfs-bin'
-                                };
-                                bookmarkSystem.vfsBin.children.push(newNode);
-                                term.writeLine(`Saved to VFS: ${savedPath}`);
-                            } else {
-                                term.writeHtml(`<span class="term-error">nano: Invalid path.</span>`);
-                                return false;
-                            }
-                        } 
-                        // 普通书签文件
-                        else {
-                            // 1. 找到父目录
-                            const parentPath = savedPath.substring(0, savedPath.lastIndexOf('/')) || '/';
-                            const parentResult = bookmarkSystem._findNodeByPath(parentPath);
-                            
-                            if (parentResult && parentResult.node && parentResult.node.children) {
-                                // 2. 获取文件名
-                                const newFileName = savedPath.split('/').pop();
-                                // 3. 检查父目录写权限
-                                if (!hasPermission(parentResult.node, 'w')) {
-                                     term.writeHtml(`<span class="term-error">nano: Parent directory not writable.</span>`);
-                                     return false;
-                                }
-                                // 4. 创建书签
-                                await new Promise(resolve => {
-                                    chrome.bookmarks.create({
-                                        parentId: parentResult.node.id,
-                                        title: newFileName,
-                                        url: savedContent // 内容作为 URL 保存
-                                    }, resolve);
-                                });
-                            } else {
-                                term.writeHtml(`<span class="term-error">nano: Directory not found: ${parentPath}</span>`);
-                                return false;
-                            }
-                        }
-                    }
-                    return true;
-                } catch (e) {
-                    console.error("Nano save error:", e);
-                    return false; // [!!] 5. 返回 false
-                }
-            };
-
-            const onExit = () => {
-                resolve();
-            };
-
-            const editor = new NanoEditor(term, resolvedPath, content, onSave, onExit, isReadOnly);
-            editor.open();
-        });
+     'vim': (args, options) => {
+        return openFileEditor('vim', VimEditor, args);
      },
 
      'open': (args, options) => {
@@ -6364,7 +7438,7 @@ const subCommandCompletions = {
     'downloads': ['ls', 'open'],
     'tabs': ['ls', 'switch', 'close', 'groups', 'group', 'group-add', 'ungroup', 'group-title', 'group-color', 'save-group', 'saved', 'load-group'],
     'apt': ['update', 'list', 'install', 'remove', 'upgrade'],
-    'style': ['font', 'size', 'bg', 'fg', 'accent', 'cursor', 'wall', 'opacity', 'reset'],
+    'style': ['font', 'size', 'bg', 'fg', 'stdout', 'stderr', 'accent', 'cursor', 'wall', 'opacity', 'reset'],
     'ext': ['ls', 'toggle', 'enable', 'disable', 'uninstall'],
     'theme': () => {
         if (typeof ThemeManager !== 'undefined' && ThemeManager.presets) {
@@ -6378,6 +7452,7 @@ const subCommandCompletions = {
     'ls': [], // 标记为 'path'
     'cat': [], // 标记为 'path'
     'nano': [], // 标记为 'path'
+    'vim': [], // 标记为 'path'
     'rm': [], // 标记为 'path'
     'mkdir': [], // 标记为 'path'
     'sh': [], // 标记为 'path'
@@ -6435,6 +7510,103 @@ async function updateSystemVersion() {
         }
     } catch (e) {
         console.warn("[System] Failed to check for updates:", e);
+    }
+}
+
+const ANNOUNCEMENT_CACHE_KEY = 'st2_service_broadcast';
+
+function isActiveBroadcast(record) {
+    return record && (record.is_active === true || record.is_active === 1 ||
+        record.is_active === '1' || String(record.is_active).toLowerCase() === 'true');
+}
+
+function announcementColor(type) {
+    switch (String(type || 'info').toLowerCase()) {
+        case 'warning': return 'var(--announcement-warning, #f1c40f)';
+        case 'maintenance': return 'var(--announcement-maintenance, #bd93f9)';
+        case 'danger': return 'var(--announcement-danger, #ff5555)';
+        default: return 'var(--announcement-info, #26c6da)';
+    }
+}
+
+function wrapAnnouncementText(text, maxLength) {
+    const lines = [];
+    // 归一化所有换行/行分隔符：#terminal-buffer 是 white-space: pre，
+    // 任何字面换行字符（不只是 \n）都会在 buffer 行内产生真实的视觉换行，
+    // 导致行尾填充只作用于整块文本而不是每个可见子行（与多行粘贴同类问题）。
+    const normalized = String(text || '')
+        .replace(/\r\n?/g, '\n')
+        .replace(/[\u2028\u2029]/g, '\n');
+    for (const paragraph of normalized.split('\n')) {
+        let remaining = paragraph;
+        while (remaining.length > maxLength) {
+            let breakAt = remaining.lastIndexOf(' ', maxLength);
+            if (breakAt <= 0) breakAt = maxLength;
+            lines.push(remaining.slice(0, breakAt).trimEnd());
+            remaining = remaining.slice(breakAt).trimStart();
+        }
+        lines.push(remaining);
+    }
+    return lines;
+}
+
+function writeAnnouncementText(text, color, bold = false) {
+    // writeHtml() can wrap by truncating HTML fragments. Keep every styled line shorter
+    // than the terminal width so its closing span is never split off.
+    const maxLength = Math.max(1, term.cols - 1);
+    const weight = bold ? '; font-weight: bold' : '';
+    for (const line of wrapAnnouncementText(text, maxLength)) {
+        term.writeHtml(`<span style="color: ${color}${weight};">${term.escapeHtml(line)}</span>`);
+    }
+}
+
+function displayCachedAnnouncement() {
+    let announcement;
+    try {
+        announcement = JSON.parse(localStorage.getItem(ANNOUNCEMENT_CACHE_KEY) || 'null');
+    } catch (_) {
+        localStorage.removeItem(ANNOUNCEMENT_CACHE_KEY);
+        return;
+    }
+    if (!announcement) return;
+
+    const color = announcementColor(announcement.type);
+    const type = String(announcement.type || 'info').toUpperCase();
+    const title = String(announcement.title || 'Announcement');
+    const message = String(announcement.message || '');
+    term.writeLine('');
+    writeAnnouncementText(`[${type}] ${title}`, color, true);
+    if (message) writeAnnouncementText(message, color);
+    if (announcement.allow_dismiss === true || announcement.allow_dismiss === 1 ||
+        String(announcement.allow_dismiss).toLowerCase() === 'true') {
+        term.writeHtml(`<span style="color: var(--terminal-foreground-color); opacity: .7;">(Dismissible announcement)</span>`);
+    }
+}
+
+async function updateServiceBroadcast() {
+    try {
+        const response = await fetch(Resources.urls.api_broadcasts, { cache: 'no-cache' });
+        if (!response.ok) throw new Error(`Server responded with ${response.status}`);
+        const data = await response.json();
+        const records = Array.isArray(data.items) ? data.items : (Array.isArray(data) ? data : []);
+        const latestSt2 = records.find(record => String(record.target || '').toUpperCase() === 'ST2');
+
+        // The newest ST2 record controls visibility. An inactive newest record clears stale notices.
+        if (latestSt2 && isActiveBroadcast(latestSt2)) {
+            localStorage.setItem(ANNOUNCEMENT_CACHE_KEY, JSON.stringify({
+                id: latestSt2.id,
+                title: latestSt2.title || '',
+                message: latestSt2.message || '',
+                target: latestSt2.target,
+                is_active: latestSt2.is_active,
+                allow_dismiss: latestSt2.allow_dismiss,
+                type: latestSt2.type || 'info'
+            }));
+        } else {
+            localStorage.removeItem(ANNOUNCEMENT_CACHE_KEY);
+        }
+    } catch (e) {
+        console.warn('[System] Failed to check service broadcasts:', e);
     }
 }
 
@@ -6896,6 +8068,7 @@ async function main() {
     term.enableInput(); 
 
     updateSystemVersion();
+    updateServiceBroadcast();
 }
 
 // 使用 load 事件 
