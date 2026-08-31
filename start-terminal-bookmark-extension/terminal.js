@@ -151,7 +151,7 @@ async function loadEnvironment(username) {
     
     // 3. 设置新会话的基础
     Environment.USER = username;
-    Environment.HOST = 'ST2.0';
+    Environment.HOST = loadVirtualEtcFile('hostname', 'ST2.0').trim() || 'ST2.0';
     // (不再保留 oldPS1/oldLANG)
 
     // 4. 从 .startrc 加载配置
@@ -311,6 +311,9 @@ async function writeFile(path, contentLines, append = false) {
         saveVfsScript(node.title, newContent);
     } else if (node.id === 'vfs-startrc') {
         localStorage.setItem('.startrc', newContent);
+    } else if (node.id.startsWith('vfs-etc-')) {
+        saveVirtualEtcFile(node.title, newContent);
+        node.url = `data:text/plain;base64,${btoa(encodeURIComponent(newContent))}`;
     } else {
         chrome.bookmarks.update(node.id, { url: 'data:text/plain,' + encodeURIComponent(newContent) });
     }
@@ -370,6 +373,7 @@ class Terminal {
         this.onTab = null; 
 
         this.fullScreenApp = null;
+        this.lastMouseSelection = '';
 
         // I/O 状态
         this.isReading = false;
@@ -597,6 +601,10 @@ class Terminal {
         
         this.container.addEventListener('mouseup', (e) => {
             const selection = window.getSelection();
+            const selectedText = selection.toString();
+            if (selectedText && this.container.contains(selection.anchorNode)) {
+                this.lastMouseSelection = selectedText;
+            }
             
             // 仅当 selection "collapsed" (即用户是点击，而不是拖拽)
             // 或者 selection 不在 terminal 内部时，才重新聚焦。
@@ -609,7 +617,16 @@ class Terminal {
         });
 
         this.container.addEventListener('mousedown', () => {
+            this.lastMouseSelection = '';
             this.focus();
+        });
+
+        document.addEventListener('selectionchange', () => {
+            const selection = window.getSelection();
+            const selectedText = selection.toString();
+            if (selectedText && this.container.contains(selection.anchorNode)) {
+                this.lastMouseSelection = selectedText;
+            }
         });
 
         this.container.addEventListener('dragstart', (e) => {
@@ -2286,6 +2303,27 @@ class NanoEditor {
                     this._save();
                     break;
 
+                case 'c': {
+                    if (!e.shiftKey) break;
+                    const range = this._selectionRange();
+                    const mouseText = this.term.lastMouseSelection || window.getSelection().toString();
+                    const text = range ? this._extractSelectionText(range) : mouseText;
+                    if (!text) {
+                        this.status = 'No selection to copy.';
+                        this._render();
+                        return;
+                    }
+                    editorClipboard = { type: 'char', text };
+                    try {
+                        await navigator.clipboard.writeText(text);
+                        this.status = t('nanoCopy');
+                    } catch (err) {
+                        this.status = `Copy failed: ${err.message}`;
+                    }
+                    this._render();
+                    return;
+                }
+
                 case 'v':
                     try {
                         const text = await navigator.clipboard.readText();
@@ -2349,7 +2387,7 @@ class NanoEditor {
                     break;
             }
         } else {
-            const isEditKey = ['Backspace', 'Enter'].includes(e.key) || 
+            const isEditKey = ['Backspace', 'Delete', 'Enter'].includes(e.key) ||
                               (e.key.length === 1 && !e.ctrlKey && !e.metaKey);
             if (this.isReadOnly && isEditKey) {
                 this.status = t('nanoStatusReadOnly'); // (可选) 再次提醒
@@ -2409,6 +2447,13 @@ class NanoEditor {
                         this.lines[this.cursorY - 1] = prevLine + line;
                         this.lines.splice(this.cursorY, 1);
                         this.cursorY--;
+                    }
+                    break;
+                case 'Delete':
+                    this.dirty = true;
+                    if (this.cursorX < this.lines[this.cursorY].length) {
+                        const line = this.lines[this.cursorY];
+                        this.lines[this.cursorY] = line.substring(0, this.cursorX) + line.substring(this.cursorX + 1);
                     }
                     break;
                 case 'Enter':
@@ -2829,6 +2874,18 @@ class VimEditor {
         return { start: b, end: a };
     }
 
+    _getVisualSelectionText() {
+        if (this.mode !== 'visual' && this.mode !== 'visual-line') return '';
+        const { start, end } = this._visualRange();
+        if (this.mode === 'visual-line') {
+            return this.lines.slice(start.y, end.y + 1).join('\n') + '\n';
+        }
+        const { text, lineStarts } = this._flatten();
+        const from = this._posToFlat(start.y, start.x, lineStarts);
+        const to = Math.min(text.length, this._posToFlat(end.y, end.x, lineStarts) + 1);
+        return text.slice(from, to);
+    }
+
     _applyVisualAction(op) {
         if (this.mode === 'visual-line') {
             const y1 = Math.min(this.visualAnchor.y, this.cursorY);
@@ -2955,6 +3012,32 @@ class VimEditor {
             return;
         }
         switch (e.key) {
+            case 'ArrowLeft':
+                if (this.cursorX > 0) this.cursorX--;
+                else if (this.cursorY > 0) {
+                    this.cursorY--;
+                    this.cursorX = this.lines[this.cursorY].length;
+                }
+                break;
+            case 'ArrowRight':
+                if (this.cursorX < this.lines[this.cursorY].length) this.cursorX++;
+                else if (this.cursorY < this.lines.length - 1) {
+                    this.cursorY++;
+                    this.cursorX = 0;
+                }
+                break;
+            case 'ArrowUp':
+                if (this.cursorY > 0) {
+                    this.cursorY--;
+                    this.cursorX = Math.min(this.cursorX, this.lines[this.cursorY].length);
+                }
+                break;
+            case 'ArrowDown':
+                if (this.cursorY < this.lines.length - 1) {
+                    this.cursorY++;
+                    this.cursorX = Math.min(this.cursorX, this.lines[this.cursorY].length);
+                }
+                break;
             case 'Backspace':
                 if (this.cursorX > 0) {
                     const line = this.lines[this.cursorY];
@@ -2968,6 +3051,13 @@ class VimEditor {
                     this.lines[this.cursorY - 1] = prevLine + line;
                     this.lines.splice(this.cursorY, 1);
                     this.cursorY--;
+                    this.dirty = true;
+                }
+                break;
+            case 'Delete':
+                if (this.cursorX < this.lines[this.cursorY].length) {
+                    const line = this.lines[this.cursorY];
+                    this.lines[this.cursorY] = line.substring(0, this.cursorX) + line.substring(this.cursorX + 1);
                     this.dirty = true;
                 }
                 break;
@@ -3071,7 +3161,10 @@ class VimEditor {
     }
 
     _handleNormalOrVisualKey(e) {
-        const key = e.key;
+        const arrowMotion = {
+            ArrowLeft: 'h', ArrowRight: 'l', ArrowUp: 'k', ArrowDown: 'j'
+        };
+        const key = arrowMotion[e.key] || e.key;
         const inVisual = (this.mode === 'visual' || this.mode === 'visual-line');
 
         if (e.ctrlKey) {
@@ -3138,6 +3231,10 @@ class VimEditor {
         }
 
         switch (key) {
+            case 'Delete':
+                if (this._guardReadOnly()) return;
+                this._deleteCharUnderCursor();
+                return;
             case 'h': case 'l': case 'j': case 'k': case '0': case '$': case 'w': case 'e': case 'b': case 'G':
                 this._moveCursor(key);
                 return;
@@ -3210,6 +3307,23 @@ class VimEditor {
         e.stopPropagation();
         this.status = "";
         this._quit = false;
+
+        if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'c') {
+            const text = this._getVisualSelectionText() || this.term.lastMouseSelection || window.getSelection().toString();
+            if (!text) {
+                this.status = 'No selection to copy.';
+            } else {
+                editorClipboard = { type: this.mode === 'visual-line' ? 'line' : 'char', text };
+                try {
+                    await navigator.clipboard.writeText(text);
+                    this.status = 'Copied to clipboard.';
+                } catch (err) {
+                    this.status = `Copy failed: ${err.message}`;
+                }
+            }
+            this._render();
+            return;
+        }
 
         if (this.mode === 'insert') {
             this._handleInsertKey(e);
@@ -3340,6 +3454,10 @@ function openFileEditor(cmdName, EditorClass, args) {
                         startrcNode.url = `data:text/plain;base64,${btoa(encodeURIComponent(savedContent))}`;
                     }
 
+                } else if (node && node.id.startsWith('vfs-etc-')) {
+                    saveVirtualEtcFile(node.title, savedContent);
+                    node.url = `data:text/plain;base64,${btoa(encodeURIComponent(savedContent))}`;
+
 
                 } else if (node && node.id.startsWith('vfs-bin-')) {
                     // A. 正在更新一个*已存在的* /bin/ 脚本
@@ -3458,7 +3576,8 @@ class BookmarkSystem {
                     title: '.startrc',
                     url: `data:text/plain;base64,${btoa(encodeURIComponent(loadVirtualStartrc()))}`, // 编码前先 URI 编码
                     children: null
-                }
+                },
+                ...loadVirtualEtcFiles()
             ],
             parentId: 'vfs-root'
         };
@@ -4850,6 +4969,36 @@ function loadVirtualStartrc() {
     return content;
 }
 
+const VIRTUAL_ETC_DEFAULTS = {
+    hostname: 'ST2.0',
+    issue: '',
+    motd: ''
+};
+
+function loadVirtualEtcFile(name, fallback = '') {
+    const files = JSON.parse(localStorage.getItem('vfs_etc_files') || '{}');
+    return Object.prototype.hasOwnProperty.call(files, name) ? files[name] : fallback;
+}
+
+function saveVirtualEtcFile(name, content) {
+    const files = JSON.parse(localStorage.getItem('vfs_etc_files') || '{}');
+    files[name] = content;
+    localStorage.setItem('vfs_etc_files', JSON.stringify(files));
+}
+
+function loadVirtualEtcFiles() {
+    return Object.entries(VIRTUAL_ETC_DEFAULTS).map(([name, fallback]) => {
+        const content = loadVirtualEtcFile(name, fallback);
+        return {
+            id: `vfs-etc-${name}`,
+            title: name,
+            url: `data:text/plain;base64,${btoa(encodeURIComponent(content))}`,
+            children: null,
+            parentId: 'vfs-etc'
+        };
+    });
+}
+
 /**
  * 从 localStorage 加载所有 VFS 脚本
  * @returns {Array} VFS 节点对象数组
@@ -4885,9 +5034,10 @@ function getMetadata(node) {
         return { mode: node.mode, owner: node.owner, group: node.group || 'user' };
     }
     // 硬编码的 VFS 目录/文件
-    if (node.id === 'vfs-etc') return { mode: 0o755, owner: 'root', group: 'root' };
+    if (node.id === 'vfs-etc') return { mode: 0o777, owner: 'root', group: 'root' };
     if (node.id === 'vfs-bin') return { mode: 0o777, owner: 'root', group: 'root' };
     if (node.id === 'vfs-startrc') return { mode: 0o666, owner: 'root', group: 'root' };
+    if (node.id.startsWith('vfs-etc-')) return { mode: 0o666, owner: 'root', group: 'root' };
 
     // 2. 真实书签 (从 localStorage 读取)
     const metadataStore = JSON.parse(localStorage.getItem('vfs_metadata') || '{}');
@@ -5938,6 +6088,12 @@ const globalCommands = {
         // 获取远程最新版本 (Remote - 从 updateSystemVersion 缓存中读取)
         const remoteVersion = localStorage.getItem('st2_system_version');
 
+        const issue = loadVirtualEtcFile('issue', VIRTUAL_ETC_DEFAULTS.issue).trim();
+        if (issue) {
+            term.writeLine(issue);
+            term.writeLine("");
+        }
+
         // 系统版本 
         term.writeLine(t('welcomeTitle').replace('{0}', installedVersion));
         term.writeLine("");
@@ -5992,6 +6148,12 @@ const globalCommands = {
         // --- 7. 'apt' 状态 (模拟) ---
         term.writeLine(t('welcomeApt'));
         term.writeLine("");
+
+        const motd = loadVirtualEtcFile('motd', VIRTUAL_ETC_DEFAULTS.motd).trim();
+        if (motd) {
+            term.writeLine(motd);
+            term.writeLine("");
+        }
 
         // --- 8. 上次登录 (来自 L1804 的新 localStorage 条目) ---
         const lastLogin = localStorage.getItem('st2_last_login');
@@ -6392,6 +6554,7 @@ const globalCommands = {
         term.writeHtml(formatHelp('sh, ./', 'help_sh'));
         term.writeHtml(formatHelp('chmod', 'help_chmod'));
         term.writeHtml(formatHelp('chown', 'help_chown'));
+        term.writeHtml(formatHelp('/etc', 'help_etc'));
         
         term.writeHtml(`\n<b>${t('helpEnv')}</b>`);
         term.writeHtml(formatHelp('login', 'help_login'));
@@ -6402,6 +6565,7 @@ const globalCommands = {
         term.writeHtml(formatHelp('alias', 'help_alias'));
         term.writeHtml(formatHelp('unalias', 'help_unalias'));
         term.writeHtml(formatHelp('source, .', 'help_source'));
+        term.writeHtml(formatHelp('reload', 'help_reload'));
         term.writeHtml(formatHelp('theme', 'help_theme')); // [新增]
         term.writeHtml(formatHelp('ext', 'help_ext'));     // [新增]
         
@@ -6655,9 +6819,7 @@ const globalCommands = {
                         document.documentElement.style.setProperty('--terminal-background-color', autoRgba);
                         overrides['--terminal-background-color'] = autoRgba; // 更新保存
                         localStorage.setItem('style_overrides', JSON.stringify(overrides));
-                        term.writeLine(`Wallpaper set. Transparency adjusted to 0.7.`);
-                    } else {
-                        term.writeLine(`Wallpaper set.`);
+                        term.writeLine(`Transparency adjusted to 0.7.`);
                     }
                 }
                 break;
@@ -6825,6 +6987,11 @@ const globalCommands = {
     '.': (args, options) => {
         // 'source' 的别名
         return globalCommands.source(args, options);
+    },
+
+    'reload': async (args, options) => {
+        await loadEnvironment(Environment.USER || localStorage.getItem('st2_active_user') || 'user');
+        term.writeLine('Configuration reloaded.');
     },
 
     // 在 globalCommands 对象中添加：
@@ -8075,4 +8242,3 @@ async function main() {
 window.addEventListener('load', main);
 
 // main();
-
